@@ -1,0 +1,44 @@
+services:
+  kirie-daemon:
+    image: ${KIRIE_IMAGE:-kirie:local}
+    environment:
+      HOME: /home/node
+      KIRIE_MASTER_KEY: ${KIRIE_MASTER_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - ${KIRIE_CONFIG_DIR:-~/.kirie}:/home/node/.kirie
+    ports:
+      - "${KIRIE_GATEWAY_PORT:-18789}:18789"
+    init: true
+    restart: unless-stopped
+    command: ["node", "apps/daemon/dist/index.js"]
+
+  kirie-cli:
+    image: ${KIRIE_IMAGE:-kirie:local}
+    environment:
+      HOME: /home/node
+      KIRIE_MASTER_KEY: ${KIRIE_MASTER_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - ${KIRIE_CONFIG_DIR:-~/.kirie}:/home/node/.kirie
+    stdin_open: true
+    tty: true
+    init: true
+    profiles: ["cli"]
+    entrypoint: ["node", "apps/cli/dist/index.js"]
+    command: ["chat"]
+
+  kirie-sandbox-browser:
+    image: kirie-sandbox-browser:bookworm-slim
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox-browser
+    environment:
+      KIRIE_BROWSER_CDP_PORT: "9222"
+      KIRIE_BROWSER_HEADLESS: "0"
+    ports:
+      - "9222:9222"
+      - "5900:5900"
+      - "6080:6080"
+    init: true
+    profiles: ["browser"]

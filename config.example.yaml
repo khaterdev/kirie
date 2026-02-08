@@ -1,0 +1,182 @@
+agent:
+  maxTurns: 100                    # 0 = unlimited
+  model: "claude-opus-4-6"
+  # customInstructions: "Always respond in English. My name is Alex."
+  # workspace: "/path/to/your/projects"
+
+security:
+  owner:
+    identities:
+      telegram: []                 # Numeric user IDs
+      discord: []                  # Discord user IDs
+      whatsapp: []                 # Phone numbers
+      signal: []                   # Phone numbers
+      slack: []                    # Slack user IDs (U01ABC...)
+  dmPolicy: "owner-only"          # "owner-only", "allowlist", "open"
+  groupPolicy: "mention-only"     # "mention-only", "all", "disabled"
+  rateLimit:
+    perUser:
+      maxRequests: 30
+      windowMs: 60000
+    perGroup:
+      maxRequests: 60
+      windowMs: 60000
+
+channels:
+  telegram:
+    enabled: false
+    token: "$credential:telegram.bot_token"
+    # webhookUrl: "https://example.com/webhooks/telegram"  # Use webhook instead of polling
+    # pollingTimeout: 30           # Long-polling timeout in seconds
+    # allowedUserIds: [123456789]  # Only allow these user IDs (empty = global policy)
+    # allowGroups: true            # Whether bot responds in group chats
+    # allowAddToGroups: true       # Whether bot can be added to new groups
+  discord:
+    enabled: false
+    token: "$credential:discord.bot_token"
+    # intents: []                  # Additional Discord gateway intents
+    # allowedUserIds: []
+    # allowGroups: true
+  slack:
+    enabled: false
+    botToken: "$credential:slack.bot_token"
+    appToken: "$credential:slack.app_token"
+    # signingSecret: "$credential:slack.signing_secret"
+    # allowedUserIds: []
+  whatsapp:
+    enabled: false
+    # sessionDataPath: "~/.kirie/whatsapp-auth"  # Auth session storage
+  signal:
+    enabled: false
+    apiUrl: "http://localhost:8080"
+    # phoneNumber: "+1234567890"   # Registered Signal phone number
+
+memory:
+  enabled: true
+  backend: "sqlite"
+  # dbPath: "~/.kirie/memory.db"   # Custom database path
+  embeddings:
+    provider: "local"              # "local" (offline ONNX), "openai" (API), "noop" (disable)
+    # apiKey: "$credential:openai.api_key"        # Only needed for openai provider
+    # model: "fast-bge-small-en-v1.5"             # Local default; for openai: "text-embedding-3-small"
+
+gateway:
+  port: 18789
+  bind: "loopback"                # "loopback" (localhost only) or "all" (remote access)
+  # bearerToken: "$credential:gateway.bearer_token"  # Required when bind is "all"
+
+browser:
+  enabled: false                  # Playwright-based browser automation (auto-installs Chromium)
+
+proactive:
+  enabled: true
+  tier2IntervalMinutes: 15        # Minutes between triage LLM checks
+  tier2Model: "claude-haiku-4-5"  # Fast/cheap model for triage
+  tier3Model: "claude-opus-4-6"   # Deep reasoning model for escalation
+  activeHours:
+    start: "00:00"
+    end: "23:59"
+    timezone: "UTC"               # IANA timezone (e.g. "America/New_York", "Europe/London")
+  dailyDigestTime: "09:00"        # HH:MM in 24h format
+  notificationCooldownMinutes: 60 # Suppress repeat notifications for same signal type
+  heartbeatFile: "~/.kirie/HEARTBEAT.md"  # Checklist the triage LLM evaluates
+  heartbeatLogging:
+    enabled: true
+    levels:                       # Minimum log level per tier
+      tier1: "info"               # Signal detection
+      tier2: "info"               # Triage decisions
+      tier3: "debug"              # Escalation tasks
+      heartbeat: "info"           # Retry, schedule, cleanup
+    retention:                    # Days to keep logs (0 = forever)
+      tier1: 7
+      tier2: 30
+      tier3: 0
+      heartbeat: 14
+
+# ── Optional sections (uncomment to configure) ─────────────────────────────
+
+# logging:
+#   level: "info"                 # "debug", "info", "warn", "error"
+#   redactSensitive: "tools"      # "off", "tools", "all"
+#   telemetry:
+#     enabled: false
+#     exporter: "otlp"            # "console", "otlp", "jaeger"
+#     endpoint: "http://localhost:4318"
+
+# voice:
+#   enabled: false
+#   provider: "twilio"
+#   twilio:
+#     accountSid: "$credential:twilio.account_sid"
+#     authToken: "$credential:twilio.auth_token"
+#     fromNumber: "+1234567890"
+#   maxConcurrentCalls: 3
+#   tts:
+#     provider: "openai"          # "openai", "elevenlabs", "edge"
+#     voice: "alloy"
+#   stt:
+#     provider: "openai"          # "openai", "groq"
+#     model: "whisper-1"
+
+# mediaUnderstanding:
+#   audio:
+#     enabled: false
+#     provider: "openai"          # "openai", "groq"
+#   video:
+#     enabled: false
+#     extractAudio: true
+
+# canvas:
+#   enabled: false
+#   port: 18793
+#   canvasDir: "~/.kirie/canvas"
+
+# sandbox:
+#   mode: "off"                   # "off", "docker"
+#   scope: "agent"                # "shared", "agent", "session"
+#   workspaceAccess: "rw"         # "rw", "none"
+#   docker:
+#     image: "kirie-sandbox:latest"
+#     readOnlyRoot: true
+#     network: "none"             # "none", "bridge", "host"
+#     capDrop: ["ALL"]
+#     memory: "512m"
+#     cpus: 1
+#   prune:
+#     idleHours: 24
+#     maxAgeDays: 7
+
+# tools:
+#   agentToAgent:
+#     enabled: true
+#     allow: ["*"]
+#     maxPingPongTurns: 5
+
+# routing:
+#   broadcastGroups:
+#     family:
+#       targets:
+#         - channel: "telegram"
+#           chatId: "123456789"
+#         - channel: "whatsapp"
+#           chatId: "+1234567890"
+
+# nodes:
+#   enabled: false
+#   defaultTimeout: 30000
+
+# agents:                         # Multi-agent definitions
+#   - id: "researcher"
+#     name: "Research Agent"
+#     model: "claude-sonnet-4-5-20250929"
+#     systemPrompt: "You are a research specialist."
+#     skills: ["github", "summarize"]
+#     sessionScope: "per-peer"    # "main", "per-peer", "per-channel-peer"
+#     bindings:
+#       - scope: "peer"
+#         channel: "telegram"
+
+# plugins:
+#   - package: "./my-plugin"
+#     enabled: true
+#     config: {}

@@ -1,0 +1,26 @@
+{
+  "name": "@kirie/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@kirie/core": "workspace:*",
+    "@kirie/channel-telegram": "workspace:*",
+    "@kirie/channel-discord": "workspace:*",
+    "@kirie/channel-slack": "workspace:*",
+    "@kirie/channel-whatsapp": "workspace:*",
+    "@kirie/channel-signal": "workspace:*",
+    "@kirie/skills": "workspace:*",
+    "@kirie/memory": "workspace:*",
+    "pino": "^9.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}

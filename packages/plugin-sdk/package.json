@@ -1,0 +1,13 @@
+{
+  "name": "@kirie/plugin-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsdown",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@kirie/core": "workspace:*"
+  }
+}
