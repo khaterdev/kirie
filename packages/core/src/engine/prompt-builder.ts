@@ -41,6 +41,8 @@ export interface PromptConfig {
   model: string;
   /** Data directory where MEMORY.md and TOOLS.md live (e.g. ~/.kirie) */
   dataDir?: string;
+  /** IANA timezone for current time display (e.g. "Africa/Cairo") */
+  timezone?: string;
 }
 
 /**
@@ -386,6 +388,21 @@ function buildAppendedPrompt(
   sender: SenderIdentity,
 ): string {
   const lines: string[] = [];
+
+  // Inject current date and time so the agent always knows when it is
+  const now = new Date();
+  let timeStr: string;
+  try {
+    timeStr = now.toLocaleString("en-US", {
+      timeZone: config.timezone || "UTC",
+      dateStyle: "full",
+      timeStyle: "long",
+    });
+  } catch {
+    timeStr = now.toISOString();
+  }
+  lines.push(`<current_time>${timeStr} (${config.timezone || "UTC"})</current_time>`);
+  lines.push("");
 
   lines.push(`<assistant_identity>`);
   lines.push(DEFAULT_SYSTEM_PROMPT);

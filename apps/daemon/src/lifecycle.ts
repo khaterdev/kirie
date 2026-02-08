@@ -334,6 +334,7 @@ export async function startDaemon(): Promise<void> {
       maxTurns: config.agent.maxTurns,
       model: config.agent.model,
       dataDir,
+      timezone: config.proactive?.activeHours?.timezone,
     },
     cwd: config.agent.workspace || dataDir,
     allowedTools,
