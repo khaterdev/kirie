@@ -369,6 +369,20 @@ export class BackgroundTaskManager {
         `Execution error: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
+      // End the message queue so the SDK's streamInput() finishes iterating
+      // and calls endInput() to close stdin. Without this, the subprocess
+      // stdin stays open, the process never exits, and the SDK's
+      // process.on("exit") listener is never cleaned up — causing the
+      // MaxListenersExceededWarning memory leak.
+      running.messageQueue.end();
+
+      // Close the query to forcefully terminate the subprocess and clean up
+      // all resources (including the process "exit" listener on the global
+      // process object). This is safe to call even if the stream already ended.
+      if (running.query) {
+        running.query.close();
+      }
+
       this.runningTasks.delete(task.id);
     }
   }
