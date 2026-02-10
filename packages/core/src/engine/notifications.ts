@@ -9,6 +9,8 @@ import pino from "pino";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { Signal } from "./signals.js";
 import type { ChannelName } from "../channels/normalizer.js";
+import type { HeartbeatService } from "./heartbeat.js";
+import { isTransientNetworkError } from "./network-errors.js";
 
 const log = pino({ name: "notifications" });
 
@@ -20,6 +22,8 @@ export interface NotificationManagerConfig {
   defaultChannel: ChannelName;
   /** Default chat ID for owner notifications */
   defaultChatId: string;
+  /** Optional heartbeat service for retrying failed deliveries */
+  heartbeat?: HeartbeatService;
 }
 
 /**
@@ -36,6 +40,14 @@ export class NotificationManager {
   ) {
     this.channelRegistry = channelRegistry;
     this.config = config;
+  }
+
+  /**
+   * Set the heartbeat service for retry support.
+   * Called after HeartbeatService is created.
+   */
+  setHeartbeat(heartbeat: HeartbeatService): void {
+    this.config.heartbeat = heartbeat;
   }
 
   /**
@@ -68,6 +80,13 @@ export class NotificationManager {
       log.debug({ channel: targetChannel, chatId: targetChatId }, "notification sent");
       return true;
     } catch (err) {
+      // On transient network errors, queue for retry via heartbeat
+      if (this.config.heartbeat && isTransientNetworkError(err)) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        this.config.heartbeat.addFailedDelivery(targetChannel, targetChatId, message, errorMsg);
+        log.info({ channel: targetChannel, chatId: targetChatId }, "notification queued for retry via heartbeat");
+        return false;
+      }
       log.error(
         { channel: targetChannel, chatId: targetChatId, err },
         "failed to send notification",

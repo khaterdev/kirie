@@ -6,6 +6,7 @@ import type { ChannelRegistry } from "../channels/registry.js";
 import type { SecurityGate, GateResult } from "../security/gate.js";
 import type { SessionStore } from "../engine/session-store.js";
 import type { AgentEngine, ExecutionResult } from "../engine/agent-engine.js";
+import type { HeartbeatService } from "../engine/heartbeat.js";
 
 function makeMessage(overrides: Partial<UnifiedMessage> = {}): UnifiedMessage {
   return {
@@ -279,6 +280,184 @@ describe("MessagePipeline", () => {
       // getAll should only have been called once
       expect(mockRegistry.getAll).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+describe("MessagePipeline retry integration", () => {
+  let mockAdapter: ReturnType<typeof createMockAdapter>;
+  let mockRegistry: ChannelRegistry;
+  let mockGate: SecurityGate;
+  let mockSessionStore: SessionStore;
+  let mockEngine: AgentEngine;
+  let mockHeartbeat: HeartbeatService;
+  let pipeline: MessagePipeline;
+
+  beforeEach(() => {
+    mockAdapter = createMockAdapter();
+
+    mockRegistry = {
+      getAll: vi.fn(() => new Map([["telegram", mockAdapter]])),
+      getById: vi.fn(() => mockAdapter),
+      isRunning: vi.fn(() => true),
+      on: vi.fn(),
+    } as unknown as ChannelRegistry;
+
+    mockGate = {
+      check: vi.fn((): GateResult => ({
+        passed: true,
+        identity: {
+          canonicalId: "user-123",
+          senderId: "user-123",
+          role: "owner" as const,
+          channel: "telegram",
+        },
+        wrappedText: "<user_message>Hello bot</user_message>",
+      })),
+    } as unknown as SecurityGate;
+
+    mockSessionStore = {
+      get: vi.fn(() => null),
+      set: vi.fn(),
+    } as unknown as SessionStore;
+
+    mockEngine = {
+      execute: vi.fn(async (): Promise<ExecutionResult> => ({
+        response: "Hello human!",
+        sessionId: "sdk-sess-1",
+        costUsd: 0.01,
+        numTurns: 1,
+        isError: false,
+      })),
+    } as unknown as AgentEngine;
+
+    mockHeartbeat = {
+      addFailedDelivery: vi.fn(() => "retry_1"),
+    } as unknown as HeartbeatService;
+
+    pipeline = new MessagePipeline({
+      channelRegistry: mockRegistry,
+      securityGate: mockGate,
+      sessionStore: mockSessionStore,
+      agentEngine: mockEngine,
+      debounceMs: 0,
+    });
+
+    // Wire heartbeat for retry support
+    pipeline.setHeartbeat(mockHeartbeat);
+  });
+
+  afterEach(() => {
+    pipeline.stop();
+  });
+
+  it("queues response for heartbeat retry on ETIMEDOUT", async () => {
+    const etimedoutErr = new Error("connect ETIMEDOUT 149.154.167.220:443");
+    (etimedoutErr as NodeJS.ErrnoException).code = "ETIMEDOUT";
+
+    (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockRejectedValueOnce(etimedoutErr);
+
+    pipeline.start();
+    mockAdapter.messageListeners[0](makeMessage());
+
+    await vi.waitFor(() => {
+      expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
+    }, { timeout: 3000 });
+
+    expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalledWith(
+      "telegram",
+      "chat-456",
+      "Hello human!",
+      expect.stringContaining("ETIMEDOUT"),
+      undefined,
+    );
+  });
+
+  it("queues response for heartbeat retry on ECONNRESET", async () => {
+    const err = new Error("socket hang up");
+    (err as NodeJS.ErrnoException).code = "ECONNRESET";
+
+    (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockRejectedValueOnce(err);
+
+    pipeline.start();
+    mockAdapter.messageListeners[0](makeMessage());
+
+    await vi.waitFor(() => {
+      expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
+    }, { timeout: 3000 });
+  });
+
+  it("does NOT queue for retry on non-transient errors", async () => {
+    (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("Bad Request: chat not found"),
+    );
+
+    pipeline.start();
+    mockAdapter.messageListeners[0](makeMessage());
+
+    // Wait for the error response to be attempted (the outer catch sends error message)
+    await vi.waitFor(() => {
+      expect(mockAdapter.sendText).toHaveBeenCalledTimes(2); // original + error response
+    }, { timeout: 3000 });
+
+    // Heartbeat should NOT have been called (not a transient error)
+    expect(mockHeartbeat.addFailedDelivery).not.toHaveBeenCalled();
+  });
+
+  it("queues background task result for retry on ETIMEDOUT", async () => {
+    const etimedoutErr = new Error("connect ETIMEDOUT");
+    (etimedoutErr as NodeJS.ErrnoException).code = "ETIMEDOUT";
+
+    (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockRejectedValueOnce(etimedoutErr);
+
+    await pipeline.pushBackgroundTaskResult({
+      id: "task-1",
+      session_key: "telegram:dm:chat-456",
+      description: "Test task",
+      prompt: "test",
+      result: "Task result text",
+      status: "completed",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    } as any);
+
+    expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalledWith(
+      "telegram",
+      "chat-456",
+      expect.stringContaining("Task result text"),
+      expect.stringContaining("ETIMEDOUT"),
+      undefined,
+    );
+  });
+
+  it("queues error response for retry when both reply and fallback fail with network error", async () => {
+    const netErr = new Error("connect ETIMEDOUT");
+    (netErr as NodeJS.ErrnoException).code = "ETIMEDOUT";
+
+    // Make security gate reject to trigger sendErrorResponse
+    (mockGate.check as ReturnType<typeof vi.fn>).mockReturnValue({
+      passed: false,
+      reason: "Not authorized",
+    });
+
+    // Both attempts fail with network error
+    (mockAdapter.sendText as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(netErr)  // first attempt with replyToId
+      .mockRejectedValueOnce(netErr); // fallback without replyToId
+
+    pipeline.start();
+    mockAdapter.messageListeners[0](makeMessage());
+
+    await vi.waitFor(() => {
+      expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
+    }, { timeout: 3000 });
+
+    expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalledWith(
+      "telegram",
+      "chat-456",
+      "Not authorized",
+      expect.stringContaining("ETIMEDOUT"),
+      undefined,
+    );
   });
 });
 

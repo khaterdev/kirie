@@ -567,7 +567,15 @@ export async function startDaemon(): Promise<void> {
 
   heartbeat.start();
   heartbeatRef.instance = heartbeat;
-  log.info("heartbeat service started");
+
+  // Wire heartbeat retry queue into the message pipeline and proactive engine
+  // so transient network errors (ETIMEDOUT, ECONNREFUSED, etc.) are retried
+  // automatically instead of losing messages.
+  pipeline.setHeartbeat(heartbeat);
+  if (proactive) {
+    proactive.setHeartbeat(heartbeat);
+  }
+  log.info("heartbeat service started (wired to pipeline + proactive for retry)");
 
   // 10b. Wire heartbeat logging + proactive engine to heartbeat ticks
   let lastTickNumber = 0;

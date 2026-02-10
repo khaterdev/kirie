@@ -23,41 +23,9 @@ import type { BackgroundTaskStore, BackgroundTask } from "../engine/background-t
 import type { AutoReplyEngine } from "../auto-reply/auto-reply.js";
 import type { UsageTracker } from "../logging/usage-tracker.js";
 import type { HeartbeatService } from "../engine/heartbeat.js";
+import { isTransientNetworkError } from "../engine/network-errors.js";
 
 const log = pino({ name: "message-pipeline" });
-
-/**
- * Network/transient error codes that warrant a retry rather than giving up.
- */
-const TRANSIENT_ERROR_CODES = new Set([
-  "ETIMEDOUT",
-  "ECONNREFUSED",
-  "ECONNRESET",
-  "ENOTFOUND",
-  "EPIPE",
-  "EAI_AGAIN",
-  "EHOSTUNREACH",
-  "ENETUNREACH",
-]);
-
-/**
- * Check whether an error is a transient network error that should be retried.
- */
-export function isTransientNetworkError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const code = (err as NodeJS.ErrnoException).code;
-  if (code && TRANSIENT_ERROR_CODES.has(code)) return true;
-  // Also match common network error messages (e.g. from Grammy/HTTP libraries)
-  const msg = err.message.toLowerCase();
-  return (
-    msg.includes("etimedout") ||
-    msg.includes("econnrefused") ||
-    msg.includes("econnreset") ||
-    msg.includes("network") ||
-    msg.includes("socket hang up") ||
-    msg.includes("fetch failed")
-  );
-}
 
 /**
  * Configuration for the MessagePipeline.
@@ -117,6 +85,15 @@ export class MessagePipeline {
   constructor(config: MessagePipelineConfig) {
     this.config = config;
     this.laneQueue = new LaneQueue<ExecutionResult>(config.debounceMs);
+  }
+
+  /**
+   * Set the heartbeat service for retry support.
+   * Called after HeartbeatService is created (it depends on the pipeline, so
+   * the pipeline is created first and the heartbeat is wired in afterwards).
+   */
+  setHeartbeat(heartbeat: HeartbeatService): void {
+    this.config.heartbeat = heartbeat;
   }
 
   /**

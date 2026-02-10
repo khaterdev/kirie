@@ -3,6 +3,7 @@ export * from "./engine/agent-engine.js";
 export * from "./engine/session-store.js";
 export * from "./engine/lane-queue.js";
 export * from "./engine/heartbeat.js";
+export * from "./engine/network-errors.js";
 export * from "./engine/v2-session-manager.js";
 export * from "./engine/workspace-manager.js";
 export * from "./engine/background-task-store.js";

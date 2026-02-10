@@ -15,7 +15,7 @@
 import { EventEmitter } from "node:events";
 import pino from "pino";
 import type { ProactiveConfig } from "../config/schema.js";
-import type { HeartbeatTickEvent } from "./heartbeat.js";
+import type { HeartbeatTickEvent, HeartbeatService } from "./heartbeat.js";
 import type {
   Signal,
   SignalDetector,
@@ -155,6 +155,15 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
       },
       "proactive engine initialized",
     );
+  }
+
+  /**
+   * Wire the heartbeat service into the notification manager for retry support.
+   * Called after HeartbeatService is created (it depends on ProactiveEngine
+   * via ticks, so the engine is created first).
+   */
+  setHeartbeat(heartbeat: HeartbeatService): void {
+    this.notificationManager.setHeartbeat(heartbeat);
   }
 
   /**
