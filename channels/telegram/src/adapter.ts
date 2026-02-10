@@ -176,14 +176,15 @@ export class TelegramAdapter implements ChannelAdapter {
     const results: SentMessage[] = [];
 
     for (const chunk of chunks) {
-      const baseOpts = {
-        ...(params.ctx.replyToId
-          ? { reply_parameters: { message_id: Number(params.ctx.replyToId) } }
-          : {}),
-        ...(params.ctx.threadId
-          ? { message_thread_id: Number(params.ctx.threadId) }
-          : {}),
-      };
+      const threadOpts = params.ctx.threadId
+        ? { message_thread_id: Number(params.ctx.threadId) }
+        : {};
+
+      const replyOpts = params.ctx.replyToId
+        ? { reply_parameters: { message_id: Number(params.ctx.replyToId) } }
+        : {};
+
+      const baseOpts = { ...replyOpts, ...threadOpts };
 
       let sent;
       try {
@@ -199,11 +200,52 @@ export class TelegramAdapter implements ChannelAdapter {
           err instanceof Error &&
           err.message.includes("can't parse entities");
         if (isParseError) {
-          sent = await this.bot!.api.sendMessage(
-            params.ctx.chatId,
-            chunk,
-            baseOpts,
-          );
+          try {
+            sent = await this.bot!.api.sendMessage(
+              params.ctx.chatId,
+              chunk,
+              baseOpts,
+            );
+          } catch (plainErr: unknown) {
+            // If the plain-text send also fails AND we were trying to reply,
+            // fall back to sending without reply_parameters
+            if (params.ctx.replyToId) {
+              const fallbackOpts = { ...threadOpts };
+              sent = await this.bot!.api.sendMessage(
+                params.ctx.chatId,
+                chunk,
+                fallbackOpts,
+              );
+            } else {
+              throw plainErr;
+            }
+          }
+        } else if (params.ctx.replyToId) {
+          // Non-parse error while replying — fall back to sending without
+          // reply_parameters so the message isn't silently lost
+          try {
+            const fallbackOpts = { ...threadOpts };
+            sent = await this.bot!.api.sendMessage(
+              params.ctx.chatId,
+              chunk,
+              { ...fallbackOpts, parse_mode: "Markdown" },
+            );
+          } catch (fallbackErr: unknown) {
+            // Markdown fallback also failed — try plain text without reply
+            const isFallbackParseError =
+              fallbackErr instanceof Error &&
+              fallbackErr.message.includes("can't parse entities");
+            if (isFallbackParseError) {
+              const fallbackOpts = { ...threadOpts };
+              sent = await this.bot!.api.sendMessage(
+                params.ctx.chatId,
+                chunk,
+                fallbackOpts,
+              );
+            } else {
+              throw fallbackErr;
+            }
+          }
         } else {
           throw err;
         }

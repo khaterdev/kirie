@@ -170,6 +170,98 @@ describe("MessagePipeline", () => {
     });
   });
 
+  describe("schedule-injected messages", () => {
+    it("does not set replyToId for schedule-injected messages", async () => {
+      // Add isRunning to the mock registry
+      (mockRegistry as any).isRunning = vi.fn(() => true);
+
+      pipeline.start();
+
+      // Use injectScheduleMessage which creates a message with id "schedule-..."
+      await pipeline.injectScheduleMessage({
+        channel: "telegram",
+        chatId: "chat-456",
+        text: "Scheduled reminder",
+        senderId: "user-123",
+        senderName: "Schedule",
+      });
+
+      await vi.waitFor(() => {
+        expect(mockAdapter.sendText).toHaveBeenCalled();
+      }, { timeout: 3000 });
+
+      // Find the response send call (not the typing indicator)
+      const sendCalls = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls;
+      const responseSend = sendCalls.find(
+        (call: any[]) => call[0].text === "Hello human!",
+      );
+      expect(responseSend).toBeDefined();
+      // replyToId should NOT be set for schedule messages
+      expect(responseSend![0].ctx.replyToId).toBeUndefined();
+    });
+
+    it("sends error responses without replyToId for schedule messages", async () => {
+      (mockRegistry as any).isRunning = vi.fn(() => true);
+      (mockEngine.execute as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("Something broke"),
+      );
+
+      pipeline.start();
+
+      await pipeline.injectScheduleMessage({
+        channel: "telegram",
+        chatId: "chat-456",
+        text: "Scheduled reminder",
+        senderId: "user-123",
+      });
+
+      await vi.waitFor(() => {
+        expect(mockAdapter.sendText).toHaveBeenCalled();
+      }, { timeout: 3000 });
+
+      const sendCalls = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls;
+      const errorSend = sendCalls.find(
+        (call: any[]) => call[0].text.includes("internal error"),
+      );
+      expect(errorSend).toBeDefined();
+      expect(errorSend![0].ctx.replyToId).toBeUndefined();
+    });
+  });
+
+  describe("error response reply fallback", () => {
+    it("falls back to sending without replyToId when reply fails", async () => {
+      // Make security gate reject the message
+      (mockGate.check as ReturnType<typeof vi.fn>).mockReturnValue({
+        passed: false,
+        reason: "Not authorized",
+      });
+
+      // First call (with replyToId) fails, second call (without) succeeds
+      let callCount = 0;
+      (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockImplementation(
+        async (params: any) => {
+          callCount++;
+          if (callCount === 1 && params.ctx.replyToId) {
+            throw new Error("Bad Request: message to reply not found");
+          }
+          return [{ id: "sent-1", timestamp: Date.now() }];
+        },
+      );
+
+      pipeline.start();
+      mockAdapter.messageListeners[0](makeMessage());
+
+      await vi.waitFor(() => {
+        expect(mockAdapter.sendText).toHaveBeenCalledTimes(2);
+      }, { timeout: 3000 });
+
+      // Second call should NOT have replyToId
+      const secondCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[1][0];
+      expect(secondCall.ctx.replyToId).toBeUndefined();
+      expect(secondCall.text).toContain("Not authorized");
+    });
+  });
+
   describe("start/stop", () => {
     it("does not process messages after stop", () => {
       pipeline.start();

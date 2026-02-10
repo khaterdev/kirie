@@ -22,8 +22,42 @@ import type { ChatHistoryStore } from "../mcp/tools/chat-history.js";
 import type { BackgroundTaskStore, BackgroundTask } from "../engine/background-task-store.js";
 import type { AutoReplyEngine } from "../auto-reply/auto-reply.js";
 import type { UsageTracker } from "../logging/usage-tracker.js";
+import type { HeartbeatService } from "../engine/heartbeat.js";
 
 const log = pino({ name: "message-pipeline" });
+
+/**
+ * Network/transient error codes that warrant a retry rather than giving up.
+ */
+const TRANSIENT_ERROR_CODES = new Set([
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EPIPE",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+]);
+
+/**
+ * Check whether an error is a transient network error that should be retried.
+ */
+export function isTransientNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code && TRANSIENT_ERROR_CODES.has(code)) return true;
+  // Also match common network error messages (e.g. from Grammy/HTTP libraries)
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("etimedout") ||
+    msg.includes("econnrefused") ||
+    msg.includes("econnreset") ||
+    msg.includes("network") ||
+    msg.includes("socket hang up") ||
+    msg.includes("fetch failed")
+  );
+}
 
 /**
  * Configuration for the MessagePipeline.
@@ -51,6 +85,8 @@ export interface MessagePipelineConfig {
   model?: string;
   /** Optional transcription provider for auto-transcribing audio/voice media */
   transcriptionProvider?: TranscriptionProvider;
+  /** Optional heartbeat service for retrying failed message deliveries */
+  heartbeat?: HeartbeatService;
 }
 
 /**
@@ -209,16 +245,22 @@ export class MessagePipeline {
         });
         if (autoResponse) {
           log.info({ messageId, channel }, "auto-reply matched");
-          const autoReceipts = await sourceAdapter.sendText({
-            ctx: {
-              chatId: message.chatId,
-              threadId: message.threadId,
-              replyToId: message.id,
-            },
-            text: autoResponse,
-          });
-          for (const r of autoReceipts) {
-            this.trackSentMessage(message.chatId, r.id, autoResponse);
+          const isScheduleMsg = message.id.startsWith("schedule-");
+          try {
+            const autoReceipts = await sourceAdapter.sendText({
+              ctx: {
+                chatId: message.chatId,
+                threadId: message.threadId,
+                ...(isScheduleMsg ? {} : { replyToId: message.id }),
+              },
+              text: autoResponse,
+            });
+            for (const r of autoReceipts) {
+              this.trackSentMessage(message.chatId, r.id, autoResponse);
+            }
+          } catch (autoSendErr) {
+            // On transient network errors, queue for retry instead of losing the auto-reply
+            this.queueForRetry(channel, message.chatId, autoResponse, autoSendErr, message.threadId);
           }
           return;
         }
@@ -426,14 +468,20 @@ export class MessagePipeline {
       if (result.response && !result.wasAborted) {
         // For reaction events, reply to the message that was reacted to
         // (not the synthetic reaction event ID which isn't a valid platform message).
-        const replyToId = message.reaction
-          ? message.reaction.messageId
-          : message.id;
+        // For schedule-injected messages, don't set replyToId at all — the
+        // synthetic ID (e.g. "schedule-1738000000000") isn't a real platform
+        // message ID and would cause the send to fail.
+        const isScheduleMessage = message.id.startsWith("schedule-");
+        const replyToId = isScheduleMessage
+          ? undefined
+          : message.reaction
+            ? message.reaction.messageId
+            : message.id;
 
         const ctx = {
           chatId: message.chatId,
           threadId: message.threadId,
-          replyToId,
+          ...(replyToId ? { replyToId } : {}),
         };
 
         // Parse media tokens from agent output
@@ -456,10 +504,17 @@ export class MessagePipeline {
 
         // Send cleaned text (if any remains after media extraction)
         if (parsed.text && parsed.text.trim()) {
-          const sentReceipts = await sourceAdapter.sendText({ ctx, text: parsed.text });
-          // Track sent message IDs so reactions to bot messages can be identified
-          for (const receipt of sentReceipts) {
-            this.trackSentMessage(message.chatId, receipt.id, parsed.text);
+          try {
+            const sentReceipts = await sourceAdapter.sendText({ ctx, text: parsed.text });
+            // Track sent message IDs so reactions to bot messages can be identified
+            for (const receipt of sentReceipts) {
+              this.trackSentMessage(message.chatId, receipt.id, parsed.text);
+            }
+          } catch (sendErr) {
+            // On transient network errors, queue for retry instead of losing the response
+            if (!this.queueForRetry(channel, message.chatId, parsed.text, sendErr, message.threadId)) {
+              throw sendErr; // Non-transient error — let the outer catch handle it
+            }
           }
         }
 
@@ -523,22 +578,22 @@ export class MessagePipeline {
    * Called by the BackgroundTaskManager's onTaskComplete callback.
    */
   async pushBackgroundTaskResult(task: BackgroundTask): Promise<void> {
+    const parts = parseSessionKey(task.session_key);
+    if (!parts) {
+      log.warn({ sessionKey: task.session_key }, "cannot parse session key for task result push");
+      return;
+    }
+
+    const adapter = this.config.channelRegistry.getById(parts.channel);
+    if (!adapter || !this.config.channelRegistry.isRunning(parts.channel)) {
+      log.warn({ channel: parts.channel }, "channel not available for task result push");
+      return;
+    }
+
+    const resultText = task.result || "Task completed (no result text)";
+    const text = `Background task completed: ${task.description}\n\n${resultText}`;
+
     try {
-      const parts = parseSessionKey(task.session_key);
-      if (!parts) {
-        log.warn({ sessionKey: task.session_key }, "cannot parse session key for task result push");
-        return;
-      }
-
-      const adapter = this.config.channelRegistry.getById(parts.channel);
-      if (!adapter || !this.config.channelRegistry.isRunning(parts.channel)) {
-        log.warn({ channel: parts.channel }, "channel not available for task result push");
-        return;
-      }
-
-      const resultText = task.result || "Task completed (no result text)";
-      const text = `Background task completed: ${task.description}\n\n${resultText}`;
-
       await adapter.sendText({
         ctx: { chatId: parts.chatId },
         text,
@@ -546,7 +601,10 @@ export class MessagePipeline {
 
       log.info({ taskId: task.id, channel: parts.channel, chatId: parts.chatId }, "pushed background task result");
     } catch (err) {
-      log.error({ taskId: task.id, err }, "failed to push background task result");
+      // On transient network errors, queue for retry instead of losing the result
+      if (!this.queueForRetry(parts.channel, parts.chatId, text, err)) {
+        log.error({ taskId: task.id, err }, "failed to push background task result");
+      }
     }
   }
 
@@ -603,27 +661,75 @@ export class MessagePipeline {
   }
 
   /**
+   * Queue a failed message for retry via the heartbeat service.
+   * Only queues if the heartbeat service is configured and the error is transient.
+   * Returns true if the message was queued, false otherwise.
+   */
+  private queueForRetry(
+    channel: string,
+    chatId: string,
+    text: string,
+    err: unknown,
+    threadId?: string,
+  ): boolean {
+    if (!this.config.heartbeat || !isTransientNetworkError(err)) return false;
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    this.config.heartbeat.addFailedDelivery(channel, chatId, text, errorMsg, threadId);
+    log.info({ channel, chatId }, "queued failed send for retry via heartbeat");
+    return true;
+  }
+
+  /**
    * Send an error response back to the user through the source adapter.
+   * Falls back to sending without replyToId if the reply fails.
    */
   private async sendErrorResponse(
     adapter: ChannelAdapter,
     message: UnifiedMessage,
     errorText: string,
   ): Promise<void> {
-    try {
-      const replyToId = message.reaction
+    // Don't attempt to reply to schedule-injected messages — their synthetic
+    // IDs aren't valid platform message IDs.
+    const isScheduleMsg = message.id.startsWith("schedule-");
+    const replyToId = isScheduleMsg
+      ? undefined
+      : message.reaction
         ? message.reaction.messageId
         : message.id;
+
+    try {
       await adapter.sendText({
         ctx: {
           chatId: message.chatId,
           threadId: message.threadId,
-          replyToId,
+          ...(replyToId ? { replyToId } : {}),
         },
         text: errorText,
       });
     } catch (sendErr) {
-      log.error({ sendErr, originalMessage: message.id }, "failed to send error response");
+      // If we were trying to reply and it failed, retry without replyToId
+      if (replyToId) {
+        log.warn({ sendErr, originalMessage: message.id }, "reply failed for error response, retrying without reply");
+        try {
+          await adapter.sendText({
+            ctx: {
+              chatId: message.chatId,
+              threadId: message.threadId,
+            },
+            text: errorText,
+          });
+        } catch (fallbackErr) {
+          // Last resort: queue for heartbeat retry on transient network errors
+          if (!this.queueForRetry(message.channel, message.chatId, errorText, fallbackErr, message.threadId)) {
+            log.error({ fallbackErr, originalMessage: message.id }, "failed to send error response even without reply");
+          }
+        }
+      } else {
+        // Queue for heartbeat retry on transient network errors
+        if (!this.queueForRetry(message.channel, message.chatId, errorText, sendErr, message.threadId)) {
+          log.error({ sendErr, originalMessage: message.id }, "failed to send error response");
+        }
+      }
     }
   }
 }
