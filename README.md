@@ -447,6 +447,12 @@ sandbox:
 
 ---
 
+## Disclaimer
+
+There is no $KIRIE token. Any cryptocurrency or token claiming to be associated with this project is not affiliated with Kirie or its developers.
+
+---
+
 ## License
 
 [MIT](LICENSE)
