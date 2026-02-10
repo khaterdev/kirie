@@ -318,7 +318,7 @@ describe("Signal Detectors", () => {
     let originalMemoryUsage: typeof process.memoryUsage;
 
     beforeEach(() => {
-      detector = new SystemHealthDetector();
+      detector = new SystemHealthDetector(512);
       originalMemoryUsage = process.memoryUsage;
     });
 

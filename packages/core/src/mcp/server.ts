@@ -9,7 +9,7 @@ import { MemoryStore, createMemoryToolHandlers, type MemoryManagerLike } from ".
 import { ScheduleStore, createScheduleToolHandlers } from "./tools/schedule.js";
 import { createAgentsToolHandlers } from "./tools/agents-tool.js";
 import type { AgentRegistry } from "../engine/agent-registry.js";
-export type { ScheduleFireEvent, ScheduleEntry, WebhookEntry, WebhookFireEvent, ActiveHoursConfig } from "./tools/schedule.js";
+export type { ScheduleFireEvent, ScheduleDeliveryMode, ScheduleEntry, WebhookEntry, WebhookFireEvent, ActiveHoursConfig } from "./tools/schedule.js";
 export { isWithinActiveHours } from "./tools/schedule.js";
 import { createMessagingToolHandlers } from "./tools/messaging.js";
 import { ChatHistoryStore, createChatHistoryToolHandlers } from "./tools/chat-history.js";

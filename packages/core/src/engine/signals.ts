@@ -186,27 +186,33 @@ export class ChannelHealthDetector implements SignalDetector {
 // Detector: System Health
 // ---------------------------------------------------------------------------
 
-/** RSS memory threshold: 500MB */
-const MEMORY_THRESHOLD_BYTES = 500 * 1024 * 1024;
+/** Default RSS memory threshold: 1GB */
+const DEFAULT_MEMORY_THRESHOLD_MB = 1024;
 
 /**
  * Checks process-level health metrics (memory usage, etc.)
  */
 export class SystemHealthDetector implements SignalDetector {
   readonly name = "system-health";
+  private readonly thresholdBytes: number;
+
+  constructor(thresholdMB: number = DEFAULT_MEMORY_THRESHOLD_MB) {
+    this.thresholdBytes = thresholdMB * 1024 * 1024;
+  }
 
   detect(context: DetectorContext): Signal[] {
     const signals: Signal[] = [];
+    const thresholdMB = Math.round(this.thresholdBytes / (1024 * 1024));
 
     const mem = process.memoryUsage();
-    if (mem.rss > MEMORY_THRESHOLD_BYTES) {
+    if (mem.rss > this.thresholdBytes) {
       const rssMb = Math.round(mem.rss / (1024 * 1024));
       signals.push({
         id: createSignalId("system-health"),
         type: "high-memory",
         severity: "warning",
         title: `High memory usage (${rssMb}MB RSS)`,
-        details: `Process RSS is ${rssMb}MB (threshold: ${Math.round(MEMORY_THRESHOLD_BYTES / (1024 * 1024))}MB). Heap used: ${Math.round(mem.heapUsed / (1024 * 1024))}MB.`,
+        details: `Process RSS is ${rssMb}MB (threshold: ${thresholdMB}MB). Heap used: ${Math.round(mem.heapUsed / (1024 * 1024))}MB.`,
         timestamp: context.now,
         source: this.name,
       });
@@ -337,7 +343,7 @@ export function createDefaultDetectors(config: ProactiveConfig): SignalDetector[
   return [
     new TaskHealthDetector(),
     new ChannelHealthDetector(),
-    new SystemHealthDetector(),
+    new SystemHealthDetector(config.memoryThresholdMB),
     new TimeAwarenessDetector(config),
   ];
 }

@@ -64,6 +64,7 @@ interface ScheduleRow {
   session_target: string;
   at: string | null;
   timezone: string | null;
+  delivery: string | null;
 }
 
 interface WebhookRow {
@@ -76,12 +77,15 @@ interface WebhookRow {
   created_at: string;
 }
 
+export type ScheduleDeliveryMode = "announce" | "post-to-main" | "payload" | "none";
+
 export interface ScheduleFireEvent {
   name: string;
   message: string;
   channel: string;
   chatId: string;
   sessionKey?: string;
+  delivery: ScheduleDeliveryMode;
 }
 
 /**
@@ -157,6 +161,13 @@ export class ScheduleStore extends EventEmitter {
       // Column already exists
     }
 
+    // Add delivery column (announce, post-to-main, payload, none)
+    try {
+      this.db.exec(`ALTER TABLE schedules ADD COLUMN delivery TEXT DEFAULT 'announce'`);
+    } catch {
+      // Column already exists
+    }
+
     // Webhooks table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS webhooks (
@@ -224,6 +235,7 @@ export class ScheduleStore extends EventEmitter {
         message: row.message,
         channel: row.channel,
         chatId: row.chat_id,
+        delivery: (row.delivery as ScheduleDeliveryMode) || "announce",
       };
 
       // For isolated sessions, generate a unique session key

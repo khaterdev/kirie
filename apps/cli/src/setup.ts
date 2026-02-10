@@ -513,11 +513,26 @@ export async function runSetup(): Promise<void> {
       process.exit(0);
     }
 
+    const memoryThreshold = await p.text({
+      message: "Memory threshold in MB (alert when RSS exceeds this)",
+      initialValue: "1024",
+      validate: (v) => {
+        const n = Number(v);
+        if (!Number.isInteger(n) || n < 128) return "Must be at least 128";
+        return undefined;
+      },
+    });
+    if (isCancelled(memoryThreshold)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+
     proactiveConfig = {
       enabled: true,
       tier2IntervalMinutes: Number(triageInterval),
       tier2Model: "claude-haiku-4-5-20241022",
       tier3Model: "claude-opus-4-6",
+      memoryThresholdMB: Number(memoryThreshold),
       activeHours: {
         start: "00:00",
         end: "23:59",

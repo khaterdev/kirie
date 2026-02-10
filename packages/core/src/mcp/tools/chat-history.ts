@@ -166,15 +166,23 @@ export class ChatHistoryStore {
     } catch { /* non-fatal */ }
   }
 
-  recent(sessionKey: string, limit: number = 50): ChatHistoryEntry[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM messages
-         WHERE session_key = ?
-         ORDER BY created_at ASC, id ASC
-         LIMIT ?`,
-      )
-      .all(sessionKey, limit) as ChatHistoryRow[];
+  recent(sessionKey?: string, limit: number = 50): ChatHistoryEntry[] {
+    const sql = sessionKey
+      ? `SELECT * FROM (
+           SELECT * FROM messages
+           WHERE session_key = ?
+           ORDER BY id DESC
+           LIMIT ?
+         ) sub ORDER BY id ASC`
+      : `SELECT * FROM (
+           SELECT * FROM messages
+           ORDER BY id DESC
+           LIMIT ?
+         ) sub ORDER BY id ASC`;
+
+    const rows = sessionKey
+      ? this.db.prepare(sql).all(sessionKey, limit) as ChatHistoryRow[]
+      : this.db.prepare(sql).all(limit) as ChatHistoryRow[];
 
     return rows.map((row) => this.rowToEntry(row));
   }
@@ -341,22 +349,22 @@ export function createChatHistoryToolHandlers(store: ChatHistoryStore) {
   return {
     chat_history_recent: {
       description:
-        "Retrieve recent chat messages for a session. Returns messages in chronological order (oldest first).",
+        "Retrieve recent chat messages. If sessionKey is provided, returns messages for that session only. Otherwise returns recent messages across all sessions. Messages are in chronological order (oldest first).",
       parameters: {
         type: "object" as const,
         properties: {
           sessionKey: {
             type: "string" as const,
-            description: "Session key to retrieve messages for (e.g., 'telegram:dm:12345')",
+            description: "Optional session key to filter by (e.g., 'telegram:dm:12345'). Omit to get recent messages across all sessions.",
           },
           limit: {
             type: "number" as const,
             description: "Maximum number of messages to return (default 50)",
           },
         },
-        required: ["sessionKey"] as const,
+        required: [] as const,
       },
-      handler(params: { sessionKey: string; limit?: number }): ChatHistoryEntry[] {
+      handler(params: { sessionKey?: string; limit?: number }): ChatHistoryEntry[] {
         return store.recent(params.sessionKey, params.limit);
       },
     },

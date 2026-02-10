@@ -505,7 +505,36 @@ export async function startDaemon(): Promise<void> {
     channelRegistry,
     scheduleStore,
     onScheduleFire: async (event: ScheduleFireEvent) => {
-      // Route the scheduled message through the channel adapter
+      const delivery = event.delivery || "announce";
+
+      if (delivery === "none") {
+        return;
+      }
+
+      if (delivery === "post-to-main") {
+        // Route through the message pipeline so the agent processes it
+        await pipeline.injectScheduleMessage({
+          channel: event.channel,
+          chatId: event.chatId,
+          text: event.message,
+          senderId: event.chatId, // Use chatId as senderId (owner's DM)
+          senderName: "Schedule",
+        });
+        return;
+      }
+
+      if (delivery === "payload") {
+        // Spawn a background task to process the message
+        const sessionKey = `${event.channel}:dm:${event.chatId}`;
+        backgroundTaskStore.create(
+          sessionKey,
+          `Scheduled task: ${event.name}`,
+          event.message,
+        );
+        return;
+      }
+
+      // Default: "announce" — send raw text directly
       const adapter = channelRegistry.getById(event.channel);
       if (!adapter) {
         throw new Error(`Channel "${event.channel}" not found for schedule "${event.name}"`);

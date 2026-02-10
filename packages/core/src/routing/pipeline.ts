@@ -551,6 +551,36 @@ export class MessagePipeline {
   }
 
   /**
+   * Inject a scheduled message into the pipeline as if a user sent it.
+   * Used by "post-to-main" delivery mode so the agent actually processes the message.
+   */
+  async injectScheduleMessage(opts: {
+    channel: string;
+    chatId: string;
+    text: string;
+    senderId: string;
+    senderName?: string;
+  }): Promise<void> {
+    const adapter = this.config.channelRegistry.getById(opts.channel);
+    if (!adapter || !this.config.channelRegistry.isRunning(opts.channel)) {
+      log.warn({ channel: opts.channel }, "channel not available for schedule injection");
+      return;
+    }
+
+    const syntheticMessage: UnifiedMessage = {
+      id: `schedule-${Date.now()}`,
+      channel: opts.channel as ChannelName,
+      senderId: opts.senderId,
+      senderName: opts.senderName || "Schedule",
+      text: opts.text,
+      chatType: "dm",
+      chatId: opts.chatId,
+    };
+
+    await this.handleMessage(syntheticMessage, adapter);
+  }
+
+  /**
    * Start a repeating typing indicator. Fires immediately and then
    * every 4 seconds (most platforms expire typing after ~5s).
    * Returns the interval handle so the caller can clear it.

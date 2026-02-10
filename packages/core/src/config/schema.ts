@@ -288,6 +288,8 @@ export const ProactiveConfigSchema = z.object({
   dailyDigestTime: z.string().default("09:00"),
   /** Path to the heartbeat checklist file */
   heartbeatFile: z.string().default("~/.kirie/HEARTBEAT.md"),
+  /** RSS memory threshold in MB before triggering a high-memory warning */
+  memoryThresholdMB: z.number().int().min(128).default(1024),
   /** Cooldown in minutes before re-notifying about the same signal type (0 = no cooldown) */
   notificationCooldownMinutes: z.number().min(0).default(60),
   /** Heartbeat logging configuration */
