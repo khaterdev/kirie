@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { EventEmitter } from "node:events";
+import type { BackgroundTaskStore } from "../../engine/background-task-store.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "memory.db");
 
@@ -95,6 +96,7 @@ export interface ScheduleFireEvent {
 export class ScheduleStore extends EventEmitter {
   private db: Database.Database;
   private jobs: Map<string, Cron> = new Map();
+  private backgroundTaskStore: BackgroundTaskStore | null = null;
 
   constructor(dbPath?: string) {
     super();
@@ -107,6 +109,14 @@ export class ScheduleStore extends EventEmitter {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.migrate();
+  }
+
+  /**
+   * Set the BackgroundTaskStore reference for auto-canceling spawned tasks
+   * when a schedule is deleted.
+   */
+  setBackgroundTaskStore(store: BackgroundTaskStore): void {
+    this.backgroundTaskStore = store;
   }
 
   private migrate(): void {
@@ -417,6 +427,23 @@ export class ScheduleStore extends EventEmitter {
   }
 
   delete(name: string): boolean {
+    // Auto-cancel any running/pending background tasks spawned by this schedule.
+    // Payload-delivery crons create background tasks with description "Scheduled task: <name>".
+    if (this.backgroundTaskStore) {
+      const row = this.db
+        .prepare("SELECT delivery FROM schedules WHERE name = ?")
+        .get(name) as { delivery: string | null } | undefined;
+
+      if (row?.delivery === "payload") {
+        const prefix = `Scheduled task: ${name}`;
+        const activeTasks = this.backgroundTaskStore.listByDescription(prefix, true);
+        for (const task of activeTasks) {
+          this.backgroundTaskStore.addCommand(task.id, "kill");
+          this.backgroundTaskStore.markCancelled(task.id);
+        }
+      }
+    }
+
     const job = this.jobs.get(name);
     if (job) {
       job.stop();

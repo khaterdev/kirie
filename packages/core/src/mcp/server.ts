@@ -111,6 +111,9 @@ export function createMcpToolRegistry(options: McpServerOptions): {
     options.heartbeatLogLevels as import("./tools/heartbeat-logs.js").HeartbeatLogMinLevels | undefined,
   );
 
+  // Wire background task store into schedule store for auto-cancel on delete
+  scheduleStore.setBackgroundTaskStore(backgroundTaskStore);
+
   // Load persisted schedules
   scheduleStore.loadAll();
 

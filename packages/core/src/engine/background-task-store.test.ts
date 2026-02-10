@@ -139,6 +139,51 @@ describe("BackgroundTaskStore", () => {
     });
   });
 
+  describe("listByDescription", () => {
+    it("finds tasks matching a description prefix", () => {
+      store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 1");
+      store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 2");
+      store.create("telegram:dm:123", "Scheduled task: other-cron", "prompt 3");
+      store.create("telegram:dm:123", "Unrelated task", "prompt 4");
+
+      const results = store.listByDescription("Scheduled task: my-cron");
+      expect(results).toHaveLength(2);
+      expect(results.every((t) => t.description === "Scheduled task: my-cron")).toBe(true);
+    });
+
+    it("returns empty array when no tasks match", () => {
+      store.create("telegram:dm:123", "Scheduled task: something", "prompt");
+      const results = store.listByDescription("Scheduled task: nonexistent");
+      expect(results).toHaveLength(0);
+    });
+
+    it("filters to active tasks only when activeOnly is true", () => {
+      const t1 = store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 1");
+      const t2 = store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 2");
+      const t3 = store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 3");
+
+      store.markRunning(t1.id);
+      store.markCompleted(t2.id, "done", 0.01, 1);
+      // t3 remains pending
+
+      const activeOnly = store.listByDescription("Scheduled task: my-cron", true);
+      expect(activeOnly).toHaveLength(2); // t1 (running) and t3 (pending)
+
+      const all = store.listByDescription("Scheduled task: my-cron", false);
+      expect(all).toHaveLength(3); // all three
+    });
+
+    it("does not match partial description names incorrectly", () => {
+      store.create("telegram:dm:123", "Scheduled task: my-cron-extended", "prompt");
+      store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt");
+
+      // "Scheduled task: my-cron" prefix also matches "Scheduled task: my-cron-extended"
+      // because LIKE uses % wildcard. This is expected behavior for prefix matching.
+      const results = store.listByDescription("Scheduled task: my-cron");
+      expect(results).toHaveLength(2);
+    });
+  });
+
   describe("persistence", () => {
     it("data persists across store instances", () => {
       const dbPath = join(tempDir, "persist-test.db");

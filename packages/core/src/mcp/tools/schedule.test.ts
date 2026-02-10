@@ -2,19 +2,25 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { ScheduleStore, createScheduleToolHandlers, type ScheduleFireEvent } from "./schedule.js";
+import { BackgroundTaskStore } from "../../engine/background-task-store.js";
 
 const TEST_DIR = `/tmp/kirie-schedule-test-${process.pid}`;
 const TEST_DB = join(TEST_DIR, "schedule.db");
+const TEST_BG_DB = join(TEST_DIR, "background-tasks.db");
 
 let store: ScheduleStore;
+let bgStore: BackgroundTaskStore;
 
 beforeEach(() => {
   mkdirSync(TEST_DIR, { recursive: true });
   store = new ScheduleStore(TEST_DB);
+  bgStore = new BackgroundTaskStore(TEST_BG_DB);
+  store.setBackgroundTaskStore(bgStore);
 });
 
 afterEach(() => {
   store.close();
+  bgStore.close();
   rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
@@ -130,6 +136,75 @@ describe("ScheduleStore", () => {
       store.delete("active-job");
       // Job should be stopped and removed
       expect(store.get("active-job")).toBeNull();
+    });
+
+    it("auto-cancels running background tasks for payload-delivery schedules", () => {
+      // Create a payload-delivery schedule
+      store.create("my-payload-cron", "0 9 * * *", "do stuff", "telegram", "chat-1");
+      // Set delivery to payload via DB
+      store.getDb().prepare("UPDATE schedules SET delivery = 'payload' WHERE name = ?").run("my-payload-cron");
+
+      // Create some background tasks that look like they were spawned by this cron
+      const t1 = bgStore.create("telegram:dm:chat-1", "Scheduled task: my-payload-cron", "prompt 1");
+      const t2 = bgStore.create("telegram:dm:chat-1", "Scheduled task: my-payload-cron", "prompt 2");
+      bgStore.markRunning(t1.id);
+      // t2 remains pending
+
+      // Also create a completed task (should NOT be cancelled)
+      const t3 = bgStore.create("telegram:dm:chat-1", "Scheduled task: my-payload-cron", "prompt 3");
+      bgStore.markCompleted(t3.id, "done", 0.01, 1);
+
+      // Also create a task for a different cron (should NOT be touched)
+      const t4 = bgStore.create("telegram:dm:chat-1", "Scheduled task: other-cron", "prompt 4");
+
+      // Delete the schedule
+      store.delete("my-payload-cron");
+
+      // Running and pending tasks for this cron should be cancelled
+      expect(bgStore.get(t1.id)!.status).toBe("cancelled");
+      expect(bgStore.get(t2.id)!.status).toBe("cancelled");
+
+      // Completed task should NOT be touched
+      expect(bgStore.get(t3.id)!.status).toBe("completed");
+
+      // Other cron's task should NOT be touched
+      expect(bgStore.get(t4.id)!.status).toBe("pending");
+    });
+
+    it("sends kill commands for auto-cancelled tasks", () => {
+      store.create("kill-test-cron", "0 9 * * *", "do stuff", "telegram", "chat-1");
+      store.getDb().prepare("UPDATE schedules SET delivery = 'payload' WHERE name = ?").run("kill-test-cron");
+
+      const t1 = bgStore.create("telegram:dm:chat-1", "Scheduled task: kill-test-cron", "prompt");
+      bgStore.markRunning(t1.id);
+
+      store.delete("kill-test-cron");
+
+      // Should have a kill command queued
+      const commands = bgStore.getUnprocessedCommands();
+      const killCmds = commands.filter((c) => c.task_id === t1.id && c.action === "kill");
+      expect(killCmds).toHaveLength(1);
+    });
+
+    it("does NOT auto-cancel tasks for non-payload schedules", () => {
+      // Default delivery is 'announce'
+      store.create("announce-cron", "0 9 * * *", "msg", "telegram", "chat-1");
+
+      // Even if there happen to be tasks with matching description
+      const t1 = bgStore.create("telegram:dm:chat-1", "Scheduled task: announce-cron", "prompt");
+
+      store.delete("announce-cron");
+
+      // Task should NOT be cancelled (delivery is announce, not payload)
+      expect(bgStore.get(t1.id)!.status).toBe("pending");
+    });
+
+    it("works gracefully when no backgroundTaskStore is set", () => {
+      const standaloneStore = new ScheduleStore(join(TEST_DIR, "standalone.db"));
+      // NOT calling setBackgroundTaskStore — should not throw
+      standaloneStore.create("standalone-cron", "0 9 * * *", "msg", "telegram", "chat-1");
+      expect(standaloneStore.delete("standalone-cron")).toBe(true);
+      standaloneStore.close();
     });
   });
 

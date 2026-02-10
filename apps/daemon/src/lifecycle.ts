@@ -470,6 +470,10 @@ export async function startDaemon(): Promise<void> {
   );
   log.info({ toolCount: tools.size }, "MCP tools registered");
 
+  // Wire the daemon's background task store into the schedule store so that
+  // deleting a payload-delivery cron auto-cancels its spawned background tasks.
+  scheduleStore.setBackgroundTaskStore(backgroundTaskStore);
+
   // 8. Auto-reply engine (fast command responses, bypasses agent)
   const autoReply = new AutoReplyEngine();
   // Register basic commands now; stop/stopall/clear added after pipeline is created

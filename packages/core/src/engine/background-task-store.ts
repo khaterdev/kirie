@@ -201,6 +201,31 @@ export class BackgroundTaskStore {
   }
 
   /**
+   * Find tasks whose description starts with the given prefix.
+   * Optionally filter to only active (pending/running) tasks.
+   */
+  listByDescription(descriptionPrefix: string, activeOnly = false): BackgroundTask[] {
+    const pattern = descriptionPrefix + "%";
+    let rows: BackgroundTaskRow[];
+
+    if (activeOnly) {
+      rows = this.db
+        .prepare(
+          "SELECT * FROM background_tasks WHERE description LIKE ? AND status IN ('pending', 'running') ORDER BY created_at DESC",
+        )
+        .all(pattern) as BackgroundTaskRow[];
+    } else {
+      rows = this.db
+        .prepare(
+          "SELECT * FROM background_tasks WHERE description LIKE ? ORDER BY created_at DESC",
+        )
+        .all(pattern) as BackgroundTaskRow[];
+    }
+
+    return rows.map((row) => this.rowToTask(row));
+  }
+
+  /**
    * Update task status to running and set the SDK session ID.
    */
   markRunning(id: string, sdkSessionId?: string): void {
