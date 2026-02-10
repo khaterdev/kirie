@@ -172,17 +172,27 @@ export class WhatsAppAdapter implements ChannelAdapter {
     const results: SentMessage[] = [];
 
     for (const chunk of chunks) {
-      const sent = await this.socket!.sendMessage(jid, {
-        text: chunk,
-      }, params.ctx.replyToId ? {
-        quoted: {
-          key: {
-            remoteJid: jid,
-            id: params.ctx.replyToId,
-          },
-          message: {},
-        } as Parameters<WASocket["sendMessage"]>[2] extends { quoted?: infer Q } ? Q : never,
-      } : undefined);
+      let sent;
+      if (params.ctx.replyToId) {
+        try {
+          sent = await this.socket!.sendMessage(jid, {
+            text: chunk,
+          }, {
+            quoted: {
+              key: {
+                remoteJid: jid,
+                id: params.ctx.replyToId,
+              },
+              message: {},
+            } as Parameters<WASocket["sendMessage"]>[2] extends { quoted?: infer Q } ? Q : never,
+          });
+        } catch {
+          // Reply failed (e.g. original message deleted) — retry without quote
+          sent = await this.socket!.sendMessage(jid, { text: chunk });
+        }
+      } else {
+        sent = await this.socket!.sendMessage(jid, { text: chunk });
+      }
 
       results.push({
         id: sent?.key.id ?? `${Date.now()}`,

@@ -429,6 +429,71 @@ describe("MessagePipeline retry integration", () => {
     );
   });
 
+  it("queues media send for heartbeat retry on transient network error", async () => {
+    // Agent responds with a MEDIA: token (the format splitMediaFromOutput expects)
+    (mockEngine.execute as ReturnType<typeof vi.fn>).mockResolvedValue({
+      response: "Here is the file\nMEDIA: https://example.com/file.png",
+      sessionId: "sdk-sess-1",
+      costUsd: 0.01,
+      numTurns: 1,
+      isError: false,
+    });
+
+    // Enable sendMedia on the adapter
+    const sendMediaMock = vi.fn();
+    const etimedoutErr = new Error("connect ETIMEDOUT");
+    (etimedoutErr as NodeJS.ErrnoException).code = "ETIMEDOUT";
+    sendMediaMock.mockRejectedValueOnce(etimedoutErr);
+
+    (mockAdapter as any).sendMedia = sendMediaMock;
+    (mockAdapter as any).capabilities.sendMedia = true;
+
+    pipeline.start();
+    mockAdapter.messageListeners[0](makeMessage());
+
+    await vi.waitFor(() => {
+      expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
+    }, { timeout: 3000 });
+
+    // Should queue a text fallback for the failed media
+    expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalledWith(
+      "telegram",
+      "chat-456",
+      expect.stringContaining("[media:"),
+      expect.stringContaining("ETIMEDOUT"),
+      undefined,
+    );
+  });
+
+  it("does NOT queue media send for retry on non-transient error", async () => {
+    // Agent responds with a MEDIA: token
+    (mockEngine.execute as ReturnType<typeof vi.fn>).mockResolvedValue({
+      response: "Here is the file\nMEDIA: https://example.com/file.png",
+      sessionId: "sdk-sess-1",
+      costUsd: 0.01,
+      numTurns: 1,
+      isError: false,
+    });
+
+    // Enable sendMedia on the adapter
+    const sendMediaMock = vi.fn();
+    sendMediaMock.mockRejectedValueOnce(new Error("File not found"));
+
+    (mockAdapter as any).sendMedia = sendMediaMock;
+    (mockAdapter as any).capabilities.sendMedia = true;
+
+    pipeline.start();
+    mockAdapter.messageListeners[0](makeMessage());
+
+    // Wait for text to be sent (the non-media part)
+    await vi.waitFor(() => {
+      expect(mockAdapter.sendText).toHaveBeenCalled();
+    }, { timeout: 3000 });
+
+    // Heartbeat should NOT have been called (not a transient error)
+    expect(mockHeartbeat.addFailedDelivery).not.toHaveBeenCalled();
+  });
+
   it("queues error response for retry when both reply and fallback fail with network error", async () => {
     const netErr = new Error("connect ETIMEDOUT");
     (netErr as NodeJS.ErrnoException).code = "ETIMEDOUT";

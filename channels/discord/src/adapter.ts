@@ -156,13 +156,22 @@ export class DiscordAdapter implements ChannelAdapter {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
-      const sent = await channel.send({
-        content: chunk,
-        // Only reply to the original message on the first chunk
-        ...(i === 0 && params.ctx.replyToId
-          ? { reply: { messageReference: params.ctx.replyToId } }
-          : {}),
-      });
+      const wantsReply = i === 0 && !!params.ctx.replyToId;
+
+      let sent;
+      if (wantsReply) {
+        try {
+          sent = await channel.send({
+            content: chunk,
+            reply: { messageReference: params.ctx.replyToId! },
+          });
+        } catch {
+          // Reply failed (e.g. original message deleted) — retry without reply
+          sent = await channel.send({ content: chunk });
+        }
+      } else {
+        sent = await channel.send({ content: chunk });
+      }
 
       results.push({
         id: sent.id,

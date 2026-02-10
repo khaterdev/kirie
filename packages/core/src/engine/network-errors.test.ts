@@ -88,4 +88,76 @@ describe("isTransientNetworkError", () => {
     expect(isTransientNetworkError(new Error("Rate limited"))).toBe(false);
     expect(isTransientNetworkError(new Error("Invalid token"))).toBe(false);
   });
+
+  // --- HTTP 5xx / 429 detection (Gap 3) ---
+
+  it("returns true for error with status 500", () => {
+    const err = new Error("server error") as Error & { status: number };
+    err.status = 500;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns true for error with status 502", () => {
+    const err = new Error("proxy error") as Error & { status: number };
+    err.status = 502;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns true for error with status 503", () => {
+    const err = new Error("unavailable") as Error & { status: number };
+    err.status = 503;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns true for error with status 504", () => {
+    const err = new Error("timeout") as Error & { status: number };
+    err.status = 504;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns true for error with status 429 (rate limit)", () => {
+    const err = new Error("too many requests") as Error & { status: number };
+    err.status = 429;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns true for error with statusCode property", () => {
+    const err = new Error("server error") as Error & { statusCode: number };
+    err.statusCode = 502;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns true for error with numeric code (HTTP status)", () => {
+    const err = new Error("error") as Error & { code: number };
+    (err as any).code = 503;
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  it("returns false for error with non-transient HTTP status", () => {
+    const err = new Error("not found") as Error & { status: number };
+    err.status = 404;
+    expect(isTransientNetworkError(err)).toBe(false);
+  });
+
+  it("returns false for error with 400 status", () => {
+    const err = new Error("bad request") as Error & { status: number };
+    err.status = 400;
+    expect(isTransientNetworkError(err)).toBe(false);
+  });
+
+  it("returns true for message containing 'Internal Server Error'", () => {
+    expect(isTransientNetworkError(new Error("HTTP 500 Internal Server Error"))).toBe(true);
+  });
+
+  it("returns true for message containing 'Bad Gateway'", () => {
+    expect(isTransientNetworkError(new Error("502 Bad Gateway"))).toBe(true);
+  });
+
+  it("returns true for message containing 'Service Unavailable'", () => {
+    expect(isTransientNetworkError(new Error("503 Service Unavailable"))).toBe(true);
+  });
+
+  it("returns true for message containing 'Gateway Timeout'", () => {
+    expect(isTransientNetworkError(new Error("504 Gateway Timeout"))).toBe(true);
+  });
 });

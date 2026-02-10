@@ -474,7 +474,11 @@ export class MessagePipeline {
                 media: { type: mediaType, url },
               });
             } catch (mediaErr) {
-              log.warn({ mediaErr, url }, "failed to send media from agent output (non-fatal)");
+              // On transient network errors, queue a text fallback for retry via heartbeat
+              const mediaFallbackText = `[media: ${url}]`;
+              if (!this.queueForRetry(channel, message.chatId, mediaFallbackText, mediaErr, message.threadId)) {
+                log.warn({ mediaErr, url }, "failed to send media from agent output (non-fatal)");
+              }
             }
           }
         }

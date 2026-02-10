@@ -153,16 +153,24 @@ export class SignalAdapter implements ChannelAdapter {
     const results: SentMessage[] = [];
 
     for (const chunk of chunks) {
-      const result = await this.client!.sendMessage(
-        params.ctx.chatId,
-        chunk,
-        params.ctx.replyToId
-          ? {
+      let result;
+      if (params.ctx.replyToId) {
+        try {
+          result = await this.client!.sendMessage(
+            params.ctx.chatId,
+            chunk,
+            {
               quoteTimestamp: Number(params.ctx.replyToId),
               quoteAuthor: params.ctx.chatId,
-            }
-          : undefined,
-      );
+            },
+          );
+        } catch {
+          // Reply failed (e.g. original message deleted) — retry without quote
+          result = await this.client!.sendMessage(params.ctx.chatId, chunk);
+        }
+      } else {
+        result = await this.client!.sendMessage(params.ctx.chatId, chunk);
+      }
 
       results.push({
         id: result.timestamp,
