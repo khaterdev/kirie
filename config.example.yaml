@@ -93,6 +93,35 @@ proactive:
       tier3: 0
       heartbeat: 14
 
+# ── External MCP Servers ─────────────────────────────────────────────────────
+# Add external MCP servers that Kirie can use alongside its built-in tools.
+# Supports stdio servers (command + args) and HTTP/SSE servers (url + headers).
+# Use ${VAR_NAME} syntax to reference environment variables in env/headers values.
+# Kirie can also manage these via the mcp_servers_add/remove tools at runtime.
+
+# mcpServers:
+#   linear:                          # Use Linear's official MCP server
+#     command: "npx"
+#     args: ["-y", "mcp-remote", "https://mcp.linear.app/mcp"]
+#     env:
+#       LINEAR_API_KEY: "${LINEAR_API_KEY}"
+#   filesystem:                      # Local filesystem MCP server
+#     command: "npx"
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+#   github:                          # GitHub MCP server
+#     command: "npx"
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     env:
+#       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+#   remote-server:                   # HTTP/SSE remote MCP server
+#     url: "https://mcp.example.com/sse"
+#     headers:
+#       Authorization: "Bearer ${API_KEY}"
+#   disabled-example:                # Disabled server (skipped at startup)
+#     command: "node"
+#     args: ["/path/to/server.js"]
+#     enabled: false
+
 # ── Optional sections (uncomment to configure) ─────────────────────────────
 
 # logging:

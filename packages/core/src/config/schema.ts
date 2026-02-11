@@ -261,6 +261,29 @@ export const NodesConfigSchema = z.object({
   defaultTimeout: z.number().int().positive().default(30_000),
 }).default({});
 
+// ── MCP Servers ─────────────────────────────────────────────────────────────
+
+/**
+ * Configuration for a single external MCP server.
+ * Supports stdio servers (command + args) and HTTP/SSE servers (url + headers).
+ */
+const McpServerEntrySchema = z.object({
+  /** Command to spawn the MCP server (stdio mode). Mutually exclusive with `url`. */
+  command: z.string().optional(),
+  /** Arguments passed to the command. */
+  args: z.array(z.string()).default([]),
+  /** Environment variables to set for the spawned process. Supports ${VAR} interpolation. */
+  env: z.record(z.string()).default({}),
+  /** URL for HTTP/SSE MCP servers (remote mode). Mutually exclusive with `command`. */
+  url: z.string().optional(),
+  /** HTTP headers sent with requests to remote MCP servers. */
+  headers: z.record(z.string()).default({}),
+  /** Whether this server is enabled. Disabled servers are skipped at startup. */
+  enabled: z.boolean().default(true),
+});
+
+export const McpServersConfigSchema = z.record(McpServerEntrySchema).default({});
+
 // ── Browser ─────────────────────────────────────────────────────────────────
 
 const BrowserConfigSchema = z.object({
@@ -334,6 +357,8 @@ export const KirieConfigSchema = z.object({
   nodes: NodesConfigSchema,
   browser: BrowserConfigSchema,
   proactive: ProactiveConfigSchema,
+  /** External MCP servers to connect alongside the built-in kirie-tools server. */
+  mcpServers: McpServersConfigSchema,
 });
 
 export type KirieConfig = z.infer<typeof KirieConfigSchema>;
@@ -351,6 +376,8 @@ export type SandboxSchemaConfig = z.infer<typeof SandboxConfigSchema>;
 export type NodesConfig = z.infer<typeof NodesConfigSchema>;
 export type ProactiveConfig = z.infer<typeof ProactiveConfigSchema>;
 export type BrowserConfig = z.infer<typeof BrowserConfigSchema>;
+export type McpServerEntry = z.infer<typeof McpServerEntrySchema>;
+export type McpServersConfig = z.infer<typeof McpServersConfigSchema>;
 
 /**
  * Pattern for detecting $credential:key references in string values.

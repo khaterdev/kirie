@@ -38,6 +38,7 @@ import type { BroadcastTarget } from "../routing/broadcast.js";
 import { createVoiceCallToolHandlers, type VoiceCallToolOptions } from "./tools/voice-call.js";
 import { createNodesToolHandlers, type NodesToolOptions } from "./tools/nodes-tool.js";
 import { createProactiveToolHandlers } from "./tools/proactive-tools.js";
+import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
 import type { ProactiveEngine } from "../engine/proactive.js";
 
 export interface McpToolDefinition {
@@ -257,6 +258,12 @@ export function createMcpToolRegistry(options: McpServerOptions): {
   // Register heartbeat log tools
   const heartbeatLogHandlers = createHeartbeatLogToolHandlers(heartbeatLogStore);
   for (const [name, def] of Object.entries(heartbeatLogHandlers)) {
+    tools.set(name, def as unknown as McpToolDefinition);
+  }
+
+  // Register MCP server management tools (list/add/remove external servers)
+  const mcpServersHandlers = createMcpServersToolHandlers();
+  for (const [name, def] of Object.entries(mcpServersHandlers)) {
     tools.set(name, def as unknown as McpToolDefinition);
   }
 

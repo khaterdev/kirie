@@ -43,6 +43,7 @@ import { createAgentsToolHandlers } from "./tools/agents-tool.js";
 import { AgentRegistry } from "../engine/agent-registry.js";
 import { MemoryManager, VectorStore, OpenAIEmbeddings, LocalEmbeddings, ensureModelDownloaded, isModelDownloaded } from "@kirie/memory";
 import { HeartbeatLogStore, createHeartbeatLogToolHandlers } from "./tools/heartbeat-logs.js";
+import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
 
 // ── Database paths ──────────────────────────────────────────────────────────
 
@@ -266,6 +267,7 @@ if (process.env.KIRIE_BROWSER_ENABLED === "1") {
 }
 registerHandlers(createImageToolHandlers());
 registerHandlers(createTTSToolHandlers());
+registerHandlers(createMcpServersToolHandlers());
 
 // Gateway-proxied tools (send_message, channel_action, proactive) — only when spawned by daemon
 if (gatewayUrl) {

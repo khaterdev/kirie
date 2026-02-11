@@ -124,7 +124,7 @@ export async function startDaemon(): Promise<void> {
   // Build the stdio MCP server config for V1 query() calls.
   // V1 query() passes this to each subprocess so it spawns the kirie-tools MCP server.
   const gatewayPort = config.gateway.port;
-  const mcpServers = {
+  const mcpServers: Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string; headers?: Record<string, string> }> = {
     "kirie-tools": {
       command: "node",
       args: [stdioServerPath],
@@ -135,7 +135,57 @@ export async function startDaemon(): Promise<void> {
       },
     },
   };
-  log.info({ stdioServerPath }, "MCP server config resolved");
+
+  // Merge external MCP servers from config
+  if (config.mcpServers) {
+    for (const [name, serverConf] of Object.entries(config.mcpServers)) {
+      if (name === "kirie-tools") {
+        log.warn("mcpServers config contains 'kirie-tools' — skipping (reserved name)");
+        continue;
+      }
+      if (serverConf.enabled === false) {
+        log.info({ server: name }, "external MCP server disabled, skipping");
+        continue;
+      }
+
+      // Resolve ${VAR} references in env values
+      const resolvedEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(serverConf.env ?? {})) {
+        resolvedEnv[k] = v.replace(/\$\{(\w+)\}/g, (_: string, varName: string) => {
+          return process.env[varName] ?? "";
+        });
+      }
+
+      // Resolve ${VAR} in headers too
+      const resolvedHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(serverConf.headers ?? {})) {
+        resolvedHeaders[k] = v.replace(/\$\{(\w+)\}/g, (_: string, varName: string) => {
+          return process.env[varName] ?? "";
+        });
+      }
+
+      if (serverConf.url) {
+        // HTTP/SSE remote server
+        mcpServers[name] = {
+          type: "http",
+          url: serverConf.url,
+          ...(Object.keys(resolvedHeaders).length > 0 ? { headers: resolvedHeaders } : {}),
+        };
+        log.info({ server: name, url: serverConf.url }, "external MCP server (HTTP) configured");
+      } else if (serverConf.command) {
+        // Stdio server
+        mcpServers[name] = {
+          command: serverConf.command,
+          args: serverConf.args ?? [],
+          ...(Object.keys(resolvedEnv).length > 0 ? { env: resolvedEnv } : {}),
+        };
+        log.info({ server: name, command: serverConf.command }, "external MCP server (stdio) configured");
+      } else {
+        log.warn({ server: name }, "external MCP server has neither 'command' nor 'url' — skipping");
+      }
+    }
+  }
+  log.info({ stdioServerPath, totalServers: Object.keys(mcpServers).length }, "MCP server config resolved");
 
   // Background task store
   const backgroundTaskStore = new BackgroundTaskStore(join(dataDir, "background-tasks.db"));
@@ -202,6 +252,13 @@ export async function startDaemon(): Promise<void> {
     "mcp__kirie-tools__heartbeat_log_time_range",
     "mcp__kirie-tools__heartbeat_log_by_tier",
     "mcp__kirie-tools__heartbeat_log_recent",
+    "mcp__kirie-tools__mcp_servers_list",
+    "mcp__kirie-tools__mcp_servers_add",
+    "mcp__kirie-tools__mcp_servers_remove",
+    // Auto-allow all tools from configured external MCP servers
+    ...Object.keys(mcpServers)
+      .filter((name) => name !== "kirie-tools")
+      .map((name) => `mcp__${name}__*`),
     // Built-in Claude Code tools — auto-allow so agents don't hit permission prompts
     "Bash(*)",
     "Read",
