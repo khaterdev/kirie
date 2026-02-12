@@ -10,6 +10,8 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 
+import { SSRFGuard } from "../../security/ssrf-guard.js";
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 // Minimal Playwright types to avoid importing playwright-core at the module level
@@ -163,6 +165,8 @@ export async function ensurePlaywrightInstalled(opts?: {
 
 // ── Tool handler ────────────────────────────────────────────────────────────
 
+const ssrfGuard = new SSRFGuard();
+
 export function createBrowserToolHandlers() {
   return {
     browser: {
@@ -216,6 +220,7 @@ export function createBrowserToolHandlers() {
 
           case "navigate": {
             if (!url) throw new Error("'url' parameter is required for navigate action");
+            await ssrfGuard.validateAsync(url);
             const { page } = await ensureBrowser();
             await page.goto(url, {
               waitUntil: "domcontentloaded",
