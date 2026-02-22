@@ -177,12 +177,25 @@ const CanvasConfigSchema = z.object({
 
 // -- Media Understanding --------------------------------------------------
 
+const LocalWhisperConfigSchema = z.object({
+  /** Path to whisper-cli binary (default: "whisper-cli" in PATH) */
+  whisperBinary: z.string().default("whisper-cli"),
+  /** Path to the GGML model file (required for local provider) */
+  modelPath: z.string(),
+  /** Language code or "auto" for auto-detect (default: "auto") */
+  language: z.string().default("auto"),
+  /** Number of threads for whisper-cpp (default: 4) */
+  threads: z.number().int().min(1).default(4),
+});
+
 const MediaUnderstandingSchema = z.object({
   audio: z.object({
     enabled: z.boolean().default(false),
-    provider: z.enum(["openai", "groq"]).default("openai"),
+    provider: z.enum(["openai", "groq", "local"]).default("openai"),
     model: z.string().optional(),
     language: z.string().optional(),
+    /** Configuration for the local whisper-cpp provider */
+    local: LocalWhisperConfigSchema.optional(),
   }).default({}),
   video: z.object({
     enabled: z.boolean().default(false),

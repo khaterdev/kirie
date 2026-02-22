@@ -29,6 +29,7 @@ import {
   registerBuiltinCommands,
 } from "@kirie/core";
 import { loadAllSkills, isEligible } from "@kirie/skills";
+import { createTranscriptionProvider } from "@kirie/media";
 import type { McpServerOptions } from "@kirie/core";
 import { AgentRegistry } from "@kirie/core";
 import { UsageTracker, UsageDashboard } from "@kirie/core";
@@ -537,6 +538,47 @@ export async function startDaemon(): Promise<void> {
   registerBuiltinCommands(autoReply, { channelRegistry, sessionStore });
   log.info("auto-reply engine initialized");
 
+  // 8b. Transcription provider (for auto-transcribing voice/audio media)
+  let transcriptionProvider: import("@kirie/media").TranscriptionProvider | undefined;
+  const audioCfg = config.mediaUnderstanding?.audio;
+  if (audioCfg?.enabled) {
+    try {
+      if (audioCfg.provider === "local") {
+        if (!audioCfg.local?.modelPath) {
+          log.warn("local transcription provider enabled but no modelPath configured — skipping");
+        } else {
+          transcriptionProvider = createTranscriptionProvider({
+            provider: "local",
+            local: {
+              whisperBinary: audioCfg.local.whisperBinary,
+              modelPath: audioCfg.local.modelPath,
+              language: audioCfg.local.language ?? audioCfg.language,
+              threads: audioCfg.local.threads,
+            },
+          });
+          log.info({ provider: "local", model: audioCfg.local.modelPath }, "local whisper transcription enabled");
+        }
+      } else {
+        // OpenAI / Groq providers require API keys
+        const apiKey = audioCfg.provider === "openai"
+          ? (process.env.OPENAI_API_KEY ?? "")
+          : (process.env.GROQ_API_KEY ?? "");
+        if (apiKey) {
+          transcriptionProvider = createTranscriptionProvider({
+            provider: audioCfg.provider,
+            apiKey,
+            model: audioCfg.model,
+          });
+          log.info({ provider: audioCfg.provider }, "audio transcription enabled");
+        } else {
+          log.warn({ provider: audioCfg.provider }, "audio transcription enabled but no API key found — skipping");
+        }
+      }
+    } catch (err) {
+      log.warn({ err }, "failed to create transcription provider");
+    }
+  }
+
   // 9. Message pipeline
   const pipeline = new MessagePipeline({
     channelRegistry,
@@ -548,6 +590,7 @@ export async function startDaemon(): Promise<void> {
     autoReply,
     usageTracker,
     model: config.agent.model,
+    transcriptionProvider,
   });
 
   // 9. Start channels

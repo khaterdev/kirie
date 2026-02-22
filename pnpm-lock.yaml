@@ -72,6 +72,9 @@ importers:
       '@kirie/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@kirie/media':
+        specifier: workspace:*
+        version: link:../../packages/media
       '@kirie/memory':
         specifier: workspace:*
         version: link:../../packages/memory

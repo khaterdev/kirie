@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@kirie/core": "workspace:*",
+    "@kirie/media": "workspace:*",
     "@kirie/channel-telegram": "workspace:*",
     "@kirie/channel-discord": "workspace:*",
     "@kirie/channel-slack": "workspace:*",
