@@ -250,12 +250,6 @@ export class MessagePipeline {
     const gateResult: GateResult = this.config.securityGate.check(message);
 
     if (!gateResult.passed) {
-      log.info({ messageId, reason: gateResult.reason }, "message rejected by security gate");
-      await this.sendErrorResponse(
-        sourceAdapter,
-        message,
-        gateResult.reason,
-      );
       return;
     }
 
