@@ -210,7 +210,14 @@ export class MessagePipeline {
       "message received",
     );
 
-    // Step 0: Auto-reply check (fast path, skips agent entirely)
+    // Step 0: Security gate (must run before anything else, including auto-reply)
+    const gateResult: GateResult = this.config.securityGate.check(message);
+
+    if (!gateResult.passed) {
+      return;
+    }
+
+    // Step 1: Auto-reply check (fast path, skips agent entirely)
     if (this.config.autoReply && message.text) {
       try {
         const autoResponse = await this.config.autoReply.match(message.text, {
@@ -246,14 +253,7 @@ export class MessagePipeline {
       }
     }
 
-    // Step 1: Security gate
-    const gateResult: GateResult = this.config.securityGate.check(message);
-
-    if (!gateResult.passed) {
-      return;
-    }
-
-    // Step 1.5: Download and save media attachments to disk
+    // Step 2: Download and save media attachments to disk
     let resolvedMedia: ResolvedMedia[] | undefined;
     if (message.media && message.media.length > 0 && sourceAdapter.downloadMedia) {
       resolvedMedia = await downloadAndSaveMedia(
@@ -263,7 +263,7 @@ export class MessagePipeline {
       );
     }
 
-    // Step 2: Route resolution
+    // Step 3: Route resolution
     // Enrich reaction messages with context about the reacted-to message
     let reactionContext: { isTargetFromBot?: boolean; targetContent?: string } | undefined;
     if (message.reaction) {
@@ -284,13 +284,13 @@ export class MessagePipeline {
       "route resolved",
     );
 
-    // Step 3: Interrupt running agent if one is active for this session
+    // Step 4: Interrupt running agent if one is active for this session
     if (this.runningQueries.has(route.sessionKey)) {
       log.info({ sessionKey: route.sessionKey }, "new message arrived while agent busy — interrupting");
       this.abortSession(route.sessionKey);
     }
 
-    // Step 4: Enqueue in LaneQueue for per-session serialization
+    // Step 5: Enqueue in LaneQueue for per-session serialization
     try {
       // Start typing indicator loop while agent is working
       const typingCtx = {
@@ -300,7 +300,7 @@ export class MessagePipeline {
       const typingInterval = this.startTypingLoop(sourceAdapter, typingCtx);
 
       const result = await this.laneQueue.enqueue(route.sessionKey, async () => {
-        // Step 5: Execute through AgentEngine
+        // Step 6: Execute through AgentEngine
         const sender = identityToSender(gateResult.identity, message.senderName);
 
         log.debug(
@@ -379,7 +379,7 @@ export class MessagePipeline {
           this.runningQueries.delete(route.sessionKey);
         }
 
-        // Step 5: Persist the new/updated session ID
+        // Step 7: Persist the new/updated session ID
         if (executionResult.sessionId) {
           this.config.sessionStore.set(route.sessionKey, executionResult.sessionId);
         }
@@ -433,7 +433,7 @@ export class MessagePipeline {
         clearInterval(typingInterval);
       });
 
-      // Step 6: Send response back through the originating channel.
+      // Step 8: Send response back through the originating channel.
       // Skip sending if the execution was aborted (user sent a new message —
       // they'll get a fresh response from the new execution).
       if (result.response && !result.wasAborted) {
