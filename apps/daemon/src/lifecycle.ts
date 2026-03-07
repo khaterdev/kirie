@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, openSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
+import { type ChildProcess, spawn } from "node:child_process";
 import pino from "pino";
 import {
   type KirieConfig,
@@ -64,6 +65,7 @@ interface DaemonState {
   usageTracker: UsageTracker;
   proactive: ProactiveEngine | null;
   heartbeatLogStore: HeartbeatLogStore | null;
+  kokoroProcess: ChildProcess | null;
 }
 
 let state: DaemonState | null = null;
@@ -125,6 +127,20 @@ export async function startDaemon(): Promise<void> {
   // Build the stdio MCP server config for V1 query() calls.
   // V1 query() passes this to each subprocess so it spawns the kirie-tools MCP server.
   const gatewayPort = config.gateway.port;
+  // Build TTS env vars from messages.tts config
+  const ttsCfg = config.messages?.tts;
+  const ttsEnv: Record<string, string> = {};
+  if (ttsCfg) {
+    if (ttsCfg.provider) ttsEnv.KIRIE_TTS_PROVIDER = ttsCfg.provider;
+    if (ttsCfg.edge?.voice) ttsEnv.KIRIE_EDGE_VOICE = ttsCfg.edge.voice;
+    if (ttsCfg.kokoro?.enabled) {
+      ttsEnv.KIRIE_KOKORO_ENABLED = "1";
+      ttsEnv.KIRIE_KOKORO_PORT = String(ttsCfg.kokoro.port ?? 18790);
+      if (ttsCfg.kokoro.voice) ttsEnv.KIRIE_KOKORO_VOICE = ttsCfg.kokoro.voice;
+      if (ttsCfg.kokoro.speed != null) ttsEnv.KIRIE_KOKORO_SPEED = String(ttsCfg.kokoro.speed);
+    }
+  }
+
   const mcpServers: Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string; headers?: Record<string, string> }> = {
     "kirie-tools": {
       command: "node",
@@ -133,6 +149,7 @@ export async function startDaemon(): Promise<void> {
         KIRIE_DB_DIR: resolve(dataDir),
         KIRIE_GATEWAY_URL: `http://127.0.0.1:${gatewayPort}`,
         ...(config.browser?.enabled ? { KIRIE_BROWSER_ENABLED: "1" } : {}),
+        ...ttsEnv,
       },
     },
   };
@@ -309,6 +326,63 @@ export async function startDaemon(): Promise<void> {
       log.info("playwright and Chromium browser ready");
     } else {
       log.info("playwright and Chromium already available");
+    }
+  }
+
+  // ── Kokoro TTS daemon (spawn early so model has time to load) ──────────
+  let kokoroProcess: ChildProcess | null = null;
+  const kokoroCfg = config.messages?.tts?.kokoro;
+  if (kokoroCfg?.enabled && kokoroCfg.daemonScript && kokoroCfg.pythonPath) {
+    const scriptPath = kokoroCfg.daemonScript;
+    const pythonPath = kokoroCfg.pythonPath;
+    if (existsSync(scriptPath) && existsSync(pythonPath)) {
+      const kokoroPort = String(kokoroCfg.port ?? 18790);
+      const kokoroVoice = kokoroCfg.voice ?? "af_heart";
+      const kokoroLang = kokoroCfg.lang ?? "a";
+
+      log.info({ script: scriptPath, port: kokoroPort, voice: kokoroVoice }, "spawning Kokoro TTS daemon");
+
+      const kokoroLogFile = join(dataDir, "kokoro-daemon.log");
+      const kokoroLogFd = openSync(kokoroLogFile, "a");
+
+      kokoroProcess = spawn(pythonPath, [
+        scriptPath,
+        "--port", kokoroPort,
+        "--voice", kokoroVoice,
+        "--lang", kokoroLang,
+      ], {
+        stdio: ["ignore", kokoroLogFd, kokoroLogFd],
+        detached: false,
+      });
+
+      kokoroProcess.on("exit", (code, signal) => {
+        log.warn({ code, signal }, "Kokoro daemon process exited");
+      });
+
+      // Non-blocking health check: wait up to 120s for the daemon to become ready
+      // (model loading can be slow). Don't block daemon startup.
+      void (async () => {
+        const healthUrl = `http://127.0.0.1:${kokoroPort}/health`;
+        const maxWait = 120_000;
+        const interval = 3_000;
+        const start = Date.now();
+        while (Date.now() - start < maxWait) {
+          try {
+            const resp = await fetch(healthUrl, { signal: AbortSignal.timeout(2000) });
+            if (resp.ok) {
+              const body = await resp.json() as { ready?: boolean };
+              if (body.ready) {
+                log.info({ port: kokoroPort, elapsed: Date.now() - start }, "Kokoro daemon is ready");
+                return;
+              }
+            }
+          } catch { /* daemon not ready yet */ }
+          await new Promise((r) => setTimeout(r, interval));
+        }
+        log.warn("Kokoro daemon did not become ready within 120s — TTS may fail");
+      })();
+    } else {
+      log.warn({ scriptPath, pythonPath }, "Kokoro daemon enabled but script/python not found — skipping");
     }
   }
 
@@ -921,6 +995,7 @@ export async function startDaemon(): Promise<void> {
     usageTracker,
     proactive,
     heartbeatLogStore,
+    kokoroProcess,
   };
 
   // 14. Signal handlers (registered once to avoid stacking on restart)
@@ -1010,7 +1085,20 @@ export async function stopDaemon(): Promise<void> {
     backgroundTaskManager, backgroundTaskStore, usageTracker,
     proactive: proactiveEngine,
     heartbeatLogStore: hbLogStore,
+    kokoroProcess: kokoroProc,
   } = state;
+
+  // 0a. Kill Kokoro daemon process
+  if (kokoroProc && !kokoroProc.killed) {
+    log.info("stopping Kokoro TTS daemon");
+    kokoroProc.kill("SIGTERM");
+    // Give it 3s to shut down gracefully, then SIGKILL
+    setTimeout(() => {
+      if (!kokoroProc.killed) {
+        kokoroProc.kill("SIGKILL");
+      }
+    }, 3000);
+  }
 
   // 0. Stop proactive engine (before heartbeat so it stops receiving ticks)
   if (proactiveEngine) {

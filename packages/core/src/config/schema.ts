@@ -350,6 +350,34 @@ export const ProactiveConfigSchema = z.object({
   }).default({}),
 }).default({});
 
+// ── Messages TTS ────────────────────────────────────────────────────────────
+
+const EdgeTTSConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  voice: z.string().default("en-US-AriaNeural"),
+});
+
+const KokoroTTSConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  port: z.number().int().min(1).max(65535).default(18790),
+  voice: z.string().default("af_heart"),
+  lang: z.string().default("a"),
+  speed: z.number().default(1.0),
+  pythonPath: z.string().default("python3"),
+  daemonScript: z.string().default(""),
+});
+
+const MessagesTTSConfigSchema = z.object({
+  auto: z.enum(["off", "edge", "kokoro", "openai", "elevenlabs"]).default("off"),
+  provider: z.enum(["edge", "kokoro", "openai", "elevenlabs"]).default("edge"),
+  edge: EdgeTTSConfigSchema.default({}),
+  kokoro: KokoroTTSConfigSchema.default({}),
+}).default({});
+
+const MessagesConfigSchema = z.object({
+  tts: MessagesTTSConfigSchema,
+}).default({});
+
 // ── Root ─────────────────────────────────────────────────────────────────────
 
 export const KirieConfigSchema = z.object({
@@ -372,6 +400,8 @@ export const KirieConfigSchema = z.object({
   proactive: ProactiveConfigSchema,
   /** External MCP servers to connect alongside the built-in kirie-tools server. */
   mcpServers: McpServersConfigSchema,
+  /** Message-level settings (TTS, etc.) */
+  messages: MessagesConfigSchema,
 });
 
 export type KirieConfig = z.infer<typeof KirieConfigSchema>;
@@ -391,6 +421,8 @@ export type ProactiveConfig = z.infer<typeof ProactiveConfigSchema>;
 export type BrowserConfig = z.infer<typeof BrowserConfigSchema>;
 export type McpServerEntry = z.infer<typeof McpServerEntrySchema>;
 export type McpServersConfig = z.infer<typeof McpServersConfigSchema>;
+export type MessagesConfig = z.infer<typeof MessagesConfigSchema>;
+export type MessagesTTSConfig = z.infer<typeof MessagesTTSConfigSchema>;
 
 /**
  * Pattern for detecting $credential:key references in string values.
