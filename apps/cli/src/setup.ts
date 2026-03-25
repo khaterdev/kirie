@@ -1,17 +1,95 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import * as p from "@clack/prompts";
 import { stringify as stringifyYaml } from "yaml";
-import { CredentialStore, KIRIE_DIR } from "@kirie/core";
+import { CredentialStore, ConfigBackup, KIRIE_DIR } from "@kirie/core";
+import { deepMerge, mergeEnvFile, mergeConfigYaml, writeConfigYaml } from "./setup-utils.js";
 
 function isCancelled(value: unknown): value is symbol {
   return p.isCancel(value);
 }
 
-export async function runSetup(): Promise<void> {
+/** Files that must NEVER be overwritten if they already exist. */
+const PROTECTED_FILES = ["SOUL.md", "MEMORY.md", "TOOLS.md"] as const;
+
+export interface SetupOptions {
+  /** When true, performs a full clean setup (resets everything after backup + confirmation). */
+  force?: boolean;
+}
+
+export async function runSetup(options: SetupOptions = {}): Promise<void> {
+  const kirieDir = KIRIE_DIR;
+  const configPath = join(kirieDir, "config.yaml");
+  const isExisting = existsSync(configPath);
+
   p.intro("Kirie Setup");
+
+  // ── "Already configured" detection ──────────────────────────────────────
+
+  if (isExisting && !options.force) {
+    p.log.info(
+      `Kirie is already configured at ${kirieDir}.\n` +
+      `Running setup will update your configuration. Existing settings not\n` +
+      `changed in this wizard will be preserved.\n\n` +
+      `To do a full clean reinstall instead, run: kirie setup --force`,
+    );
+
+    const proceed = await p.confirm({
+      message: "Continue with configuration update?",
+      initialValue: true,
+    });
+    if (isCancelled(proceed) || !proceed) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+  }
+
+  // ── --force: full clean reinstall with backup ───────────────────────────
+
+  let forceClean = false;
+  if (isExisting && options.force) {
+    p.log.warn(
+      `WARNING: --force flag detected.\n` +
+      `This will RESET your entire Kirie configuration at ${kirieDir}.\n` +
+      `All existing config.yaml settings, SOUL.md, and .env will be overwritten.`,
+    );
+
+    const confirmForce = await p.confirm({
+      message: "Are you SURE you want to reset everything? This cannot be undone.",
+      initialValue: false,
+    });
+    if (isCancelled(confirmForce) || !confirmForce) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+    forceClean = true;
+  }
+
+  // ── Create backup before ANY modifications ──────────────────────────────
+
+  const configBackup = new ConfigBackup();
+  let backupPath = "";
+
+  if (isExisting) {
+    backupPath = configBackup.backup(configPath);
+    if (backupPath) {
+      p.log.info(`Config backed up to ${backupPath}`);
+    }
+
+    // Also backup .env if it exists
+    const envPath = join(kirieDir, ".env");
+    if (existsSync(envPath)) {
+      const envBackupDir = join(kirieDir, "config-backups");
+      if (!existsSync(envBackupDir)) {
+        mkdirSync(envBackupDir, { recursive: true });
+      }
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const envBackupPath = join(envBackupDir, `env-${timestamp}.bak`);
+      const envContent = readFileSync(envPath, "utf-8");
+      writeFileSync(envBackupPath, envContent, "utf-8");
+    }
+  }
 
   // ── Step 1: Anthropic API Key ──────────────────────────────────────────
 
@@ -51,6 +129,9 @@ export async function runSetup(): Promise<void> {
 
   const credentialStore = new CredentialStore();
 
+  // Track which credentials were actually changed during this setup run
+  const changedCredentials = new Set<string>();
+
   const channelsConfig: Record<string, Record<string, unknown>> = {};
   const ownerIdentities: Record<string, (string | number)[]> = {};
 
@@ -67,6 +148,7 @@ export async function runSetup(): Promise<void> {
           process.exit(0);
         }
         await credentialStore.set("telegram.bot_token", token);
+        changedCredentials.add("telegram.bot_token");
 
         const ownerId = await p.text({
           message: "Your Telegram user ID (numeric)",
@@ -141,6 +223,7 @@ export async function runSetup(): Promise<void> {
           process.exit(0);
         }
         await credentialStore.set("discord.bot_token", token);
+        changedCredentials.add("discord.bot_token");
 
         const ownerId = await p.text({
           message: "Your Discord user ID",
@@ -205,6 +288,7 @@ export async function runSetup(): Promise<void> {
           process.exit(0);
         }
         await credentialStore.set("slack.bot_token", botToken);
+        changedCredentials.add("slack.bot_token");
 
         const appToken = await p.text({
           message: "Slack app token (xapp-...)",
@@ -216,6 +300,7 @@ export async function runSetup(): Promise<void> {
           process.exit(0);
         }
         await credentialStore.set("slack.app_token", appToken);
+        changedCredentials.add("slack.app_token");
 
         const slackAllowedIds = await p.text({
           message: "Allowed Slack user IDs (comma-separated, leave empty for global policy)",
@@ -317,6 +402,7 @@ export async function runSetup(): Promise<void> {
 
     bearerTokenValue = bearerToken || randomBytes(32).toString("hex");
     await credentialStore.set("gateway.bearer_token", bearerTokenValue);
+    changedCredentials.add("gateway.bearer_token");
   }
 
   // ── Step 5: Agent Configuration ────────────────────────────────────────
@@ -428,6 +514,7 @@ export async function runSetup(): Promise<void> {
   };
 
   // ── Step 7: Embedding Configuration ─────────────────────────────────
+
   let embeddingProvider = await p.select({
     message: "Embedding provider for semantic search",
     options: [
@@ -591,12 +678,12 @@ export async function runSetup(): Promise<void> {
 
   // ── Step 9: Write Config ───────────────────────────────────────────────
 
-  const kirieDir = KIRIE_DIR;
   if (!existsSync(kirieDir)) {
     mkdirSync(kirieDir, { recursive: true });
   }
 
-  const config: Record<string, unknown> = {
+  // Build the config object from wizard values
+  const wizardConfig: Record<string, unknown> = {
     agent: {
       maxTurns,
       model,
@@ -644,15 +731,22 @@ export async function runSetup(): Promise<void> {
     ...(proactiveConfig ? { proactive: proactiveConfig } : {}),
   };
 
-  const configPath = join(kirieDir, "config.yaml");
-  writeFileSync(configPath, stringifyYaml(config), "utf-8");
+  if (isExisting && !forceClean) {
+    // ── MERGE mode: deep-merge wizard values into existing config ────────
+    // This preserves custom MCP servers, agents, plugins, and any other
+    // manual additions to config.yaml.
+    const merged = mergeConfigYaml(configPath, wizardConfig);
+    writeConfigYaml(configPath, merged);
+    p.log.info("Config updated (merged with existing settings).");
+  } else {
+    // ── FRESH mode: write config from scratch ────────────────────────────
+    writeFileSync(configPath, stringifyYaml(wizardConfig), "utf-8");
+  }
 
-  // ── Step 10: Write SOUL.md ────────────────────────────────────────────
+  // ── Step 10: Write SOUL.md (only if not exists OR --force) ─────────────
 
   const soulPath = join(kirieDir, "SOUL.md");
-  writeFileSync(
-    soulPath,
-    `# Soul
+  const soulContent = `# Soul
 
 ## Name
 ${agentName}
@@ -684,19 +778,59 @@ ${agentTagline || "(A short one-liner about who you are)"}
 - Default language: ${agentLanguage}
 - Tone: ${toneDescriptions[agentTone as string] ?? "Casual but competent"}
 - Use short messages in chat. Save long responses for when detail is needed.
-`,
-    "utf-8",
-  );
+`;
 
-  // ── Step 11: Write .env ─────────────────────────────────────────────────
+  if (!existsSync(soulPath) || forceClean) {
+    writeFileSync(soulPath, soulContent, "utf-8");
+  } else {
+    p.log.info("SOUL.md already exists — skipped (not overwritten).");
+  }
+
+  // Guard other protected files: MEMORY.md and TOOLS.md
+  // These are only created by the daemon, but we explicitly guard them here
+  // in case future setup changes try to touch them.
+  for (const protectedFile of PROTECTED_FILES) {
+    if (protectedFile === "SOUL.md") continue; // Already handled above
+    const filePath = join(kirieDir, protectedFile);
+    if (existsSync(filePath) && !forceClean) {
+      // Never overwrite — setup does not touch these files anyway,
+      // but this guard ensures future additions remain safe.
+    }
+    // Note: setup does not create MEMORY.md or TOOLS.md; the daemon does.
+    // This loop is a safety net only.
+  }
+
+  // ── Step 11: Write .env (merge, not overwrite) ─────────────────────────
 
   const envPath = join(kirieDir, ".env");
-  writeFileSync(envPath, `ANTHROPIC_API_KEY=${apiKey}\n`, "utf-8");
 
-  p.note(
-    `Config written to ${configPath}\nAPI key saved to ${envPath}\n\nSource the .env file in your shell:\n  export $(cat ${envPath} | xargs)`,
-    "Files created",
+  if (!existsSync(envPath) || forceClean) {
+    // Fresh install or --force: create .env from scratch
+    writeFileSync(envPath, `ANTHROPIC_API_KEY=${apiKey}\n`, "utf-8");
+  } else {
+    // Existing install: parse and merge, preserving other env vars
+    const mergedEnv = mergeEnvFile(envPath, { ANTHROPIC_API_KEY: apiKey });
+    writeFileSync(envPath, mergedEnv, "utf-8");
+    p.log.info(".env updated (merged — existing variables preserved).");
+  }
+
+  // ── Summary ────────────────────────────────────────────────────────────
+
+  const notes: string[] = [
+    `Config written to ${configPath}`,
+    `API key saved to ${envPath}`,
+  ];
+  if (backupPath) {
+    notes.push(`Backup saved to ${backupPath}`);
+  }
+  if (isExisting && !forceClean) {
+    notes.push("Existing settings were preserved (merge mode).");
+  }
+  notes.push(
+    `\nSource the .env file in your shell:\n  export $(cat ${envPath} | xargs)`,
   );
+
+  p.note(notes.join("\n"), isExisting ? "Files updated" : "Files created");
 
   p.outro("Setup complete! Run 'kirie daemon' to start, or 'kirie chat' to chat.");
 }

@@ -126,9 +126,10 @@ program
 program
   .command("setup")
   .description("Interactive setup wizard for Kirie")
-  .action(async () => {
+  .option("-f, --force", "Force a full clean reinstall (backs up existing config first)")
+  .action(async (opts: { force?: boolean }) => {
     const { runSetup } = await import("./setup.js");
-    await runSetup();
+    await runSetup({ force: opts.force });
   });
 
 const embeddings = program
