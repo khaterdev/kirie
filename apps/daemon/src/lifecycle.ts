@@ -28,6 +28,7 @@ import {
   BackgroundTaskManager,
   AutoReplyEngine,
   registerBuiltinCommands,
+  buildBackgroundTaskSystemPrompt,
 } from "@kirie/core";
 import { loadAllSkills, isEligible } from "@kirie/skills";
 import { createTranscriptionProvider } from "@kirie/media";
@@ -900,11 +901,22 @@ export async function startDaemon(): Promise<void> {
   }
 
   // 11. Background task manager (uses V1 query() with mcpServers)
+  // Build the same system prompt the main agent gets, plus background-task-specific instructions
+  const backgroundTaskSystemPrompt = buildBackgroundTaskSystemPrompt({
+    customInstructions: config.agent.customInstructions,
+    maxTurns: config.agent.backgroundTaskMaxTurns ?? 200,
+    model: config.agent.model,
+    dataDir,
+    timezone: config.proactive?.activeHours?.timezone,
+  });
+
   const backgroundTaskManager = new BackgroundTaskManager(backgroundTaskStore, {
     model: config.agent.model,
     mcpServers,
     allowedTools,
     cwd: config.agent.workspace || dataDir,
+    systemPrompt: backgroundTaskSystemPrompt,
+    maxTurns: config.agent.backgroundTaskMaxTurns ?? 200,
     onTaskComplete: async (task) => {
       // Push completed task result proactively to the originating channel
       await pipeline.pushBackgroundTaskResult(task);
@@ -1007,6 +1019,8 @@ export async function startDaemon(): Promise<void> {
       void stopDaemon();
     };
 
+    // Note: On Windows, SIGINT works (Ctrl+C) but SIGTERM is not reliably
+    // delivered to Node processes. Node.js handles the translation internally.
     process.on("SIGINT", () => handleSignal("SIGINT"));
     process.on("SIGTERM", () => handleSignal("SIGTERM"));
 
@@ -1092,10 +1106,15 @@ export async function stopDaemon(): Promise<void> {
   if (kokoroProc && !kokoroProc.killed) {
     log.info("stopping Kokoro TTS daemon");
     kokoroProc.kill("SIGTERM");
-    // Give it 3s to shut down gracefully, then SIGKILL
+    // Give it 3s to shut down gracefully, then force-kill.
+    // On Windows, SIGKILL does not exist; .kill() without a signal terminates the process.
     setTimeout(() => {
       if (!kokoroProc.killed) {
-        kokoroProc.kill("SIGKILL");
+        if (process.platform === "win32") {
+          kokoroProc.kill();
+        } else {
+          kokoroProc.kill("SIGKILL");
+        }
       }
     }, 3000);
   }

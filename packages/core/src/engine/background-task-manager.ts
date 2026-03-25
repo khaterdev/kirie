@@ -32,6 +32,8 @@ export interface BackgroundTaskManagerConfig {
   cwd?: string;
   /** System prompt for background tasks */
   systemPrompt?: string;
+  /** Maximum turns per background task (default: unlimited) */
+  maxTurns?: number;
   /** Poll interval in ms for picking up pending tasks (default 2000) */
   pollIntervalMs?: number;
   /** Callback when a task completes */
@@ -264,6 +266,7 @@ export class BackgroundTaskManager {
         allowedTools: this.config.allowedTools,
         mcpServers: this.config.mcpServers,
         cwd: this.config.cwd,
+        maxTurns: this.config.maxTurns,
       };
 
       // If the task has a saved SDK session ID, try to resume it

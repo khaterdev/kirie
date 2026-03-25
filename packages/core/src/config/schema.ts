@@ -16,6 +16,8 @@ export const AgentConfigSchema = z.object({
   model: z.string().default("claude-opus-4-6"),
   /** Default working directory for the agent (cwd passed to the SDK) */
   workspace: z.string().optional(),
+  /** Maximum turns for background task agents. Default 200. */
+  backgroundTaskMaxTurns: z.number().int().min(1).default(200),
 });
 
 // ── Security ─────────────────────────────────────────────────────────────────

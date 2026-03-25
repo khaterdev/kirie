@@ -84,8 +84,11 @@ function createSignalId(source: string): string {
 // Detector: Task Health
 // ---------------------------------------------------------------------------
 
-/** Maximum time a background task should run before being flagged (10 minutes) */
-const STUCK_TASK_THRESHOLD_MS = 10 * 60 * 1000;
+/** Minimum time a background task runs before a first "long-running" info signal (30 minutes) */
+const LONG_RUNNING_TASK_THRESHOLD_MS = 30 * 60 * 1000;
+
+/** Time threshold for escalation-level warning (60 minutes) */
+const STUCK_TASK_ESCALATION_THRESHOLD_MS = 60 * 60 * 1000;
 
 /**
  * Checks for background tasks that have been running longer than the threshold.
@@ -101,17 +104,31 @@ export class TaskHealthDetector implements SignalDetector {
     const tasks = context.getRunningTasks();
     for (const task of tasks) {
       const runningMs = context.now - task.startedAt;
-      if (runningMs > STUCK_TASK_THRESHOLD_MS) {
+      if (runningMs > STUCK_TASK_ESCALATION_THRESHOLD_MS) {
+        // 60+ minutes: warning-level signal (but still NOT auto-cancel worthy)
         const minutes = Math.round(runningMs / 60_000);
         signals.push({
           id: createSignalId("task-health"),
           type: "task-stuck",
           severity: "warning",
-          title: `Background task stuck (${minutes}min)`,
-          details: `Task "${task.description}" (${task.id}) has been running for ${minutes} minutes.`,
+          title: `Background task long-running (${minutes}min)`,
+          details: `Task "${task.description}" (${task.id}) has been running for ${minutes} minutes. Note: complex tasks (builds, tests, multi-step implementations) routinely take 30-60+ minutes. Do NOT cancel unless confirmed stuck/failed.`,
           timestamp: context.now,
           source: this.name,
           deduplicationKey: `task-stuck:${task.id}`,
+        });
+      } else if (runningMs > LONG_RUNNING_TASK_THRESHOLD_MS) {
+        // 30-60 minutes: info-level signal (informational only, no action needed)
+        const minutes = Math.round(runningMs / 60_000);
+        signals.push({
+          id: createSignalId("task-health"),
+          type: "task-long-running",
+          severity: "info",
+          title: `Background task running (${minutes}min)`,
+          details: `Task "${task.description}" (${task.id}) has been running for ${minutes} minutes. This is within normal range for complex tasks.`,
+          timestamp: context.now,
+          source: this.name,
+          deduplicationKey: `task-long-running:${task.id}`,
         });
       }
     }

@@ -245,9 +245,9 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
         }
       }
 
-      // Filter out informational time signals — they're not actionable by triage
+      // Filter out informational signals — they're not actionable by triage
       const signals = allSignals.filter(
-        (s) => s.type !== "daily-digest-time" && s.type !== "late-night",
+        (s) => s.type !== "daily-digest-time" && s.type !== "late-night" && s.type !== "task-long-running",
       );
 
       log.debug({ signalCount: signals.length, filtered: allSignals.length - signals.length }, "starting triage");
@@ -350,7 +350,7 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
           const sessionKey = `${this.defaultChannel}:dm:${this.defaultChatId}`;
           const description = `Proactive escalation: ${decision.message ?? "investigate signal"}`;
           const prompt = decision.message
-            ? `You are Kirie's proactive intelligence system. A triage check escalated this to you for deep investigation:\n\n${decision.message}\n\nInvestigate thoroughly using all available tools. Send your findings as a message to telegram chat ${this.defaultChatId} using the send_message tool.`
+            ? `You are Kirie's proactive intelligence system. A triage check escalated this to you for deep investigation:\n\n${decision.message}\n\nCRITICAL RULES:\n- NEVER cancel or kill background tasks unless you are 100% certain they have FAILED (e.g., process crashed, SDK session dead, explicit error in logs).\n- A task running for 10, 20, 30, or even 60+ minutes is NOT stuck. Complex tasks like builds, test suites, and multi-phase implementations routinely take this long.\n- If a background task has cost > $0 and num_turns > 0, it is ACTIVELY WORKING. Do NOT kill it.\n- If you're unsure whether a task is stuck or just slow, ASK THE USER first by sending a message. Do NOT take destructive action.\n- The ONLY acceptable reasons to auto-cancel a task are: SDK session is dead/disconnected, the task has had 0 turns for 30+ minutes, or the task explicitly errored out.\n- Your default action should be to INFORM the user about your findings, NOT to cancel anything.\n\nInvestigate thoroughly using all available tools. Send your findings as a message to telegram chat ${this.defaultChatId} using the send_message tool.`
             : "Proactive escalation triggered but no details provided.";
           try {
             this.createBackgroundTask(sessionKey, description, prompt);

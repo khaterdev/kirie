@@ -517,3 +517,96 @@ export function buildPrompt(options: BuildPromptOptions): BuiltPrompt {
     model: config.model,
   };
 }
+
+/**
+ * Additional instructions injected into the system prompt for background task agents.
+ * These ensure the agent takes action with tools instead of just describing work.
+ */
+export const BACKGROUND_TASK_AGENT_INSTRUCTIONS = `<background_task_agent_mode>
+CRITICAL: You are running as an AUTONOMOUS BACKGROUND TASK AGENT.
+
+You are a full clone of the main Kirie agent with all the same tools, memory, and context.
+However, you are running in a separate subprocess to handle a specific task asynchronously.
+
+RULES:
+1. You MUST use tools (Read, Write, Edit, Bash, memory tools, web tools, etc.) to accomplish your task.
+2. NEVER respond with only text descriptions of what you plan to do. Always take action with tools IMMEDIATELY.
+3. You have access to ALL the same tools, memory, and context as the main agent.
+4. Work autonomously — do not ask for clarification. Make reasonable decisions and proceed.
+5. Be thorough — complete the entire task, not just part of it.
+6. When your task is complete, provide a detailed summary of what was accomplished, including any key findings, files changed, or important decisions made.
+7. If you encounter errors, try to fix them. Only report failure after exhausting reasonable approaches.
+8. Store important findings in memory using memory_store so they persist beyond this task.
+</background_task_agent_mode>`;
+
+/**
+ * Builds a system prompt for background task agents.
+ *
+ * This includes the same identity, context files (SOUL.md, MEMORY.md, TOOLS.md),
+ * and self-learning rules as the main agent, plus additional instructions that
+ * tell the agent it's running as an autonomous background task.
+ *
+ * @param config - The prompt configuration (same as main agent)
+ * @returns The appended system prompt string for a background task agent
+ */
+export function buildBackgroundTaskSystemPrompt(config: PromptConfig): string {
+  const lines: string[] = [];
+
+  // Inject current date and time
+  const now = new Date();
+  let timeStr: string;
+  try {
+    timeStr = now.toLocaleString("en-US", {
+      timeZone: config.timezone || "UTC",
+      dateStyle: "full",
+      timeStyle: "long",
+    });
+  } catch {
+    timeStr = now.toISOString();
+  }
+  lines.push(`<current_time>${timeStr} (${config.timezone || "UTC"})</current_time>`);
+  lines.push("");
+
+  lines.push(`<assistant_identity>`);
+  lines.push(DEFAULT_SYSTEM_PROMPT);
+  if (config.customInstructions) {
+    lines.push("");
+    lines.push(config.customInstructions);
+  }
+  lines.push(`</assistant_identity>`);
+
+  // Background task specific instructions
+  lines.push("");
+  lines.push(BACKGROUND_TASK_AGENT_INSTRUCTIONS);
+
+  // Load context files (SOUL.md, MEMORY.md, TOOLS.md)
+  if (config.dataDir) {
+    const ctx = loadContextFiles(config.dataDir);
+
+    if (ctx.soul) {
+      lines.push("");
+      lines.push(`<soul_context>`);
+      lines.push(ctx.soul);
+      lines.push(`</soul_context>`);
+    }
+
+    if (ctx.memory) {
+      lines.push("");
+      lines.push(`<memory_context>`);
+      lines.push(ctx.memory);
+      lines.push(`</memory_context>`);
+    }
+
+    if (ctx.tools) {
+      lines.push("");
+      lines.push(`<tools_context>`);
+      lines.push(ctx.tools);
+      lines.push(`</tools_context>`);
+    }
+
+    lines.push("");
+    lines.push(SELF_LEARNING_RULES.replace("{dataDir}", config.dataDir));
+  }
+
+  return lines.join("\n");
+}

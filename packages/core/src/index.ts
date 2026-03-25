@@ -1,4 +1,5 @@
 // @kirie/core - Engine, security, routing, config
+export * from "./platform.js";
 export * from "./engine/agent-engine.js";
 export * from "./engine/session-store.js";
 export * from "./engine/lane-queue.js";
@@ -16,6 +17,8 @@ export {
   type BuildPromptOptions,
   type BuiltPrompt,
   buildPrompt,
+  buildBackgroundTaskSystemPrompt,
+  BACKGROUND_TASK_AGENT_INSTRUCTIONS,
   DEFAULT_SYSTEM_PROMPT,
 } from "./engine/prompt-builder.js";
 export * from "./channels/adapter.js";

@@ -40,6 +40,25 @@ describe("AgentConfigSchema", () => {
   it("rejects non-integer maxTurns", () => {
     expect(() => AgentConfigSchema.parse({ maxTurns: 2.5 })).toThrow();
   });
+
+  it("defaults backgroundTaskMaxTurns to 200", () => {
+    const result = AgentConfigSchema.parse({});
+    expect(result.backgroundTaskMaxTurns).toBe(200);
+  });
+
+  it("accepts custom backgroundTaskMaxTurns", () => {
+    const result = AgentConfigSchema.parse({ backgroundTaskMaxTurns: 500 });
+    expect(result.backgroundTaskMaxTurns).toBe(500);
+  });
+
+  it("rejects backgroundTaskMaxTurns less than 1", () => {
+    expect(() => AgentConfigSchema.parse({ backgroundTaskMaxTurns: 0 })).toThrow();
+    expect(() => AgentConfigSchema.parse({ backgroundTaskMaxTurns: -1 })).toThrow();
+  });
+
+  it("rejects non-integer backgroundTaskMaxTurns", () => {
+    expect(() => AgentConfigSchema.parse({ backgroundTaskMaxTurns: 1.5 })).toThrow();
+  });
 });
 
 describe("SecurityConfigSchema", () => {

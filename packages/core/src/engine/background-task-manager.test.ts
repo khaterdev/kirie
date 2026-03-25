@@ -1,9 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { BackgroundTaskStore } from "./background-task-store.js";
 import { BackgroundTaskManager } from "./background-task-manager.js";
+import {
+  buildBackgroundTaskSystemPrompt,
+  BACKGROUND_TASK_AGENT_INSTRUCTIONS,
+  DEFAULT_SYSTEM_PROMPT,
+} from "./prompt-builder.js";
 
 // Mock the claude-agent-sdk query() function
 vi.mock("@anthropic-ai/claude-agent-sdk", () => {
@@ -221,5 +226,173 @@ describe("BackgroundTaskManager", () => {
       const commands = store.getUnprocessedCommands();
       expect(commands.length).toBe(0);
     });
+  });
+
+  describe("systemPrompt and maxTurns config", () => {
+    it("passes systemPrompt to SDK query options when configured", async () => {
+      const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
+
+      const managerWithPrompt = new BackgroundTaskManager(store, {
+        model: "claude-sonnet-4-20250514",
+        allowedTools: [],
+        pollIntervalMs: 100,
+        systemPrompt: "You are a background task agent.",
+        onTaskComplete: vi.fn(),
+      });
+
+      store.create("telegram:dm:123", "Prompted task", "Do the thing");
+      managerWithPrompt.start();
+
+      // Wait for task to be picked up and query() called
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Verify query() was called with systemPrompt in options
+      const calls = (mockQuery as ReturnType<typeof vi.fn>).mock.calls;
+      const lastCall = calls[calls.length - 1];
+      expect(lastCall).toBeDefined();
+      expect(lastCall[0].options.systemPrompt).toBe("You are a background task agent.");
+
+      await managerWithPrompt.shutdown();
+    });
+
+    it("passes maxTurns to SDK query options when configured", async () => {
+      const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
+
+      const managerWithTurns = new BackgroundTaskManager(store, {
+        model: "claude-sonnet-4-20250514",
+        allowedTools: [],
+        pollIntervalMs: 100,
+        maxTurns: 150,
+        onTaskComplete: vi.fn(),
+      });
+
+      store.create("telegram:dm:456", "Turns task", "Do the thing with turns");
+      managerWithTurns.start();
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const calls = (mockQuery as ReturnType<typeof vi.fn>).mock.calls;
+      const lastCall = calls[calls.length - 1];
+      expect(lastCall).toBeDefined();
+      expect(lastCall[0].options.maxTurns).toBe(150);
+
+      await managerWithTurns.shutdown();
+    });
+
+    it("does not set systemPrompt in SDK options when not configured", async () => {
+      const { query: mockQuery } = await import("@anthropic-ai/claude-agent-sdk");
+
+      store.create("telegram:dm:789", "No prompt task", "Do something");
+      manager.start();
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const calls = (mockQuery as ReturnType<typeof vi.fn>).mock.calls;
+      const lastCall = calls[calls.length - 1];
+      expect(lastCall).toBeDefined();
+      // systemPrompt should be undefined (not set)
+      expect(lastCall[0].options.systemPrompt).toBeUndefined();
+    });
+  });
+});
+
+describe("buildBackgroundTaskSystemPrompt", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kirie-test-bg-prompt-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes the default system prompt identity", () => {
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+    });
+    expect(prompt).toContain(DEFAULT_SYSTEM_PROMPT);
+    expect(prompt).toContain("<assistant_identity>");
+    expect(prompt).toContain("</assistant_identity>");
+  });
+
+  it("includes background task agent instructions", () => {
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+    });
+    expect(prompt).toContain(BACKGROUND_TASK_AGENT_INSTRUCTIONS);
+    expect(prompt).toContain("<background_task_agent_mode>");
+    expect(prompt).toContain("AUTONOMOUS BACKGROUND TASK AGENT");
+    expect(prompt).toContain("MUST use tools");
+    expect(prompt).toContain("NEVER respond with only text descriptions");
+  });
+
+  it("includes custom instructions when provided", () => {
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+      customInstructions: "Always respond in Arabic.",
+    });
+    expect(prompt).toContain("Always respond in Arabic.");
+  });
+
+  it("includes SOUL.md, MEMORY.md, and TOOLS.md content when dataDir is provided", () => {
+    writeFileSync(join(tmpDir, "SOUL.md"), "# Soul\n\nI am Kirie");
+    writeFileSync(join(tmpDir, "MEMORY.md"), "# Memory\n\nOwner: Alice");
+    writeFileSync(join(tmpDir, "TOOLS.md"), "# Tools\n\nSkill: web-search");
+
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+      dataDir: tmpDir,
+    });
+
+    expect(prompt).toContain("<soul_context>");
+    expect(prompt).toContain("I am Kirie");
+    expect(prompt).toContain("</soul_context>");
+
+    expect(prompt).toContain("<memory_context>");
+    expect(prompt).toContain("Owner: Alice");
+    expect(prompt).toContain("</memory_context>");
+
+    expect(prompt).toContain("<tools_context>");
+    expect(prompt).toContain("Skill: web-search");
+    expect(prompt).toContain("</tools_context>");
+  });
+
+  it("includes self-learning rules when dataDir is provided", () => {
+    writeFileSync(join(tmpDir, "SOUL.md"), "# Soul");
+
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+      dataDir: tmpDir,
+    });
+
+    expect(prompt).toContain("<self_learning_rules>");
+    expect(prompt).toContain("Memory Architecture");
+    expect(prompt).toContain("Background Task Tools");
+  });
+
+  it("includes current time", () => {
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+    });
+    expect(prompt).toContain("<current_time>");
+    expect(prompt).toContain("</current_time>");
+  });
+
+  it("omits context sections when dataDir is not provided", () => {
+    const prompt = buildBackgroundTaskSystemPrompt({
+      maxTurns: 200,
+      model: "claude-opus-4-6",
+    });
+    expect(prompt).not.toContain("<soul_context>");
+    expect(prompt).not.toContain("<memory_context>");
+    expect(prompt).not.toContain("<tools_context>");
+    expect(prompt).not.toContain("<self_learning_rules>");
   });
 });

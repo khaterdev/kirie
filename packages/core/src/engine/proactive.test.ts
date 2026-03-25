@@ -151,12 +151,35 @@ describe("Signal Detectors", () => {
       detector = new TaskHealthDetector();
     });
 
-    it("should detect stuck tasks running > 10 minutes", () => {
+    it("should detect long-running tasks at 30+ minutes as info", () => {
+      const now = Date.now();
+      const longTask: RunningTaskInfo = {
+        id: "task-1",
+        description: "Long-running analysis",
+        startedAt: now - 35 * 60 * 1000, // 35 minutes ago
+        status: "running",
+      };
+
+      const context = createDetectorContext({
+        now,
+        getRunningTasks: () => [longTask],
+      });
+
+      const signals = detector.detect(context);
+
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.type).toBe("task-long-running");
+      expect(signals[0]!.severity).toBe("info");
+      expect(signals[0]!.title).toContain("35min");
+      expect(signals[0]!.details).toContain("Long-running analysis");
+    });
+
+    it("should detect stuck tasks at 60+ minutes as warning", () => {
       const now = Date.now();
       const stuckTask: RunningTaskInfo = {
         id: "task-1",
-        description: "Long-running analysis",
-        startedAt: now - 15 * 60 * 1000, // 15 minutes ago
+        description: "Very long analysis",
+        startedAt: now - 65 * 60 * 1000, // 65 minutes ago
         status: "running",
       };
 
@@ -170,16 +193,16 @@ describe("Signal Detectors", () => {
       expect(signals).toHaveLength(1);
       expect(signals[0]!.type).toBe("task-stuck");
       expect(signals[0]!.severity).toBe("warning");
-      expect(signals[0]!.title).toContain("15min");
-      expect(signals[0]!.details).toContain("Long-running analysis");
+      expect(signals[0]!.title).toContain("65min");
+      expect(signals[0]!.details).toContain("Do NOT cancel");
     });
 
-    it("should not signal for recently started tasks", () => {
+    it("should not signal for tasks under 30 minutes", () => {
       const now = Date.now();
       const recentTask: RunningTaskInfo = {
         id: "task-2",
         description: "Quick task",
-        startedAt: now - 2 * 60 * 1000, // 2 minutes ago
+        startedAt: now - 15 * 60 * 1000, // 15 minutes ago
         status: "running",
       };
 
