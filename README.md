@@ -52,10 +52,12 @@ Includes notification cooldowns, deduplication, daily digest scheduling, and ful
 
 True async task execution in separate processes:
 
+- Full agent context cloning (system prompt, memory, MCP tools, personality)
 - Database-persisted task queue with SQLite
 - Message passing to running tasks (send prompts, interrupt work)
 - Cost tracking per task (tokens + USD)
 - Session resumption on daemon restart
+- Configurable max turns per task (default 200)
 
 ### Security
 
@@ -65,7 +67,7 @@ Defense-in-depth security stack:
 - **Authorization** - Role-based access control with action-specific permissions
 - **Rate Limiting** - Token bucket algorithm with per-user and per-group buckets
 - **Input Guard** - Prompt injection defense with 20+ pattern detectors, size validation, XML boundary wrapping
-- **Credential Store** - AES-256-GCM encrypted credentials with macOS Keychain integration
+- **Credential Store** - AES-256-GCM encrypted credentials with macOS Keychain integration (cross-platform)
 - **SSRF Guard** - Blocks private IPs, metadata endpoints, internal hostnames
 - **Code Scanner** - Detects dangerous patterns in plugins/skills (command injection, eval, exfiltration)
 - **Security Audit** - Comprehensive audit tool checking file permissions, credential integrity, transport security
@@ -109,8 +111,9 @@ YAML-driven extensible skills loaded at runtime:
 
 ### Prerequisites
 
-- **Node.js** 22+
+- **Node.js** 22+ (24+ supported)
 - **pnpm** 9+
+- **Platforms**: macOS, Linux, Windows
 
 ### Authentication
 
@@ -186,6 +189,7 @@ Kirie uses a YAML config file at `~/.kirie/config.yaml`. See [`config.example.ya
 agent:
   model: "claude-opus-4-6"
   maxTurns: 100                    # 0 = unlimited
+  backgroundTaskMaxTurns: 200      # Max turns for background task agents
   # customInstructions: "..."      # Appended to system prompt
   # workspace: "/path/to/projects" # Working directory for agent
 
@@ -344,7 +348,7 @@ pnpm --filter @kirie/core run build
 
 | Component | Technology |
 |-----------|-----------|
-| Runtime | Node.js 22+, ESM |
+| Runtime | Node.js 22+ (24+ supported), ESM |
 | Package Manager | pnpm 9+ with workspaces |
 | Build | tsdown (esbuild-based) |
 | TypeScript | ES2022, strict mode |
