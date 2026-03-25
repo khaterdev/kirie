@@ -135,16 +135,14 @@ describe("MessagePipeline", () => {
       pipeline.start();
       mockAdapter.messageListeners[0](makeMessage());
 
-      await vi.waitFor(() => {
-        expect(mockAdapter.sendText).toHaveBeenCalled();
-      }, { timeout: 3000 });
+      // Give the pipeline time to process the message
+      await new Promise((r) => setTimeout(r, 100));
 
       // Engine should NOT have been called
       expect(mockEngine.execute).not.toHaveBeenCalled();
 
-      // Error response should have been sent
-      const sendCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[0][0];
-      expect(sendCall.text).toContain("Not authorized");
+      // Silently drops unauthorized messages (no response sent)
+      expect(mockAdapter.sendText).not.toHaveBeenCalled();
     });
   });
 
@@ -231,11 +229,10 @@ describe("MessagePipeline", () => {
 
   describe("error response reply fallback", () => {
     it("falls back to sending without replyToId when reply fails", async () => {
-      // Make security gate reject the message
-      (mockGate.check as ReturnType<typeof vi.fn>).mockReturnValue({
-        passed: false,
-        reason: "Not authorized",
-      });
+      // Make the agent execution throw so the catch block fires sendErrorResponse
+      (mockEngine.execute as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("Something went wrong"),
+      );
 
       // First call (with replyToId) fails, second call (without) succeeds
       let callCount = 0;
@@ -259,7 +256,7 @@ describe("MessagePipeline", () => {
       // Second call should NOT have replyToId
       const secondCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[1][0];
       expect(secondCall.ctx.replyToId).toBeUndefined();
-      expect(secondCall.text).toContain("Not authorized");
+      expect(secondCall.text).toContain("internal error");
     });
   });
 
@@ -498,11 +495,10 @@ describe("MessagePipeline retry integration", () => {
     const netErr = new Error("connect ETIMEDOUT");
     (netErr as NodeJS.ErrnoException).code = "ETIMEDOUT";
 
-    // Make security gate reject to trigger sendErrorResponse
-    (mockGate.check as ReturnType<typeof vi.fn>).mockReturnValue({
-      passed: false,
-      reason: "Not authorized",
-    });
+    // Make agent execution throw to trigger sendErrorResponse
+    (mockEngine.execute as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("Something went wrong"),
+    );
 
     // Both attempts fail with network error
     (mockAdapter.sendText as ReturnType<typeof vi.fn>)
@@ -519,7 +515,7 @@ describe("MessagePipeline retry integration", () => {
     expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalledWith(
       "telegram",
       "chat-456",
-      "Not authorized",
+      "Sorry, an internal error occurred while processing your message.",
       expect.stringContaining("ETIMEDOUT"),
       undefined,
     );

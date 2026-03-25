@@ -131,6 +131,29 @@ program
     await runSetup();
   });
 
+const embeddings = program
+  .command("embeddings")
+  .description("Manage embedding models");
+
+embeddings
+  .command("download")
+  .description("Download the local embedding model (~33MB)")
+  .action(async () => {
+    const { ensureModelDownloaded, isModelDownloaded } = await import("@kirie/memory");
+    if (await isModelDownloaded()) {
+      console.log("Embedding model is already downloaded.");
+      return;
+    }
+    console.log("Downloading snowflake-arctic-embed-s...");
+    try {
+      await ensureModelDownloaded();
+      console.log("Embedding model downloaded successfully.");
+    } catch (err) {
+      console.error(`Failed to download embedding model: ${(err as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
 const creds = program
   .command("credentials")
   .description("Manage stored credentials");

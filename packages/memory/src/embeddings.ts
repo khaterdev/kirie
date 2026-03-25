@@ -65,6 +65,7 @@ export class LocalEmbeddings implements EmbeddingProvider {
   private modelDir: string | undefined;
   private instance: unknown | null = null;
   private initPromise: Promise<void> | null = null;
+  private _fallback: NoopEmbeddings | null = null;
 
   constructor(opts?: { model?: string; cacheDir?: string; modelDir?: string }) {
     this.model = opts?.model ?? "snowflake-arctic-embed-s";
@@ -79,33 +80,40 @@ export class LocalEmbeddings implements EmbeddingProvider {
   }
 
   private async init(): Promise<void> {
-    if (this.instance) return;
+    if (this.instance || this._fallback) return;
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = (async () => {
-      const { FlagEmbedding, EmbeddingModel } = await import("fastembed");
-      const modelEnum = Object.values(EmbeddingModel).find((v) => v === this.model);
+      try {
+        const { FlagEmbedding, EmbeddingModel } = await import("fastembed");
+        const modelEnum = Object.values(EmbeddingModel).find((v) => v === this.model);
 
-      if (modelEnum) {
-        // Built-in fastembed model
-        this.instance = await FlagEmbedding.init({
-          model: modelEnum as Exclude<typeof modelEnum, "custom">,
-          cacheDir: this.cacheDir,
-          showDownloadProgress: true,
-        });
-      } else if (this.modelDir) {
-        // Custom ONNX model loaded from a local directory
-        this.instance = await FlagEmbedding.init({
-          model: EmbeddingModel.CUSTOM,
-          modelAbsoluteDirPath: this.modelDir,
-          modelName: "onnx/model.onnx",
-          cacheDir: this.cacheDir,
-          showDownloadProgress: true,
-        });
-      } else {
-        throw new Error(
-          `Unknown local embedding model: ${this.model}. Supported: ${Object.keys(LOCAL_MODEL_DIMS).join(", ")}`,
-        );
+        if (modelEnum) {
+          // Built-in fastembed model
+          this.instance = await FlagEmbedding.init({
+            model: modelEnum as Exclude<typeof modelEnum, "custom">,
+            cacheDir: this.cacheDir,
+            showDownloadProgress: true,
+          });
+        } else if (this.modelDir) {
+          // Custom ONNX model loaded from a local directory
+          this.instance = await FlagEmbedding.init({
+            model: EmbeddingModel.CUSTOM,
+            modelAbsoluteDirPath: this.modelDir,
+            modelName: "onnx/model.onnx",
+            cacheDir: this.cacheDir,
+            showDownloadProgress: true,
+          });
+        } else {
+          throw new Error(
+            `Unknown local embedding model: ${this.model}. Supported: ${Object.keys(LOCAL_MODEL_DIMS).join(", ")}`,
+          );
+        }
+      } catch (err) {
+        console.warn(`[embeddings] Failed to initialize local ONNX model: ${(err as Error).message}`);
+        console.warn("[embeddings] Falling back to NoopEmbeddings. Semantic search disabled.");
+        console.warn('[embeddings] To fix: run "kirie embeddings download" or switch to OpenAI embeddings.');
+        this._fallback = new NoopEmbeddings(this.dimensions);
       }
     })();
 
@@ -114,6 +122,9 @@ export class LocalEmbeddings implements EmbeddingProvider {
 
   async embed(texts: string[]): Promise<number[][]> {
     await this.init();
+    if (this._fallback) {
+      return this._fallback.embed(texts);
+    }
     const fe = this.instance as import("fastembed").FlagEmbedding;
     const results: number[][] = [];
     for await (const batch of fe.embed(texts, 64)) {

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { toDockerPath } from "../platform.js";
 import type { SandboxConfig } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -56,9 +57,9 @@ export function buildSandboxCreateArgs(params: {
   // Network
   args.push("--network", docker.network);
 
-  // Workspace mount
+  // Workspace mount (convert Windows paths for Docker Desktop)
   if (params.workspaceDir && params.config.workspaceAccess === "rw") {
-    args.push("-v", `${params.workspaceDir}:/workspace:rw`);
+    args.push("-v", `${toDockerPath(params.workspaceDir)}:/workspace:rw`);
   }
 
   args.push(docker.image);

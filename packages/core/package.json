@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
-    "clean": "rm -rf dist"
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.34",

@@ -283,6 +283,58 @@ describe("CredentialStore", () => {
     });
   });
 
+  describe("verifyPermissions - Windows support", () => {
+    it("skips Unix permission checks when platform is win32", async () => {
+      const originalPlatform = process.platform;
+      Object.defineProperty(process, "platform", { value: "win32", writable: true });
+
+      try {
+        // Create dir with "wrong" Unix permissions - on Windows this shouldn't matter
+        const credDir = `${TEST_DIR}/win-perms`;
+        mkdirSync(credDir, { recursive: true, mode: 0o755 });
+
+        const store = new CredentialStore({
+          credentialsDir: credDir,
+          passphrase: "test-passphrase-for-unit-tests",
+        });
+
+        const issues = await store.verifyPermissions();
+        // Should NOT report any permission issues on Windows
+        expect(issues.filter((i) => i.includes("permissions"))).toHaveLength(0);
+      } finally {
+        Object.defineProperty(process, "platform", { value: originalPlatform, writable: true });
+      }
+    });
+
+    it("reports permission issues on Unix platforms", async () => {
+      if (process.platform === "win32") return;
+
+      const credDir = `${TEST_DIR}/unix-perms`;
+      mkdirSync(credDir, { recursive: true, mode: 0o755 });
+
+      const store = new CredentialStore({
+        credentialsDir: credDir,
+        passphrase: "test-passphrase-for-unit-tests",
+      });
+
+      const issues = await store.verifyPermissions();
+      expect(issues.some((i) => i.includes("permissions"))).toBe(true);
+    });
+
+    it("reports missing directory on all platforms", async () => {
+      const credDir = `${TEST_DIR}/will-be-removed`;
+      const store = new CredentialStore({
+        credentialsDir: credDir,
+        passphrase: "test-passphrase-for-unit-tests",
+      });
+      // Constructor creates the dir via ensureDir(), so remove it to test the missing-dir path
+      rmSync(credDir, { recursive: true, force: true });
+
+      const issues = await store.verifyPermissions();
+      expect(issues.some((i) => i.includes("does not exist"))).toBe(true);
+    });
+  });
+
   describe("safeCompare", () => {
     it("returns true for equal strings", () => {
       expect(CredentialStore.safeCompare("abc", "abc")).toBe(true);

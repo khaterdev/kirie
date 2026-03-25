@@ -426,9 +426,22 @@ export class CredentialStore {
     }
   }
 
-  /** Verify directory permissions are secure. Returns issues found. */
+  /** Verify directory permissions are secure. Returns issues found.
+   *  On Windows, Unix-style permission checks are skipped since chmod only
+   *  controls the read-only flag and octal modes are meaningless. */
   async verifyPermissions(): Promise<string[]> {
     const issues: string[] = [];
+
+    // Unix file permission checks are meaningless on Windows
+    if (process.platform === "win32") {
+      // Just verify the directory exists
+      try {
+        await stat(this.credentialsDir);
+      } catch {
+        issues.push("Credentials directory does not exist or is not accessible");
+      }
+      return issues;
+    }
 
     try {
       const dirStat = await stat(this.credentialsDir);

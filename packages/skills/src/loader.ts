@@ -1,8 +1,8 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { parse as parseYaml } from "yaml";
+import { binExists } from "@kirie/core";
 import type { SkillDefinition, SkillSource } from "./types.js";
 
 /** Parse SKILL.md file: YAML frontmatter between --- delimiters + markdown body */
@@ -56,16 +56,6 @@ export function scanSkillDirectory(
   }
 
   return skills;
-}
-
-/** Check if a binary exists on the system PATH */
-function binExists(name: string): boolean {
-  try {
-    execSync(`which ${name}`, { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Check if a skill is eligible to run on the current system */

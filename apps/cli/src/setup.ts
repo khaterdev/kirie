@@ -428,7 +428,7 @@ export async function runSetup(): Promise<void> {
   };
 
   // ── Step 7: Embedding Configuration ─────────────────────────────────
-  const embeddingProvider = await p.select({
+  let embeddingProvider = await p.select({
     message: "Embedding provider for semantic search",
     options: [
       { value: "local", label: "Local (recommended)", hint: "Offline, downloads ~33MB model" },
@@ -457,9 +457,31 @@ export async function runSetup(): Promise<void> {
     if (!p.isCancel(dl) && dl) {
       const s = p.spinner();
       s.start("Downloading snowflake-arctic-embed-s...");
-      const { ensureModelDownloaded } = await import("@kirie/memory");
-      await ensureModelDownloaded();
-      s.stop("Embedding model downloaded");
+      try {
+        const { ensureModelDownloaded } = await import("@kirie/memory");
+        await ensureModelDownloaded();
+        s.stop("Embedding model downloaded");
+      } catch (err) {
+        s.stop("Failed to download embedding model");
+        p.log.warn(`Embedding model download failed: ${(err as Error).message}`);
+        p.log.info("You can retry later with: kirie embeddings download");
+
+        const fallback = await p.select({
+          message: "How would you like to handle embeddings?",
+          options: [
+            { value: "openai", label: "Use OpenAI API instead", hint: "Requires API key" },
+            { value: "noop", label: "Disable for now", hint: "No semantic search" },
+            { value: "local", label: "Keep local (will retry on first use)" },
+          ],
+        });
+        if (!p.isCancel(fallback) && fallback !== "local") {
+          embeddingProvider = fallback as string;
+          if (fallback === "openai") {
+            const key = await p.text({ message: "OpenAI API key for embeddings", placeholder: "sk-..." });
+            if (!p.isCancel(key)) embeddingApiKey = key as string;
+          }
+        }
+      }
     }
   }
 
