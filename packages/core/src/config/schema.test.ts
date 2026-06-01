@@ -14,7 +14,7 @@ describe("AgentConfigSchema", () => {
     const result = AgentConfigSchema.parse({});
     expect(result.customInstructions).toBeUndefined();
     expect(result.maxTurns).toBe(100);
-    expect(result.model).toBe("claude-opus-4-6");
+    expect(result.model).toBe("claude-opus-4-8[1m]");
   });
 
   it("accepts valid custom values", () => {
@@ -256,7 +256,7 @@ describe("KirieConfigSchema (root)", () => {
     const result = KirieConfigSchema.parse({
       agent: {
         maxTurns: 100,
-        model: "claude-opus-4-6",
+        model: "claude-opus-4-8",
       },
       security: {
         owner: { identities: { telegram: [], discord: [] } },

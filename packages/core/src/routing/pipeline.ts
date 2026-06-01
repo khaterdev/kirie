@@ -75,6 +75,14 @@ export class MessagePipeline {
   /** Active Query handles for running agent executions, keyed by session key */
   private readonly runningQueries = new Map<string, Query>();
   /**
+   * In-flight message handlers. Tracked so stop() can wait for running
+   * agent tasks to finish their post-execution writes (session ID, chat
+   * history) before the daemon closes the underlying SQLite stores.
+   */
+  private readonly inflight = new Set<Promise<void>>();
+  /** Max time stop() waits for in-flight handlers to drain before closing stores */
+  private static readonly DRAIN_TIMEOUT_MS = 5000;
+  /**
    * Track bot-sent message IDs so we can identify reactions to bot messages.
    * Maps chatId -> messageId -> truncated message text.
    * Entries are pruned when the map exceeds MAX_TRACKED_MESSAGES per chat.
@@ -173,7 +181,7 @@ export class MessagePipeline {
     const adapters = this.config.channelRegistry.getAll();
     for (const [id, adapter] of adapters) {
       log.info({ channel: id }, "wiring message listener");
-      adapter.onMessage((message) => this.handleMessage(message, adapter));
+      adapter.onMessage((message) => this.runHandler(message, adapter));
     }
 
     // Wire up newly registered adapters
@@ -181,17 +189,43 @@ export class MessagePipeline {
       const adapter = this.config.channelRegistry.getById(id);
       if (adapter) {
         log.info({ channel: id }, "wiring message listener for new adapter");
-        adapter.onMessage((message) => this.handleMessage(message, adapter));
+        adapter.onMessage((message) => this.runHandler(message, adapter));
       }
     });
   }
 
   /**
-   * Stop the pipeline, clearing all pending lane queue items.
+   * Run a message handler and track its promise so stop() can wait for it.
+   * handleMessage handles its own errors internally; the catch here is a
+   * last-resort guard so an unexpected throw never goes unhandled.
    */
-  stop(): void {
+  private runHandler(message: UnifiedMessage, adapter: ChannelAdapter): void {
+    const p = this.handleMessage(message, adapter).catch((err) => {
+      log.error({ err, messageId: message.id }, "unhandled error in message handler");
+    });
+    this.inflight.add(p);
+    void p.finally(() => this.inflight.delete(p));
+  }
+
+  /**
+   * Stop the pipeline. Rejects pending queue items, aborts running agents,
+   * then waits (bounded) for in-flight handlers to finish their post-execution
+   * writes so the daemon doesn't close the SQLite stores out from under a
+   * task that's still persisting its session ID or chat history.
+   */
+  async stop(): Promise<void> {
     this.started = false;
-    this.laneQueue.clearAll();
+    // Abort running agents and reject all pending queue items.
+    this.abortAll();
+    // Wait for in-flight handlers to settle before stores are closed.
+    if (this.inflight.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...this.inflight]),
+        new Promise<void>((resolve) =>
+          setTimeout(resolve, MessagePipeline.DRAIN_TIMEOUT_MS),
+        ),
+      ]);
+    }
   }
 
   /**
@@ -202,6 +236,11 @@ export class MessagePipeline {
     message: UnifiedMessage,
     sourceAdapter: ChannelAdapter,
   ): Promise<void> {
+    // Drop messages that arrive during shutdown/restart. Without this, a
+    // message accepted after stop() but before channels are torn down would
+    // start a new agent task and write to stores the daemon is about to close.
+    if (!this.started) return;
+
     const messageId = message.id;
     const channel = message.channel;
 
@@ -375,9 +414,21 @@ export class MessagePipeline {
             (q) => { this.runningQueries.set(route.sessionKey, q); },
             chatHistory,
           );
-        } finally {
+        } catch (execErr) {
           this.runningQueries.delete(route.sessionKey);
+          // If execution throws entirely (e.g. stale/expired session that can't
+          // be resumed and fresh session also fails), clear the bad session ID
+          // from the store so the next message doesn't hit the same failure loop.
+          if (route.sdkSessionId) {
+            log.warn(
+              { sessionKey: route.sessionKey, sdkSessionId: route.sdkSessionId },
+              "clearing stale session after execution failure",
+            );
+            this.config.sessionStore.delete(route.sessionKey);
+          }
+          throw execErr;
         }
+        this.runningQueries.delete(route.sessionKey);
 
         // Step 7: Persist the new/updated session ID
         if (executionResult.sessionId) {
@@ -502,10 +553,17 @@ export class MessagePipeline {
     } catch (err) {
       log.error({ messageId, err }, "pipeline error");
 
+      // Provide a more informative error message based on the failure type
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isSessionError = errMsg.includes("session") || errMsg.includes("resume") || errMsg.includes("spawn");
+      const userMessage = isSessionError
+        ? "Failed to start AI session. Context has been reset — please try again."
+        : "Sorry, an internal error occurred. Please try again.";
+
       await this.sendErrorResponse(
         sourceAdapter,
         message,
-        "Sorry, an internal error occurred while processing your message.",
+        userMessage,
       );
     }
   }

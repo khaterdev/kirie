@@ -24,7 +24,7 @@ describe("ConfigWatcher", () => {
   describe("load", () => {
     it("loads config from disk and stores it", () => {
       writeConfig({
-        agent: { maxTurns: 5, model: "claude-opus-4-6" },
+        agent: { maxTurns: 5, model: "claude-opus-4-8" },
       });
 
       const watcher = new ConfigWatcher({ configPath: TEST_CONFIG_PATH });
@@ -44,7 +44,7 @@ describe("ConfigWatcher", () => {
 
   describe("reload", () => {
     it("emits configReloaded when config changes", () => {
-      writeConfig({ agent: { model: "claude-opus-4-6" } });
+      writeConfig({ agent: { model: "claude-opus-4-8" } });
       const watcher = new ConfigWatcher({ configPath: TEST_CONFIG_PATH });
       watcher.load();
 
@@ -57,7 +57,7 @@ describe("ConfigWatcher", () => {
 
       expect(handler).toHaveBeenCalledTimes(1);
       const event: ConfigChangedEvent = handler.mock.calls[0]![0];
-      expect(event.previous.agent.model).toBe("claude-opus-4-6");
+      expect(event.previous.agent.model).toBe("claude-opus-4-8");
       expect(event.current.agent.model).toBe("opus");
     });
 
@@ -104,7 +104,7 @@ describe("ConfigWatcher", () => {
     it("does not emit channelConfigChanged when channels are unchanged", () => {
       writeConfig({
         channels: { telegram: { enabled: false } },
-        agent: { model: "claude-opus-4-6" },
+        agent: { model: "claude-opus-4-8" },
       });
       const watcher = new ConfigWatcher({ configPath: TEST_CONFIG_PATH });
       watcher.load();
@@ -141,7 +141,7 @@ describe("ConfigWatcher", () => {
     });
 
     it("emits error event on invalid config during reload", () => {
-      writeConfig({ agent: { model: "claude-opus-4-6" } });
+      writeConfig({ agent: { model: "claude-opus-4-8" } });
       const watcher = new ConfigWatcher({ configPath: TEST_CONFIG_PATH });
       watcher.load();
 
@@ -157,7 +157,7 @@ describe("ConfigWatcher", () => {
     });
 
     it("returns null on error during reload", () => {
-      writeConfig({ agent: { model: "claude-opus-4-6" } });
+      writeConfig({ agent: { model: "claude-opus-4-8" } });
       const watcher = new ConfigWatcher({ configPath: TEST_CONFIG_PATH });
       watcher.load();
 
@@ -169,7 +169,7 @@ describe("ConfigWatcher", () => {
     });
 
     it("does not emit events on first load (no previous config)", () => {
-      writeConfig({ agent: { model: "claude-opus-4-6" } });
+      writeConfig({ agent: { model: "claude-opus-4-8" } });
       const watcher = new ConfigWatcher({ configPath: TEST_CONFIG_PATH });
 
       const reloadHandler = vi.fn();

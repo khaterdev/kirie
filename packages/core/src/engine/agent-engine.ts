@@ -216,9 +216,26 @@ export class AgentEngine {
       delete options.resume;
     }
 
-    const stream = query({ prompt: userPrompt, options });
-    onQuery?.(stream);
-    return this.consumeStream(stream);
+    // Fresh session attempt with retry. If the first attempt fails (e.g. transient
+    // SDK spawn issue, network blip), wait briefly and retry once more before giving up.
+    const MAX_FRESH_RETRIES = 2;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < MAX_FRESH_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delayMs = attempt * 2000; // 2s, 4s
+          log.info({ attempt, delayMs }, "retrying fresh session after delay");
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+        const stream = query({ prompt: userPrompt, options });
+        onQuery?.(stream);
+        return await this.consumeStream(stream);
+      } catch (err) {
+        lastErr = err;
+        log.error({ attempt, err }, "fresh session attempt failed");
+      }
+    }
+    throw lastErr;
   }
 
   /**

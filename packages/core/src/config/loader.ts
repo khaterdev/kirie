@@ -69,7 +69,7 @@ function ensureDefaults(configPath: string): void {
     const defaultYaml = stringifyYaml({
       agent: {
         maxTurns: 100,
-        model: "claude-opus-4-6",
+        model: "claude-opus-4-8[1m]",
       },
       security: {
         dmPolicy: "owner-only",

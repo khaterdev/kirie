@@ -86,7 +86,7 @@ export function makeConfig(overrides: Partial<TestKirieConfig> = {}): TestKirieC
   return {
     agent: {
       maxTurns: 100,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
       ...overrides.agent,
     },
     security: {
@@ -129,7 +129,7 @@ export function makeSessionKey(
 export const MINIMAL_YAML_CONFIG = `
 agent:
   maxTurns: 100
-  model: "claude-opus-4-6"
+  model: "claude-opus-4-8"
 
 security:
   owner:
@@ -169,7 +169,7 @@ agent:
 export const CREDENTIAL_REF_YAML = `
 agent:
   maxTurns: 100
-  model: "claude-opus-4-6"
+  model: "claude-opus-4-8"
 
 security:
   owner:

@@ -13,7 +13,7 @@ export const AgentConfigSchema = z.object({
   customInstructions: z.string().optional(),
   /** Maximum agent turns per request. 0 = unlimited. */
   maxTurns: z.number().int().min(0).default(100),
-  model: z.string().default("claude-opus-4-6"),
+  model: z.string().default("claude-opus-4-8[1m]"),
   /** Default working directory for the agent (cwd passed to the SDK) */
   workspace: z.string().optional(),
   /** Maximum turns for background task agents. Default 200. */
@@ -315,7 +315,7 @@ export const ProactiveConfigSchema = z.object({
   /** Model to use for Tier 2 triage (fast, cheap) */
   tier2Model: z.string().default("claude-haiku-4-5"),
   /** Model to use for Tier 3 escalation (deep reasoning) */
-  tier3Model: z.string().default("claude-opus-4-6"),
+  tier3Model: z.string().default("claude-opus-4-8[1m]"),
   /** Active hours — proactive notifications only fire within this window */
   activeHours: z.object({
     start: z.string().default("00:00"),

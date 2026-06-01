@@ -410,7 +410,7 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   const model = await p.select({
     message: "Default model",
     options: [
-      { value: "claude-opus-4-6", label: "Claude Opus 4.6", hint: "Most capable (Recommended)" },
+      { value: "claude-opus-4-8[1m]", label: "Claude Opus 4.8 (1M)", hint: "Most capable (Recommended)" },
       { value: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5", hint: "Fast and capable" },
       { value: "claude-haiku-3-5-20241022", label: "Claude Haiku 3.5", hint: "Fastest, most affordable" },
     ],
@@ -640,7 +640,7 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
       enabled: true,
       tier2IntervalMinutes: Number(triageInterval),
       tier2Model: "claude-haiku-4-5-20241022",
-      tier3Model: "claude-opus-4-6",
+      tier3Model: "claude-opus-4-8[1m]",
       memoryThresholdMB: Number(memoryThreshold),
       activeHours: {
         start: "00:00",

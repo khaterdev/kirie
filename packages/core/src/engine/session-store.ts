@@ -80,6 +80,12 @@ export class SessionStore {
    * @param sessionId - Agent SDK session ID
    */
   set(key: string, sessionId: string): void {
+    // The connection can be closed during shutdown while a late agent task is
+    // still finishing. Persisting a session ID at that point is moot — the
+    // process is going away — so skip rather than throw a confusing
+    // "database connection is not open" error up through the pipeline.
+    if (!this.db.open) return;
+
     const upsert = this.db.transaction(() => {
       const stmt = this.db.prepare(`
         INSERT INTO sessions (session_key, sdk_session_id, created_at, updated_at)

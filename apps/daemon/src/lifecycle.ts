@@ -1133,8 +1133,10 @@ export async function stopDaemon(): Promise<void> {
   heartbeat.stop();
   log.info("heartbeat service stopped");
 
-  // 3. Stop the message pipeline (prevents new message processing)
-  pipeline.stop();
+  // 3. Stop the message pipeline (prevents new message processing).
+  // Awaited so in-flight agent tasks finish persisting their session ID /
+  // chat history before the SQLite stores are closed below.
+  await pipeline.stop();
   log.info("message pipeline stopped");
 
   // 4. Stop gateway

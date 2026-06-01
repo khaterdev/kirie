@@ -310,7 +310,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
   it("includes the default system prompt identity", () => {
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
     });
     expect(prompt).toContain(DEFAULT_SYSTEM_PROMPT);
     expect(prompt).toContain("<assistant_identity>");
@@ -320,7 +320,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
   it("includes background task agent instructions", () => {
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
     });
     expect(prompt).toContain(BACKGROUND_TASK_AGENT_INSTRUCTIONS);
     expect(prompt).toContain("<background_task_agent_mode>");
@@ -332,7 +332,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
   it("includes custom instructions when provided", () => {
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
       customInstructions: "Always respond in Arabic.",
     });
     expect(prompt).toContain("Always respond in Arabic.");
@@ -345,7 +345,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
 
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
       dataDir: tmpDir,
     });
 
@@ -367,7 +367,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
 
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
       dataDir: tmpDir,
     });
 
@@ -379,7 +379,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
   it("includes current time", () => {
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
     });
     expect(prompt).toContain("<current_time>");
     expect(prompt).toContain("</current_time>");
@@ -388,7 +388,7 @@ describe("buildBackgroundTaskSystemPrompt", () => {
   it("omits context sections when dataDir is not provided", () => {
     const prompt = buildBackgroundTaskSystemPrompt({
       maxTurns: 200,
-      model: "claude-opus-4-6",
+      model: "claude-opus-4-8",
     });
     expect(prompt).not.toContain("<soul_context>");
     expect(prompt).not.toContain("<memory_context>");

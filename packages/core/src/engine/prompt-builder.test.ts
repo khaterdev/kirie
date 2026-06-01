@@ -12,7 +12,7 @@ import {
 
 const baseConfig: PromptConfig = {
   maxTurns: 10,
-  model: "claude-opus-4-6",
+  model: "claude-opus-4-8",
 };
 
 const dmChannel: ChannelContext = {
@@ -80,13 +80,13 @@ describe("buildPrompt", () => {
       });
 
       expect(result.maxTurns).toBe(10);
-      expect(result.model).toBe("claude-opus-4-6");
+      expect(result.model).toBe("claude-opus-4-8");
     });
 
     it("converts maxTurns 0 to undefined (unlimited)", () => {
       const unlimitedConfig: PromptConfig = {
         maxTurns: 0,
-        model: "claude-opus-4-6",
+        model: "claude-opus-4-8",
       };
       const result = buildPrompt({
         config: unlimitedConfig,
@@ -286,7 +286,7 @@ describe("buildPrompt", () => {
       const customConfig: PromptConfig = {
         customInstructions: "Always respond in Spanish. My name is Alex.",
         maxTurns: 5,
-        model: "claude-opus-4-6",
+        model: "claude-opus-4-8",
       };
 
       const result = buildPrompt({

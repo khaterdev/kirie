@@ -32,7 +32,7 @@ function createTestConfig(overrides?: Partial<ProactiveConfig>): ProactiveConfig
     enabled: true,
     tier2IntervalMinutes: 15,
     tier2Model: "claude-haiku-4-5-20241022",
-    tier3Model: "claude-opus-4-6",
+    tier3Model: "claude-opus-4-8",
     activeHours: {
       start: "08:00",
       end: "02:00",

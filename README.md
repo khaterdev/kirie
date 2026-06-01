@@ -187,7 +187,7 @@ Kirie uses a YAML config file at `~/.kirie/config.yaml`. See [`config.example.ya
 
 ```yaml
 agent:
-  model: "claude-opus-4-6"
+  model: "claude-opus-4-8[1m]"
   maxTurns: 100                    # 0 = unlimited
   backgroundTaskMaxTurns: 200      # Max turns for background task agents
   # customInstructions: "..."      # Appended to system prompt

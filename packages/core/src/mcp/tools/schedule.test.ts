@@ -210,7 +210,8 @@ describe("ScheduleStore", () => {
 
   describe("fire event", () => {
     it("emits fire event on cron trigger", async () => {
-      vi.useFakeTimers();
+      // Pin to an exact second boundary so 1100ms crosses exactly one tick.
+      vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
 
       const fireHandler = vi.fn();
       store.on("fire", fireHandler);
@@ -234,7 +235,8 @@ describe("ScheduleStore", () => {
     });
 
     it("auto-deletes a one-time schedule after firing", async () => {
-      vi.useFakeTimers();
+      // Pin to an exact second boundary so 1100ms crosses exactly one tick.
+      vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
 
       const fireHandler = vi.fn();
       store.on("fire", fireHandler);
@@ -252,7 +254,8 @@ describe("ScheduleStore", () => {
     });
 
     it("auto-deletes an N-times schedule after N fires", async () => {
-      vi.useFakeTimers();
+      // Pin to an exact second boundary so 3500ms crosses exactly three ticks.
+      vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
 
       const fireHandler = vi.fn();
       store.on("fire", fireHandler);
@@ -270,7 +273,8 @@ describe("ScheduleStore", () => {
     });
 
     it("recurring schedule with no maxRuns keeps running", async () => {
-      vi.useFakeTimers();
+      // Pin to an exact second boundary for deterministic tick counts.
+      vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
 
       const fireHandler = vi.fn();
       store.on("fire", fireHandler);
@@ -287,7 +291,8 @@ describe("ScheduleStore", () => {
     });
 
     it("remaining field is correct after fires", async () => {
-      vi.useFakeTimers();
+      // Pin to an exact second boundary so 1100ms crosses exactly one tick.
+      vi.useFakeTimers({ now: new Date("2026-01-01T00:00:00.000Z") });
 
       store.on("fire", () => {});
 

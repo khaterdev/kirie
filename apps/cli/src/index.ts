@@ -16,7 +16,7 @@ program
 program
   .command("chat")
   .description("Start interactive chat session")
-  .option("-m, --model <model>", "Model to use", "claude-opus-4-6")
+  .option("-m, --model <model>", "Model to use", "claude-opus-4-8[1m]")
   .option("--max-turns <turns>", "Maximum conversation turns", "10")
   .option("--no-engine", "Run without AgentEngine (UI demo mode)")
   .option("-s, --session-key <key>", "Sync with an existing session key (e.g., telegram:dm:12345)")

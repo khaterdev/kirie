@@ -277,6 +277,48 @@ describe("MessagePipeline", () => {
       // getAll should only have been called once
       expect(mockRegistry.getAll).toHaveBeenCalledTimes(1);
     });
+
+    it("stop() waits for an in-flight handler to finish before resolving", async () => {
+      // Make agent execution hang until we release it, simulating a long-running
+      // task that is still persisting its session ID when shutdown begins.
+      let releaseExecute!: () => void;
+      const executeStarted = new Promise<void>((resolveStarted) => {
+        (mockEngine.execute as ReturnType<typeof vi.fn>).mockImplementation(
+          async () => {
+            resolveStarted();
+            await new Promise<void>((r) => {
+              releaseExecute = r;
+            });
+            return {
+              response: "done",
+              sessionId: "sdk-sess-1",
+              costUsd: 0.01,
+              numTurns: 1,
+              isError: false,
+            } satisfies ExecutionResult;
+          },
+        );
+      });
+
+      pipeline.start();
+      mockAdapter.messageListeners[0](makeMessage());
+      await executeStarted; // handler is now mid-execution
+
+      let stopResolved = false;
+      const stopPromise = pipeline.stop().then(() => {
+        stopResolved = true;
+      });
+
+      // stop() must not resolve while the handler is still running.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(stopResolved).toBe(false);
+
+      releaseExecute();
+      await stopPromise;
+      expect(stopResolved).toBe(true);
+      // The in-flight task got to persist its session before stores would close.
+      expect(mockSessionStore.set).toHaveBeenCalledWith("telegram:dm:chat-456", "sdk-sess-1");
+    });
   });
 });
 
@@ -515,7 +557,7 @@ describe("MessagePipeline retry integration", () => {
     expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalledWith(
       "telegram",
       "chat-456",
-      "Sorry, an internal error occurred while processing your message.",
+      "Sorry, an internal error occurred. Please try again.",
       expect.stringContaining("ETIMEDOUT"),
       undefined,
     );

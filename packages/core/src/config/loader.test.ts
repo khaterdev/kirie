@@ -61,7 +61,7 @@ describe("loadConfig", () => {
     const config = loadConfig({ configPath: missingPath });
     expect(config.agent.customInstructions).toBeUndefined();
     expect(config.agent.maxTurns).toBe(100);
-    expect(config.agent.model).toBe("claude-opus-4-6");
+    expect(config.agent.model).toBe("claude-opus-4-8[1m]");
     expect(existsSync(missingPath)).toBe(true);
   });
 
@@ -119,7 +119,7 @@ agent:
     writeTestConfig(`
 agent:
   maxTurns: 10
-  model: "claude-opus-4-6"
+  model: "claude-opus-4-8"
 
 channels:
   telegram:
@@ -158,7 +158,7 @@ channels:
     writeTestConfig(`
 agent:
   maxTurns: 5
-  model: "claude-opus-4-6"
+  model: "claude-opus-4-8"
 `);
     // This tests that loadConfig doesn't crash with nested structures
     const config = loadConfig({
