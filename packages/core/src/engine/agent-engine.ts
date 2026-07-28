@@ -111,6 +111,36 @@ export interface AgentEngineConfig {
 }
 
 /**
+ * Converts a UTC timestamp string from the chat history DB
+ * (SQLite `datetime('now')` → "YYYY-MM-DD HH:MM:SS", always UTC)
+ * into the same wall-clock format rendered in the given IANA timezone.
+ *
+ * Returns the input unchanged when no timezone is configured or the
+ * value can't be parsed, so callers never lose data on bad input.
+ */
+export function localizeUtcTimestamp(utc: string, timezone?: string): string {
+  if (!timezone) return utc;
+  const date = new Date(`${utc.replace(" ", "T")}Z`);
+  if (Number.isNaN(date.getTime())) return utc;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date);
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+  } catch {
+    return utc;
+  }
+}
+
+/**
  * AgentEngine wraps the Claude Agent SDK, providing a high-level
  * interface for executing messages through the AI agent.
  *
@@ -251,11 +281,14 @@ export class AgentEngine {
 
     // Inject recent chat history so the agent knows what was discussed before
     if (chatHistory && chatHistory.length > 0) {
+      const tz = this.config.prompt?.timezone;
       const historyKey = sessionKey ?? `${message.channel}:${message.chatType}:${message.chatId}`;
       parts.push(`<conversation_history session_key="${historyKey}">`);
-      parts.push("Recent messages from this conversation (oldest first):");
+      parts.push(
+        `Recent messages from this conversation (oldest first). Timestamps are local time in ${tz || "UTC"}:`,
+      );
       for (const entry of chatHistory) {
-        const ts = entry.timestamp ? `[${entry.timestamp}] ` : "";
+        const ts = entry.timestamp ? `[${localizeUtcTimestamp(entry.timestamp, tz)}] ` : "";
         if (entry.role === "user") {
           const name = entry.senderName ?? "user";
           parts.push(`${ts}${name}: ${entry.content}`);

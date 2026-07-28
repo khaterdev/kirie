@@ -1,6 +1,31 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Compiled output must never live inside src/. A stray `tsc` run once emitted
+# ~800 .js/.d.ts/.map files next to the sources; because TS/ESM imports use .js
+# extensions ("./foo.js"), the bundler resolved to those stale artifacts instead
+# of the .ts files and silently built dead code while reporting success.
+packages/*/src/**/*.js
+packages/*/src/**/*.d.ts
+packages/*/src/**/*.js.map
+packages/*/src/**/*.d.ts.map
+apps/*/src/**/*.js
+apps/*/src/**/*.d.ts
+apps/*/src/**/*.js.map
+apps/*/src/**/*.d.ts.map
+channels/*/src/**/*.js
+channels/*/src/**/*.d.ts
+channels/*/src/**/*.js.map
+channels/*/src/**/*.d.ts.map
+# The same stray run also emitted twins of the build configs themselves
+# (tsdown.config.ts, vitest.config.ts), which can shadow the real config.
+*.config.js
+*.config.d.ts
+*.config.js.map
+*.config.d.ts.map
+# Exception: genuine browser-side asset loaded by src/client/index.html
+!packages/canvas/src/client/canvas.js
 .env
 .env.*
 !.env.example
