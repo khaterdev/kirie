@@ -15,7 +15,9 @@ describe("Kokoro process kill - platform-aware signal handling", () => {
   function createMockProcess() {
     return {
       killed: false,
-      kill: vi.fn(function (this: { killed: boolean }) {
+      // Mirrors ChildProcess.kill, which takes an optional signal. forceKill
+      // passes "SIGKILL" on non-Windows platforms.
+      kill: vi.fn(function (this: { killed: boolean }, _signal?: NodeJS.Signals | number) {
         this.killed = true;
       }),
     };

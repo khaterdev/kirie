@@ -3,7 +3,6 @@ import {
   unstable_v2_resumeSession,
   type SDKSession,
   type SDKSessionOptions,
-  type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import pino from "pino";

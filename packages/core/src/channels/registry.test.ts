@@ -15,6 +15,10 @@ function createMockAdapter(id: ChannelName = "mock", overrides: Partial<ChannelA
       deleteMessage: false,
       sendTyping: true,
       threads: false,
+      multipleImages: false,
+      reactions: false,
+      replyContext: false,
+      voiceMessages: false,
       maxTextLength: 4000,
     },
     async start(_signal: AbortSignal) {

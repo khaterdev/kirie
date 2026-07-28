@@ -4,6 +4,7 @@
  */
 
 import { Bot, type Context } from "grammy";
+import type { ReactionTypeEmoji } from "grammy/types";
 import type { UnifiedMessage, MessageListener, ChatType } from "@kirie/core";
 import { makeDisplayName, makeSenderId } from "./auth.js";
 
@@ -201,10 +202,10 @@ export function createBot(config: TelegramBotConfig, listeners: MessageListener[
 
     // Determine which emoji was added or removed
     const newEmojis = (update.new_reaction ?? [])
-      .filter((r): r is { type: "emoji"; emoji: string } => r.type === "emoji")
+      .filter((r): r is ReactionTypeEmoji => r.type === "emoji")
       .map((r) => r.emoji);
     const oldEmojis = (update.old_reaction ?? [])
-      .filter((r): r is { type: "emoji"; emoji: string } => r.type === "emoji")
+      .filter((r): r is ReactionTypeEmoji => r.type === "emoji")
       .map((r) => r.emoji);
 
     // Find added reactions

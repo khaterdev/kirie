@@ -22,6 +22,7 @@ import {
   createMcpToolRegistry,
   createSdkMcpServerFromTools,
   type ScheduleFireEvent,
+  type McpServerConfig,
 } from "@kirie/core";
 import {
   BackgroundTaskStore,
@@ -142,7 +143,7 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
-  const mcpServers: Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string; headers?: Record<string, string> }> = {
+  const mcpServers: Record<string, McpServerConfig> = {
     "kirie-tools": {
       command: "node",
       args: [stdioServerPath],
@@ -305,7 +306,7 @@ export async function startDaemon(): Promise<void> {
     if (!isModelDownloaded()) {
       log.info("downloading local embedding model (snowflake-arctic-embed-s)...");
       await ensureModelDownloaded({
-        onProgress: (file: string, received: number, total: number) => {
+        onProgress: (file: string, received: number, total: number | null) => {
           if (total) log.info({ file, pct: Math.round(received / total * 100) }, "downloading");
         },
       });
@@ -586,7 +587,7 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
-  const { mcpShutdown, tools, scheduleStore, chatHistoryStore, sdkMcpServer } = createMcpRegistry(
+  const { mcpShutdown, tools, scheduleStore, chatHistoryStore } = createMcpRegistry(
     channelRegistry,
     {
       sessionStore,

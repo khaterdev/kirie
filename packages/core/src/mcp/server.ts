@@ -1,4 +1,4 @@
-import { z } from "zod/v3";
+import { z } from "zod/v4";
 import {
   tool as sdkTool,
   createSdkMcpServer,
@@ -345,14 +345,17 @@ export function createSdkMcpServerFromTools(
   tools: Map<string, McpToolDefinition>,
 ): McpSdkServerConfigWithInstance {
   const sdkTools = [...tools.entries()].map(([name, def]) => {
-    // Convert plain JSON schema properties to Zod schemas
-    const zodShape: Record<string, z.ZodTypeAny> = {};
+    // Convert plain JSON schema properties to Zod schemas.
+    // Built as a mutable record because z.ZodRawShape is Readonly; the SDK's
+    // tool() requires zod v4 shapes, which is why this file imports zod/v4
+    // while the rest of the repo is still on zod/v3.
+    const zodShape: Record<string, z.ZodType> = {};
     const props = def.parameters.properties;
     const required = new Set(def.parameters.required ?? []);
 
     for (const [key, schema] of Object.entries(props)) {
       const s = schema as { type?: string; description?: string };
-      let zodType: z.ZodTypeAny;
+      let zodType: z.ZodType;
 
       switch (s.type) {
         case "number":

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from "vitest";
 import {
   OpenAIBatchEmbeddings,
   type BatchEmbeddingRequest,
@@ -16,20 +16,20 @@ function mockResponse(body: unknown, status = 200): Response {
     text: () => Promise.resolve(typeof body === "string" ? body : JSON.stringify(body)),
     headers: new Headers(),
     redirected: false,
-    type: "basic" as ResponseType,
+    type: "basic" as Response["type"],
     url: "",
     clone: () => mockResponse(body, status),
     body: null,
     bodyUsed: false,
     arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
-    blob: () => Promise.resolve(new Blob()),
+    blob: () => Promise.resolve(new Blob([])),
     formData: () => Promise.resolve(new FormData()),
     bytes: () => Promise.resolve(new Uint8Array()),
   } as Response;
 }
 
 describe("OpenAIBatchEmbeddings", () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let fetchSpy: MockInstance<typeof fetch>;
   let client: OpenAIBatchEmbeddings;
 
   beforeEach(() => {

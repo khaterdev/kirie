@@ -40,6 +40,14 @@ function createTestConfig(overrides?: Partial<ProactiveConfig>): ProactiveConfig
     },
     dailyDigestTime: "09:00",
     heartbeatFile: "/tmp/kirie-test-heartbeat.md",
+    // These carry schema defaults, so they are required on the parsed type.
+    memoryThresholdMB: 1024,
+    notificationCooldownMinutes: 60,
+    heartbeatLogging: {
+      enabled: true,
+      levels: { tier1: "info", tier2: "info", tier3: "debug", heartbeat: "info" },
+      retention: { tier1: 7, tier2: 30, tier3: 0, heartbeat: 14 },
+    },
     ...overrides,
   };
 }

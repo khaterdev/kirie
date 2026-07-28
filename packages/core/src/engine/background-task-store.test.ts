@@ -74,11 +74,11 @@ describe("BackgroundTaskStore", () => {
 
       const pending = store.list("telegram:dm:123", "pending");
       expect(pending).toHaveLength(1);
-      expect(pending[0].description).toBe("Task 2");
+      expect(pending[0]!.description).toBe("Task 2");
 
       const running = store.list("telegram:dm:123", "running");
       expect(running).toHaveLength(1);
-      expect(running[0].description).toBe("Task 1");
+      expect(running[0]!.description).toBe("Task 1");
     });
   });
 
@@ -160,7 +160,7 @@ describe("BackgroundTaskStore", () => {
     it("filters to active tasks only when activeOnly is true", () => {
       const t1 = store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 1");
       const t2 = store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 2");
-      const t3 = store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 3");
+      store.create("telegram:dm:123", "Scheduled task: my-cron", "prompt 3");
 
       store.markRunning(t1.id);
       store.markCompleted(t2.id, "done", 0.01, 1);

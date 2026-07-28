@@ -358,6 +358,9 @@ export class ScheduleStore extends EventEmitter {
       max_runs: maxRunsValue, run_count: 0,
       active_hours: activeHoursJson, session_target: sessionTargetValue,
       at: atValue, timezone: timezoneValue,
+      // The INSERT omits this column, so SQLite applies its DEFAULT 'announce'.
+      // Mirror that here so the in-memory row matches what a re-read returns.
+      delivery: "announce",
     };
     this.startCronJob(row);
 
@@ -522,8 +525,11 @@ export function isWithinActiveHours(config: ActiveHoursConfig): boolean {
   }
 
   // Parse start/end times
-  const [startH, startM] = config.start.split(":").map(Number);
-  const [endH, endM] = config.end.split(":").map(Number);
+  // Defaults cover a bare "HH" with no minutes; without them the missing part
+  // is undefined and the arithmetic below silently yields NaN, which makes
+  // every comparison false and the window never active.
+  const [startH = 0, startM = 0] = config.start.split(":").map(Number);
+  const [endH = 0, endM = 0] = config.end.split(":").map(Number);
 
   // Get current time in the specified timezone or local
   let currentMinutes: number;

@@ -145,9 +145,9 @@ describe("createMemoryToolHandlers", () => {
     expect(handlers).toHaveProperty("memory_delete");
   });
 
-  it("memory_store handler works", () => {
+  it("memory_store handler works", async () => {
     const handlers = createMemoryToolHandlers(store);
-    const result = handlers.memory_store.handler({
+    const result = await handlers.memory_store.handler({
       key: "test",
       content: "test content",
       tags: ["tag1"],

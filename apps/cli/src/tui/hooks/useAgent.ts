@@ -66,7 +66,6 @@ export function useAgent({ engine, sessionId, sessionStore, sessionKey, chatHist
   const agentSessionIdRef = useRef<string | undefined>(
     sessionStore && sessionKey ? (sessionStore.get(sessionKey) ?? undefined) : undefined,
   );
-  const abortRef = useRef<AbortController | null>(null);
 
   const nextId = useCallback(() => {
     messageIdCounter.current += 1;
@@ -105,8 +104,6 @@ export function useAgent({ engine, sessionId, sessionStore, sessionKey, chatHist
             role: "owner",
           };
 
-          abortRef.current = new AbortController();
-
           // Load recent chat history so the agent has conversation context
           let history: ChatHistoryMessage[] | undefined;
           if (chatHistoryStore) {
@@ -129,7 +126,7 @@ export function useAgent({ engine, sessionId, sessionStore, sessionKey, chatHist
             incomingMessage,
             sender,
             agentSessionIdRef.current,
-            abortRef.current,
+            undefined,
             history,
           );
 
@@ -195,8 +192,6 @@ export function useAgent({ engine, sessionId, sessionStore, sessionKey, chatHist
 
         setMessages((prev) => [...prev, errorMessage]);
         setTimeout(() => setConnectionStatus("connected"), 3000);
-      } finally {
-        abortRef.current = null;
       }
     },
     [nextId, engine, sessionId, sessionStore, sessionKey, chatHistoryStore, effectiveSessionKey],

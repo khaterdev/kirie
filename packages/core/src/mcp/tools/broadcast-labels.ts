@@ -4,8 +4,7 @@
 
 import type { ChannelRegistry } from "../../channels/registry.js";
 import { broadcastMessage, type BroadcastGroup, type BroadcastTarget } from "../../routing/broadcast.js";
-import { LabelStore, type ConversationLabel } from "../../routing/labels.js";
-import type Database from "better-sqlite3";
+import { LabelStore } from "../../routing/labels.js";
 
 export function createBroadcastToolHandlers(
   channelRegistry: ChannelRegistry,

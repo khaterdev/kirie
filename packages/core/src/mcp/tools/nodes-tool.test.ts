@@ -1,9 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from "vitest";
 import { existsSync, readFileSync, rmSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
 import {
   resolveNodeId,
-  saveBase64Media,
   createNodesToolHandlers,
   callGateway,
   NODES_ACTIONS,
@@ -268,7 +266,7 @@ describe("createNodesToolHandlers", () => {
   });
 
   describe("action routing", () => {
-    let fetchSpy: ReturnType<typeof vi.spyOn>;
+    let fetchSpy: MockInstance<typeof fetch>;
 
     beforeEach(() => {
       fetchSpy = vi.spyOn(globalThis, "fetch");

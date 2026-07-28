@@ -52,7 +52,7 @@ export function splitMediaFromOutput(raw: string): MediaOutputParseResult {
     // Check for MEDIA: token
     const match = line.match(mediaRegex);
     if (match) {
-      const url = match[1].trim();
+      const url = match[1]?.trim() ?? "";
       // Validate URL: must be https:// or local path
       if (url.startsWith("https://") || url.startsWith("/") || url.startsWith("~")) {
         mediaUrls.push(url);

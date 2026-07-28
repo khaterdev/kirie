@@ -188,7 +188,10 @@ describe("MemoryManager.reindex", () => {
   });
 
   it("skips unchanged memories even with batchEmbed available", async () => {
-    const provider = createMockEmbeddingProvider({ withBatch: true });
+    // batchEmbed is optional on EmbeddingProvider, so vi.spyOn resolves to
+    // `never` without narrowing. withBatch: true guarantees it is present.
+    const provider = createMockEmbeddingProvider({ withBatch: true }) as EmbeddingProvider &
+      Required<Pick<EmbeddingProvider, "batchEmbed">>;
     const batchSpy = vi.spyOn(provider, "batchEmbed");
 
     const manager = new MemoryManager({

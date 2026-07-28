@@ -149,9 +149,6 @@ describe("chunkMarkdown", () => {
     const chunks = chunkMarkdown(content);
 
     expect(chunks.length).toBeGreaterThanOrEqual(1);
-    // All text combined should reconstruct the original
-    const fullText = chunks.map(c => c.text).join("\n");
-    // Note: the join with \n between chunks means we need to check the pieces match
     expect(chunks[0]!.startLine).toBe(1);
   });
 

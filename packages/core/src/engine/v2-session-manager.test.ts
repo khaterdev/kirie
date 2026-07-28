@@ -9,7 +9,6 @@ import { V2SessionManager } from "./v2-session-manager.js";
 vi.mock("@anthropic-ai/claude-agent-sdk", () => {
   function createMockSession(sessionId: string) {
     let streamResolve: (() => void) | null = null;
-    let sendResolve: ((value: void) => void) | null = null;
     const messages: Array<{ type: string; [key: string]: unknown }> = [];
     let closed = false;
 
@@ -20,7 +19,6 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => {
       async send(_message: string) {
         // Simulate async send — push a result message to the stream
         await new Promise<void>((resolve) => {
-          sendResolve = resolve;
           // Auto-resolve after a small delay to simulate response
           setTimeout(() => {
             messages.push({

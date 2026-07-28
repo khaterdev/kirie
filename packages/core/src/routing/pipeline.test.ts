@@ -33,6 +33,10 @@ function createMockAdapter(): ChannelAdapter & { messageListeners: Array<(msg: U
       deleteMessage: false,
       sendTyping: true,
       threads: false,
+      multipleImages: false,
+      reactions: false,
+      replyContext: false,
+      voiceMessages: false,
       maxTextLength: 4000,
     },
     async start() {},
@@ -115,7 +119,7 @@ describe("MessagePipeline", () => {
 
       const msg = makeMessage();
       // Trigger the listener
-      mockAdapter.messageListeners[0](msg);
+      mockAdapter.messageListeners[0]!(msg);
 
       // Wait for the full async processing chain to complete
       await vi.waitFor(() => {
@@ -133,7 +137,7 @@ describe("MessagePipeline", () => {
       });
 
       pipeline.start();
-      mockAdapter.messageListeners[0](makeMessage());
+      mockAdapter.messageListeners[0]!(makeMessage());
 
       // Give the pipeline time to process the message
       await new Promise((r) => setTimeout(r, 100));
@@ -153,13 +157,13 @@ describe("MessagePipeline", () => {
       );
 
       pipeline.start();
-      mockAdapter.messageListeners[0](makeMessage());
+      mockAdapter.messageListeners[0]!(makeMessage());
 
       await vi.waitFor(() => {
         expect(mockAdapter.sendText).toHaveBeenCalled();
       }, { timeout: 3000 });
 
-      const sendCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const sendCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[0]![0];
       // Should NOT contain internal error details
       expect(sendCall.text).not.toContain("ECONNREFUSED");
       expect(sendCall.text).not.toContain("database");
@@ -247,14 +251,14 @@ describe("MessagePipeline", () => {
       );
 
       pipeline.start();
-      mockAdapter.messageListeners[0](makeMessage());
+      mockAdapter.messageListeners[0]!(makeMessage());
 
       await vi.waitFor(() => {
         expect(mockAdapter.sendText).toHaveBeenCalledTimes(2);
       }, { timeout: 3000 });
 
       // Second call should NOT have replyToId
-      const secondCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[1][0];
+      const secondCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[1]![0];
       expect(secondCall.ctx.replyToId).toBeUndefined();
       expect(secondCall.text).toContain("internal error");
     });
@@ -301,7 +305,7 @@ describe("MessagePipeline", () => {
       });
 
       pipeline.start();
-      mockAdapter.messageListeners[0](makeMessage());
+      mockAdapter.messageListeners[0]!(makeMessage());
       await executeStarted; // handler is now mid-execution
 
       let stopResolved = false;
@@ -396,7 +400,7 @@ describe("MessagePipeline retry integration", () => {
     (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockRejectedValueOnce(etimedoutErr);
 
     pipeline.start();
-    mockAdapter.messageListeners[0](makeMessage());
+    mockAdapter.messageListeners[0]!(makeMessage());
 
     await vi.waitFor(() => {
       expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
@@ -418,7 +422,7 @@ describe("MessagePipeline retry integration", () => {
     (mockAdapter.sendText as ReturnType<typeof vi.fn>).mockRejectedValueOnce(err);
 
     pipeline.start();
-    mockAdapter.messageListeners[0](makeMessage());
+    mockAdapter.messageListeners[0]!(makeMessage());
 
     await vi.waitFor(() => {
       expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
@@ -431,7 +435,7 @@ describe("MessagePipeline retry integration", () => {
     );
 
     pipeline.start();
-    mockAdapter.messageListeners[0](makeMessage());
+    mockAdapter.messageListeners[0]!(makeMessage());
 
     // Wait for the error response to be attempted (the outer catch sends error message)
     await vi.waitFor(() => {
@@ -488,7 +492,7 @@ describe("MessagePipeline retry integration", () => {
     (mockAdapter as any).capabilities.sendMedia = true;
 
     pipeline.start();
-    mockAdapter.messageListeners[0](makeMessage());
+    mockAdapter.messageListeners[0]!(makeMessage());
 
     await vi.waitFor(() => {
       expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();
@@ -522,7 +526,7 @@ describe("MessagePipeline retry integration", () => {
     (mockAdapter as any).capabilities.sendMedia = true;
 
     pipeline.start();
-    mockAdapter.messageListeners[0](makeMessage());
+    mockAdapter.messageListeners[0]!(makeMessage());
 
     // Wait for text to be sent (the non-media part)
     await vi.waitFor(() => {
@@ -548,7 +552,7 @@ describe("MessagePipeline retry integration", () => {
       .mockRejectedValueOnce(netErr); // fallback without replyToId
 
     pipeline.start();
-    mockAdapter.messageListeners[0](makeMessage());
+    mockAdapter.messageListeners[0]!(makeMessage());
 
     await vi.waitFor(() => {
       expect(mockHeartbeat.addFailedDelivery).toHaveBeenCalled();

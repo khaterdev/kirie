@@ -31,7 +31,8 @@ function encodeMulawSample(sample: number): number {
   if (sign !== 0) sample = -sample;
   if (sample > CLIP) sample = CLIP;
   sample += BIAS;
-  const exponent = encodeTable[(sample >> 7) & 0xff];
+  // `& 0xff` bounds the index to 0..255 and encodeTable has exactly 256 entries.
+  const exponent = encodeTable[(sample >> 7) & 0xff]!;
   const mantissa = (sample >> (exponent + 3)) & 0x0f;
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
@@ -60,7 +61,7 @@ export function pcmToMulaw(pcm: Buffer): Buffer {
 export function mulawToPcm(mulaw: Buffer): Buffer {
   const output = Buffer.alloc(mulaw.length * 2);
   for (let i = 0; i < mulaw.length; i++) {
-    output.writeInt16LE(decodeMulawSample(mulaw[i]), i * 2);
+    output.writeInt16LE(decodeMulawSample(mulaw[i]!), i * 2);
   }
   return output;
 }

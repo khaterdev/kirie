@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { SecurityGate, type ChannelSecurityRestrictions } from "./gate.js";
 import { IdentityResolver } from "./auth.js";
 import { AuthorizationEngine } from "./authz.js";

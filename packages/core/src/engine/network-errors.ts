@@ -35,7 +35,7 @@ export function isTransientNetworkError(err: unknown): boolean {
   if (code && TRANSIENT_ERROR_CODES.has(code)) return true;
 
   // Check HTTP status code properties (used by fetch wrappers, Signal REST API, etc.)
-  const errAny = err as Record<string, unknown>;
+  const errAny = err as unknown as Record<string, unknown>;
   const status = errAny.status ?? errAny.statusCode;
   if (typeof status === "number" && TRANSIENT_HTTP_STATUS_CODES.has(status)) return true;
   // Some libraries store numeric status as error.code (not a string POSIX code)

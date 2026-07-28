@@ -4,7 +4,7 @@ import { join } from "node:path";
 import * as p from "@clack/prompts";
 import { stringify as stringifyYaml } from "yaml";
 import { CredentialStore, ConfigBackup, KIRIE_DIR } from "@kirie/core";
-import { deepMerge, mergeEnvFile, mergeConfigYaml, writeConfigYaml } from "./setup-utils.js";
+import { mergeEnvFile, mergeConfigYaml, writeConfigYaml } from "./setup-utils.js";
 
 function isCancelled(value: unknown): value is symbol {
   return p.isCancel(value);
@@ -562,7 +562,7 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
           ],
         });
         if (!p.isCancel(fallback) && fallback !== "local") {
-          embeddingProvider = fallback as string;
+          embeddingProvider = fallback as "local" | "openai" | "noop";
           if (fallback === "openai") {
             const key = await p.text({ message: "OpenAI API key for embeddings", placeholder: "sk-..." });
             if (!p.isCancel(key)) embeddingApiKey = key as string;

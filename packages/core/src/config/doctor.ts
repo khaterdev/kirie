@@ -5,7 +5,6 @@ import { existsSync, statSync, chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { KirieConfigSchema } from "./schema.js";
-import type { KirieConfig } from "./schema.js";
 import { loadRawConfig } from "./loader.js";
 
 export interface DoctorCheck {

@@ -1,5 +1,5 @@
 import pino from "pino";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -666,6 +666,8 @@ export class MessagePipeline {
       text: opts.text,
       chatType: "dm",
       chatId: opts.chatId,
+      timestamp: Date.now(),
+      raw: null,
     };
 
     await this.handleMessage(syntheticMessage, adapter);

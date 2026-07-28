@@ -1,11 +1,7 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { homedir } from "node:os";
 import pino from "pino";
-import {
-  DEFAULT_SYSTEM_PROMPT,
-  type PromptConfig,
-} from "./prompt-builder.js";
+import { DEFAULT_SYSTEM_PROMPT } from "./prompt-builder.js";
 
 const log = pino({ name: "workspace-manager" });
 

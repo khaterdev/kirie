@@ -103,7 +103,7 @@ export function createBoltApp(config: SlackBoltConfig, listeners: MessageListene
 
   // Handle edited messages (message_changed subtype)
   app.message(async ({ message, client }) => {
-    const msg = message as Record<string, unknown>;
+    const msg = message as unknown as Record<string, unknown>;
     if (msg.subtype !== "message_changed") return;
 
     // Extract the edited message from the nested structure

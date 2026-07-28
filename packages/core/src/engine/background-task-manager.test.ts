@@ -250,7 +250,7 @@ describe("BackgroundTaskManager", () => {
       const calls = (mockQuery as ReturnType<typeof vi.fn>).mock.calls;
       const lastCall = calls[calls.length - 1];
       expect(lastCall).toBeDefined();
-      expect(lastCall[0].options.systemPrompt).toBe("You are a background task agent.");
+      expect(lastCall![0].options.systemPrompt).toBe("You are a background task agent.");
 
       await managerWithPrompt.shutdown();
     });
@@ -274,7 +274,7 @@ describe("BackgroundTaskManager", () => {
       const calls = (mockQuery as ReturnType<typeof vi.fn>).mock.calls;
       const lastCall = calls[calls.length - 1];
       expect(lastCall).toBeDefined();
-      expect(lastCall[0].options.maxTurns).toBe(150);
+      expect(lastCall![0].options.maxTurns).toBe(150);
 
       await managerWithTurns.shutdown();
     });
@@ -291,7 +291,7 @@ describe("BackgroundTaskManager", () => {
       const lastCall = calls[calls.length - 1];
       expect(lastCall).toBeDefined();
       // systemPrompt should be undefined (not set)
-      expect(lastCall[0].options.systemPrompt).toBeUndefined();
+      expect(lastCall![0].options.systemPrompt).toBeUndefined();
     });
   });
 });

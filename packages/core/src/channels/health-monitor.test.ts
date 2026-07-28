@@ -16,6 +16,10 @@ function createMockAdapter(
       deleteMessage: false,
       sendTyping: true,
       threads: false,
+      multipleImages: false,
+      reactions: false,
+      replyContext: false,
+      voiceMessages: false,
       maxTextLength: 4000,
     },
     async start() {},
@@ -136,6 +140,10 @@ describe("HealthMonitor", () => {
           deleteMessage: false,
           sendTyping: true,
           threads: false,
+          multipleImages: false,
+          reactions: false,
+          replyContext: false,
+          voiceMessages: false,
           maxTextLength: 4000,
         },
         async start() {},
@@ -167,11 +175,6 @@ describe("HealthMonitor", () => {
     it("skips channels already being checked", async () => {
       monitor = new HealthMonitor();
 
-      let resolveStatus: (() => void) | undefined;
-      const statusPromise = new Promise<void>((r) => {
-        resolveStatus = r;
-      });
-
       let callCount = 0;
       const slowAdapter: ChannelAdapter = {
         id: "slow-channel" as ChannelName,
@@ -182,6 +185,10 @@ describe("HealthMonitor", () => {
           deleteMessage: false,
           sendTyping: true,
           threads: false,
+          multipleImages: false,
+          reactions: false,
+          replyContext: false,
+          voiceMessages: false,
           maxTextLength: 4000,
         },
         async start() {},
@@ -221,7 +228,7 @@ describe("HealthMonitor", () => {
       await monitor.check();
 
       expect(listener).toHaveBeenCalledOnce();
-      const results = listener.mock.calls[0][0];
+      const results = listener.mock.calls[0]![0];
       expect(results.has("telegram")).toBe(true);
     });
 

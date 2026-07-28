@@ -255,7 +255,10 @@ describe("CachedEmbeddingProvider", () => {
   });
 
   it("batchEmbed caches individual results", async () => {
-    const provider = createMockProvider({ withBatch: true });
+    // batchEmbed is optional on EmbeddingProvider, so vi.spyOn resolves to
+    // `never` without narrowing. withBatch: true guarantees it is present.
+    const provider = createMockProvider({ withBatch: true }) as EmbeddingProvider &
+      Required<Pick<EmbeddingProvider, "batchEmbed">>;
     const batchSpy = vi.spyOn(provider, "batchEmbed");
 
     const cached = new CachedEmbeddingProvider({

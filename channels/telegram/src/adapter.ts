@@ -11,7 +11,8 @@
  */
 
 import { InputFile } from "grammy";
-import type { Bot, InputMediaPhoto } from "grammy";
+import type { Bot } from "grammy";
+import type { InputMediaPhoto } from "grammy/types";
 import type {
   ChannelAdapter,
   ChannelCapabilities,

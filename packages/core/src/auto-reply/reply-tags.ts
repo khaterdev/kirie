@@ -13,5 +13,5 @@ const TAG_PATTERN = /^@tag:(\S+)\s*(.*)/s;
 export function extractReplyTag(text: string): ReplyTag | null {
   const match = text.match(TAG_PATTERN);
   if (!match) return null;
-  return { tag: match[1], rest: match[2] };
+  return { tag: match[1] ?? "", rest: match[2] ?? "" };
 }

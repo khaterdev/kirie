@@ -22,7 +22,8 @@
     "yaml": "^2.0.0",
     "zod": "^4.3.6",
     "@kirie/memory": "workspace:*",
-    "@kirie/media": "workspace:*"
+    "@kirie/media": "workspace:*",
+    "@kirie/voice": "workspace:*"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.0.0"

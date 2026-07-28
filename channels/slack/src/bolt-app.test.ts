@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { UnifiedMessage, MessageListener } from "@kirie/core";
+import type { UnifiedMessage } from "@kirie/core";
 
 // Capture registered handlers
 const messageHandler = vi.fn();

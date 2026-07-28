@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { IS_WINDOWS, IS_MACOS, IS_LINUX, binExists, toDockerPath } from "./platform.js";
 
 describe("platform constants", () => {

@@ -1,4 +1,9 @@
 // @kirie/core - Engine, security, routing, config
+
+// Part of core's public surface: AgentEngineConfig.mcpServers is typed with it,
+// so consumers need it to build that value without depending on the SDK directly.
+export type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+
 export * from "./platform.js";
 export * from "./engine/agent-engine.js";
 export * from "./engine/session-store.js";

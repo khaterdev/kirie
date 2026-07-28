@@ -4,11 +4,10 @@ import {
   readdirSync,
   rmSync,
   cpSync,
-  readFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { parseSkillFile, scanSkillDirectory } from "./loader.js";
+import { scanSkillDirectory } from "./loader.js";
 import type { SkillSource } from "./types.js";
 
 /** Manages installed skills in the managed skills directory (~/.kirie/skills) */

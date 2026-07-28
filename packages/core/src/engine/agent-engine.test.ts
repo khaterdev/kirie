@@ -104,7 +104,7 @@ describe("AgentEngine", () => {
       expect(result.sessionId).toBe("sess-existing");
 
       // Should have been called with resume option
-      const callArgs = mockQuery.mock.calls[0][0];
+      const callArgs = mockQuery.mock.calls[0]![0];
       expect(callArgs.options.resume).toBe("sess-existing");
     });
 
@@ -146,7 +146,7 @@ describe("AgentEngine", () => {
         { name: "Alice", platformId: "user-123", role: "owner" },
       );
 
-      const callArgs = mockQuery.mock.calls[0][0];
+      const callArgs = mockQuery.mock.calls[0]![0];
       expect(callArgs.prompt).toContain("[Replying to Bob");
       expect(callArgs.prompt).toContain("What do you think about this?");
     });
@@ -159,7 +159,7 @@ describe("AgentEngine", () => {
         { name: "Alice", platformId: "user-123", role: "owner" },
       );
 
-      const callArgs = mockQuery.mock.calls[0][0];
+      const callArgs = mockQuery.mock.calls[0]![0];
       expect(callArgs.prompt).toContain("[Replying to message: msg-old-42]");
     });
 
@@ -179,7 +179,7 @@ describe("AgentEngine", () => {
         history,
       );
 
-      const callArgs = mockQuery.mock.calls[0][0];
+      const callArgs = mockQuery.mock.calls[0]![0];
       expect(callArgs.prompt).toContain("conversation_history");
       expect(callArgs.prompt).toContain("First message");
       expect(callArgs.prompt).toContain("First reply");
@@ -199,7 +199,7 @@ describe("AgentEngine", () => {
         { name: "Alice", platformId: "user-123", role: "owner" },
       );
 
-      const callArgs = mockQuery.mock.calls[0][0];
+      const callArgs = mockQuery.mock.calls[0]![0];
       expect(callArgs.options.mcpServers).toHaveProperty("server-a");
       expect(callArgs.options.mcpServers).toHaveProperty("server-b");
     });

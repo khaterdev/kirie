@@ -20,6 +20,10 @@ function createMockAdapter(id: string): ChannelAdapter {
       deleteMessage: false,
       sendTyping: true,
       threads: false,
+      multipleImages: false,
+      reactions: false,
+      replyContext: false,
+      voiceMessages: false,
       maxTextLength: 4000,
     },
     async start() {},
@@ -49,6 +53,7 @@ beforeEach(() => {
     sessionStore,
     onConfigReload: vi.fn(async () => {}),
     onShutdown: vi.fn(),
+    onRestart: vi.fn(),
   };
 });
 

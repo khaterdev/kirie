@@ -10,7 +10,9 @@ import {
   ChannelType,
   type Message,
   type MessageReaction,
+  type PartialMessageReaction,
   type User,
+  type PartialUser,
 } from "discord.js";
 import type {
   UnifiedMessage,
@@ -102,7 +104,7 @@ export function createBot(
   });
 
   // Handle incoming reactions (add)
-  client.on("messageReactionAdd", async (reaction: MessageReaction, user: User) => {
+  client.on("messageReactionAdd", async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     if (user.bot) return;
     // Fetch partial reaction data if needed
     if (reaction.partial) {
@@ -130,7 +132,7 @@ export function createBot(
   });
 
   // Handle incoming reactions (remove)
-  client.on("messageReactionRemove", async (reaction: MessageReaction, user: User) => {
+  client.on("messageReactionRemove", async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     if (user.bot) return;
     if (reaction.partial) {
       try { await reaction.fetch(); } catch { return; }

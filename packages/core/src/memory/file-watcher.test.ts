@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, writeFileSync, rmSync, unlinkSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { MemoryFileWatcher, type FileWatcherOptions } from "./file-watcher.js";
 
 // ---------------------------------------------------------------------------
