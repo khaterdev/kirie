@@ -12,8 +12,11 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "outDir": "dist",
-    "rootDir": "src",
+    // Every package builds with tsdown, never with tsc, so tsc is only ever a
+    // typechecker here. Keeping noEmit in the shared base makes it impossible
+    // for a stray `tsc` to drop .js/.d.ts next to sources, where TS/ESM's .js
+    // import extensions would let the bundler resolve them instead of the .ts.
+    "noEmit": true,
     "jsx": "react-jsx",
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": false,
@@ -21,5 +24,5 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "exclude": ["node_modules", "dist"]
+  "exclude": ["**/node_modules", "**/dist"]
 }
