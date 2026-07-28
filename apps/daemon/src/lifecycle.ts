@@ -23,6 +23,8 @@ import {
   createSdkMcpServerFromTools,
   type ScheduleFireEvent,
   type McpServerConfig,
+  type AgentExecutor,
+  V2SessionManager,
 } from "@kirie/core";
 import {
   BackgroundTaskStore,
@@ -68,6 +70,8 @@ interface DaemonState {
   proactive: ProactiveEngine | null;
   heartbeatLogStore: HeartbeatLogStore | null;
   kokoroProcess: ChildProcess | null;
+  /** Set only when sessionMode is "v2"; holds live sessions that must be closed on shutdown. */
+  v2Sessions: V2SessionManager | null;
 }
 
 let state: DaemonState | null = null;
@@ -474,8 +478,42 @@ export async function startDaemon(): Promise<void> {
     allowedTools,
     mcpServers,
   };
+  // The V1 engine is always constructed: background tasks and the proactive
+  // layer use it directly for one-shot work regardless of sessionMode.
   const agentEngine = new AgentEngine(agentConfig);
-  log.info({ model: config.agent.model, maxTurns: config.agent.maxTurns }, "agent engine created (V1 mode with MCP)");
+
+  // sessionMode selects what the message pipeline runs through. V1 is a fresh
+  // query() per message; V2 keeps one live session per conversation.
+  const sessionMode = config.agent.sessionMode;
+  const pipelineExecutor: AgentExecutor =
+    sessionMode === "v2"
+      ? new V2SessionManager(sessionStore, {
+          workspacePath: config.agent.workspace || dataDir,
+          model: config.agent.model,
+          prompt: agentConfig.prompt,
+          allowedTools,
+          mcpServers,
+          idleTimeoutMs: config.agent.sessionIdleTimeoutMs,
+          maxSessions: config.agent.maxSessions,
+        })
+      : agentEngine;
+
+  log.info(
+    {
+      model: config.agent.model,
+      maxTurns: config.agent.maxTurns,
+      sessionMode,
+      ...(sessionMode === "v2"
+        ? {
+            idleTimeoutMs: config.agent.sessionIdleTimeoutMs,
+            maxSessions: config.agent.maxSessions,
+          }
+        : {}),
+    },
+    sessionMode === "v2"
+      ? "agent engine created (V2 persistent sessions with MCP)"
+      : "agent engine created (V1 mode with MCP)",
+  );
 
   // 5. Security components
   const identityResolver = new IdentityResolver({
@@ -660,7 +698,7 @@ export async function startDaemon(): Promise<void> {
     channelRegistry,
     securityGate,
     sessionStore,
-    agentEngine,
+    agentEngine: pipelineExecutor,
     chatHistoryStore,
     backgroundTaskStore,
     autoReply,
@@ -1009,6 +1047,7 @@ export async function startDaemon(): Promise<void> {
     proactive,
     heartbeatLogStore,
     kokoroProcess,
+    v2Sessions: pipelineExecutor instanceof V2SessionManager ? pipelineExecutor : null,
   };
 
   // 14. Signal handlers (registered once to avoid stacking on restart)
@@ -1101,6 +1140,7 @@ export async function stopDaemon(): Promise<void> {
     proactive: proactiveEngine,
     heartbeatLogStore: hbLogStore,
     kokoroProcess: kokoroProc,
+    v2Sessions,
   } = state;
 
   // 0a. Kill Kokoro daemon process
@@ -1139,6 +1179,14 @@ export async function stopDaemon(): Promise<void> {
   // chat history before the SQLite stores are closed below.
   await pipeline.stop();
   log.info("message pipeline stopped");
+
+  // 3b. Close any live V2 sessions. Each one holds an SDK subprocess open, so
+  // skipping this would leak them past daemon shutdown. Runs after the pipeline
+  // stops so no in-flight turn is cut off mid-execution.
+  if (v2Sessions) {
+    await v2Sessions.shutdown();
+    log.info("V2 sessions closed");
+  }
 
   // 4. Stop gateway
   try {

@@ -141,6 +141,23 @@ export function localizeUtcTimestamp(utc: string, timezone?: string): string {
 }
 
 /**
+ * The contract the message pipeline depends on to run a message.
+ *
+ * AgentEngine (one-shot query per message) and V2SessionManager (one persistent
+ * session per session key) both satisfy this, so the pipeline can be pointed at
+ * either without knowing which execution strategy is in use.
+ */
+export interface AgentExecutor {
+  execute(
+    message: IncomingMessage,
+    sender: SenderIdentity,
+    sessionId?: string,
+    onQuery?: (q: Query) => void,
+    chatHistory?: ChatHistoryMessage[],
+  ): Promise<ExecutionResult>;
+}
+
+/**
  * AgentEngine wraps the Claude Agent SDK, providing a high-level
  * interface for executing messages through the AI agent.
  *
@@ -154,7 +171,7 @@ export function localizeUtcTimestamp(utc: string, timezone?: string): string {
  * - Iterating the async message stream to extract the final response
  * - Configuring MCP servers, allowed tools, and permission modes
  */
-export class AgentEngine {
+export class AgentEngine implements AgentExecutor {
   private readonly config: AgentEngineConfig;
 
   constructor(config: AgentEngineConfig) {
@@ -222,7 +239,7 @@ export class AgentEngine {
       settingSources: ["user", "project"],
     };
 
-    const userPrompt = this.wrapUserMessage(message, chatHistory, sessionKey);
+    const userPrompt = wrapUserMessage(message, chatHistory, sessionKey, this.config.prompt?.timezone);
 
     // Attempt to resume an existing session. If the session is stale or from
     // a different process (e.g., CLI resuming a daemon session), the SDK will
@@ -268,118 +285,6 @@ export class AgentEngine {
     throw lastErr;
   }
 
-  /**
-   * Wraps the raw user message text with XML context tags for the InputGuard.
-   * Prepends recent chat history when available so the agent has conversation
-   * context even when starting a fresh SDK session.
-   *
-   * @param sessionKey - Optional session key to include in the message context.
-   *   When provided, the agent can use it for background tasks, chat history, etc.
-   */
-  private wrapUserMessage(message: IncomingMessage, chatHistory?: ChatHistoryMessage[], sessionKey?: string): string {
-    const parts: string[] = [];
-
-    // Inject recent chat history so the agent knows what was discussed before
-    if (chatHistory && chatHistory.length > 0) {
-      const tz = this.config.prompt?.timezone;
-      const historyKey = sessionKey ?? `${message.channel}:${message.chatType}:${message.chatId}`;
-      parts.push(`<conversation_history session_key="${historyKey}">`);
-      parts.push(
-        `Recent messages from this conversation (oldest first). Timestamps are local time in ${tz || "UTC"}:`,
-      );
-      for (const entry of chatHistory) {
-        const ts = entry.timestamp ? `[${localizeUtcTimestamp(entry.timestamp, tz)}] ` : "";
-        if (entry.role === "user") {
-          const name = entry.senderName ?? "user";
-          parts.push(`${ts}${name}: ${entry.content}`);
-        } else {
-          parts.push(`${ts}assistant: ${entry.content}`);
-        }
-      }
-      parts.push("</conversation_history>");
-      parts.push("");
-    }
-
-    // Include session context so the agent knows its session key for background tasks, etc.
-    const effectiveSessionKey = sessionKey ?? `${message.channel}:${message.chatType}:${message.chatId}`;
-    parts.push(`<session_context session_key="${effectiveSessionKey}" channel="${message.channel}" chat_type="${message.chatType}" chat_id="${message.chatId}" />`);
-
-    const editAttr = message.isEdited ? ' edited="true"' : "";
-    parts.push(
-      `<user_message channel="${message.channel}" sender="${message.senderName}" sender_id="${message.senderId}" message_id="${message.id}"${editAttr}>`,
-    );
-
-    if (message.isEdited) {
-      parts.push("[This message was EDITED by the user. They changed what they originally wrote. Treat this as a correction/update to their previous message and respond to the updated content.]");
-      parts.push("");
-    }
-
-    parts.push(message.text);
-
-    // Include media attachment info so the agent knows about attached files
-    if (message.media && message.media.length > 0) {
-      parts.push("");
-      for (const m of message.media) {
-        const label = mediaTypeLabel(m.type);
-        if (m.type === "voice" || m.type === "audio") {
-          const transcriptNote = m.transcript
-            ? `\n[Transcription: "${m.transcript}"]`
-            : "\n(Audio file — transcription not available)";
-          parts.push(`[📎 ${label} attached: ${m.localPath}]${transcriptNote}`);
-        } else if (m.type === "document" && m.filename) {
-          parts.push(`[📎 ${label} attached: ${m.localPath} (${m.filename})]`);
-        } else if (m.caption) {
-          parts.push(`[📎 ${label} attached: ${m.localPath} — "${m.caption}"]`);
-        } else {
-          parts.push(`[📎 ${label} attached: ${m.localPath}]`);
-        }
-      }
-      parts.push("(Use the Read tool to view attached images)");
-    }
-
-    // Include reaction event context
-    if (message.reaction) {
-      parts.push("");
-      const actionVerb = message.reaction.action === "add" ? "reacted with" : "removed reaction";
-      const target = message.reaction.isTargetFromBot ? "YOUR (the assistant's) message" : "a message";
-      parts.push(`[${message.senderName} ${actionVerb} ${message.reaction.emoji} on ${target} (message_id: ${message.reaction.messageId})]`);
-      if (message.reaction.targetContent) {
-        const truncated = message.reaction.targetContent.length > 300
-          ? message.reaction.targetContent.slice(0, 300) + "..."
-          : message.reaction.targetContent;
-        parts.push(`[Reacted-to message content: "${truncated}"]`);
-      }
-      if (message.reaction.isTargetFromBot) {
-        parts.push("[The user reacted to something YOU said. Consider whether this warrants a response — e.g. they might be acknowledging, agreeing, disagreeing, or requesting follow-up based on the emoji used.]");
-      }
-    }
-
-    parts.push(`</user_message>`);
-
-    if (message.replyTo) {
-      const replyParts: string[] = [];
-      if (message.replyTo.senderName) {
-        replyParts.push(`Replying to ${message.replyTo.senderName}`);
-      } else if (message.replyTo.senderId) {
-        replyParts.push(`Replying to user ${message.replyTo.senderId}`);
-      } else {
-        replyParts.push(`Replying to message ${message.replyTo.messageId}`);
-      }
-
-      if (message.replyTo.text) {
-        const truncated = message.replyTo.text.length > 200
-          ? message.replyTo.text.slice(0, 200) + "..."
-          : message.replyTo.text;
-        replyParts.push(`"${truncated}"`);
-      }
-
-      parts.push(`\n[${replyParts.join(": ")}]`);
-    } else if (message.replyToId) {
-      parts.push(`\n[Replying to message: ${message.replyToId}]`);
-    }
-
-    return parts.join("\n");
-  }
 
   /**
    * Consumes the SDK message stream, collecting assistant text and
@@ -489,4 +394,123 @@ function mediaTypeLabel(type: MediaType): string {
     case "animation": return "Animation";
     default: return "File";
   }
+}
+
+
+/**
+ * Wraps the raw user message text with XML context tags for the InputGuard.
+ * Prepends recent chat history when available so the agent has conversation
+ * context even when starting a fresh SDK session.
+ *
+ * @param sessionKey - Optional session key to include in the message context.
+ *   When provided, the agent can use it for background tasks, chat history, etc.
+ */
+export function wrapUserMessage(
+  message: IncomingMessage,
+  chatHistory?: ChatHistoryMessage[],
+  sessionKey?: string,
+  timezone?: string,
+): string {
+  const parts: string[] = [];
+
+  // Inject recent chat history so the agent knows what was discussed before
+  if (chatHistory && chatHistory.length > 0) {
+    const tz = timezone;
+    const historyKey = sessionKey ?? `${message.channel}:${message.chatType}:${message.chatId}`;
+    parts.push(`<conversation_history session_key="${historyKey}">`);
+    parts.push(
+      `Recent messages from this conversation (oldest first). Timestamps are local time in ${tz || "UTC"}:`,
+    );
+    for (const entry of chatHistory) {
+      const ts = entry.timestamp ? `[${localizeUtcTimestamp(entry.timestamp, tz)}] ` : "";
+      if (entry.role === "user") {
+        const name = entry.senderName ?? "user";
+        parts.push(`${ts}${name}: ${entry.content}`);
+      } else {
+        parts.push(`${ts}assistant: ${entry.content}`);
+      }
+    }
+    parts.push("</conversation_history>");
+    parts.push("");
+  }
+
+  // Include session context so the agent knows its session key for background tasks, etc.
+  const effectiveSessionKey = sessionKey ?? `${message.channel}:${message.chatType}:${message.chatId}`;
+  parts.push(`<session_context session_key="${effectiveSessionKey}" channel="${message.channel}" chat_type="${message.chatType}" chat_id="${message.chatId}" />`);
+
+  const editAttr = message.isEdited ? ' edited="true"' : "";
+  parts.push(
+    `<user_message channel="${message.channel}" sender="${message.senderName}" sender_id="${message.senderId}" message_id="${message.id}"${editAttr}>`,
+  );
+
+  if (message.isEdited) {
+    parts.push("[This message was EDITED by the user. They changed what they originally wrote. Treat this as a correction/update to their previous message and respond to the updated content.]");
+    parts.push("");
+  }
+
+  parts.push(message.text);
+
+  // Include media attachment info so the agent knows about attached files
+  if (message.media && message.media.length > 0) {
+    parts.push("");
+    for (const m of message.media) {
+      const label = mediaTypeLabel(m.type);
+      if (m.type === "voice" || m.type === "audio") {
+        const transcriptNote = m.transcript
+          ? `\n[Transcription: "${m.transcript}"]`
+          : "\n(Audio file — transcription not available)";
+        parts.push(`[📎 ${label} attached: ${m.localPath}]${transcriptNote}`);
+      } else if (m.type === "document" && m.filename) {
+        parts.push(`[📎 ${label} attached: ${m.localPath} (${m.filename})]`);
+      } else if (m.caption) {
+        parts.push(`[📎 ${label} attached: ${m.localPath} — "${m.caption}"]`);
+      } else {
+        parts.push(`[📎 ${label} attached: ${m.localPath}]`);
+      }
+    }
+    parts.push("(Use the Read tool to view attached images)");
+  }
+
+  // Include reaction event context
+  if (message.reaction) {
+    parts.push("");
+    const actionVerb = message.reaction.action === "add" ? "reacted with" : "removed reaction";
+    const target = message.reaction.isTargetFromBot ? "YOUR (the assistant's) message" : "a message";
+    parts.push(`[${message.senderName} ${actionVerb} ${message.reaction.emoji} on ${target} (message_id: ${message.reaction.messageId})]`);
+    if (message.reaction.targetContent) {
+      const truncated = message.reaction.targetContent.length > 300
+        ? message.reaction.targetContent.slice(0, 300) + "..."
+        : message.reaction.targetContent;
+      parts.push(`[Reacted-to message content: "${truncated}"]`);
+    }
+    if (message.reaction.isTargetFromBot) {
+      parts.push("[The user reacted to something YOU said. Consider whether this warrants a response — e.g. they might be acknowledging, agreeing, disagreeing, or requesting follow-up based on the emoji used.]");
+    }
+  }
+
+  parts.push(`</user_message>`);
+
+  if (message.replyTo) {
+    const replyParts: string[] = [];
+    if (message.replyTo.senderName) {
+      replyParts.push(`Replying to ${message.replyTo.senderName}`);
+    } else if (message.replyTo.senderId) {
+      replyParts.push(`Replying to user ${message.replyTo.senderId}`);
+    } else {
+      replyParts.push(`Replying to message ${message.replyTo.messageId}`);
+    }
+
+    if (message.replyTo.text) {
+      const truncated = message.replyTo.text.length > 200
+        ? message.replyTo.text.slice(0, 200) + "..."
+        : message.replyTo.text;
+      replyParts.push(`"${truncated}"`);
+    }
+
+    parts.push(`\n[${replyParts.join(": ")}]`);
+  } else if (message.replyToId) {
+    parts.push(`\n[Replying to message: ${message.replyToId}]`);
+  }
+
+  return parts.join("\n");
 }

@@ -14,7 +14,7 @@ import { resolveRoute } from "./resolve-route.js";
 import { parseSessionKey } from "./session-key.js";
 import type { SessionStore } from "../engine/session-store.js";
 import { LaneQueue } from "../engine/lane-queue.js";
-import { AgentEngine, type IncomingMessage, type ExecutionResult, type ChatHistoryMessage } from "../engine/agent-engine.js";
+import type { AgentExecutor, IncomingMessage, ExecutionResult, ChatHistoryMessage } from "../engine/agent-engine.js";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { SenderIdentity } from "../engine/prompt-builder.js";
 import type { ResolvedIdentity } from "../security/auth.js";
@@ -38,7 +38,7 @@ export interface MessagePipelineConfig {
   /** The session store for mapping session keys to SDK session IDs */
   sessionStore: SessionStore;
   /** The agent engine for processing messages */
-  agentEngine: AgentEngine;
+  agentEngine: AgentExecutor;
   /** LaneQueue debounce in ms (default 1500) */
   debounceMs?: number;
   /** Optional chat history store for persisting messages */

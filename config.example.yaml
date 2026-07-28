@@ -4,6 +4,16 @@ agent:
   # customInstructions: "Always respond in English. My name is Alex."
   # workspace: "/path/to/your/projects"
 
+  # How messages are executed.
+  #   v1 (default) — one query() per message. The subprocess starts, answers,
+  #                  and exits, so every message pays full startup cost.
+  #   v2           — one persistent session per conversation, held open with
+  #                  streaming input. Skips per-message startup, but keeps
+  #                  subprocesses alive until idle timeout or eviction.
+  # sessionMode: "v1"
+  # sessionIdleTimeoutMs: 600000   # v2 only: close a session after 10 min idle
+  # maxSessions: 20                # v2 only: live sessions before evicting oldest idle
+
 security:
   owner:
     identities:

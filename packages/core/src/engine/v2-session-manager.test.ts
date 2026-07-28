@@ -4,33 +4,39 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionStore } from "./session-store.js";
 import { V2SessionManager } from "./v2-session-manager.js";
+import type { IncomingMessage } from "./agent-engine.js";
+import type { SenderIdentity } from "./prompt-builder.js";
 
-// Mock the claude-agent-sdk V2 functions
+/**
+ * Mock `query()` in streaming-input mode.
+ *
+ * The real SDK consumes the AsyncIterable prompt and emits an assistant
+ * message plus a result message per user message pushed into it. The mock
+ * mirrors that contract so the manager's stream consumer is exercised for
+ * real: it stays open across multiple sends and only ends when the input
+ * iterable is closed.
+ */
 vi.mock("@anthropic-ai/claude-agent-sdk", () => {
-  function createMockSession(sessionId: string) {
-    let streamResolve: (() => void) | null = null;
-    const messages: Array<{ type: string; [key: string]: unknown }> = [];
-    let closed = false;
+  let sessionCounter = 0;
 
-    return {
-      get sessionId() {
-        return sessionId;
-      },
-      async send(_message: string) {
-        // Simulate async send — push a result message to the stream
-        await new Promise<void>((resolve) => {
-          // Auto-resolve after a small delay to simulate response
-          setTimeout(() => {
-            messages.push({
+  return {
+    query: vi.fn(
+      ({ prompt, options }: { prompt: AsyncIterable<unknown>; options?: { resume?: string } }) => {
+        const sessionId = options?.resume ?? `mock-session-${++sessionCounter}`;
+
+        const stream = (async function* () {
+          // One request/response cycle per pushed user message. The loop ends
+          // when the manager closes the input queue, which is what shuts the
+          // "subprocess" down.
+          for await (const _userMessage of prompt) {
+            yield {
               type: "assistant",
-              message: {
-                content: [{ type: "text", text: "Mock response" }],
-              },
+              message: { content: [{ type: "text", text: "Mock response" }] },
               parent_tool_use_id: null,
               uuid: "mock-uuid",
               session_id: sessionId,
-            });
-            messages.push({
+            };
+            yield {
               type: "result",
               subtype: "success",
               result: "Mock response",
@@ -40,50 +46,38 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => {
               is_error: false,
               duration_ms: 100,
               duration_api_ms: 80,
+              stop_reason: null,
               usage: {},
               modelUsage: {},
               permission_denials: [],
               uuid: "mock-uuid",
-            });
-            resolve();
-            if (streamResolve) streamResolve();
-          }, 10);
+            };
+          }
+        })();
+
+        return Object.assign(stream, {
+          interrupt: vi.fn(async () => undefined),
+          setPermissionMode: vi.fn(async () => undefined),
         });
       },
-      async *stream() {
-        while (!closed) {
-          if (messages.length > 0) {
-            const msg = messages.shift()!;
-            yield msg;
-            if (msg.type === "result") return;
-          } else {
-            await new Promise<void>((resolve) => {
-              streamResolve = resolve;
-              // Timeout to prevent infinite hang
-              setTimeout(resolve, 100);
-            });
-          }
-        }
-      },
-      close() {
-        closed = true;
-        if (streamResolve) streamResolve();
-      },
-    };
-  }
-
-  let sessionCounter = 0;
-
-  return {
-    unstable_v2_createSession: vi.fn((_options) => {
-      sessionCounter++;
-      return createMockSession(`mock-session-${sessionCounter}`);
-    }),
-    unstable_v2_resumeSession: vi.fn((sessionId, _options) => {
-      return createMockSession(sessionId);
-    }),
+    ),
   };
 });
+
+/** Build the IncomingMessage shape the pipeline hands to an AgentExecutor. */
+function makeMessage(chatId: string, text: string): IncomingMessage {
+  return {
+    id: `msg-${Math.random().toString(36).slice(2)}`,
+    channel: chatId.split(":")[0] ?? "telegram",
+    senderName: "Tester",
+    senderId: "tester-1",
+    text,
+    chatType: "dm",
+    chatId: chatId.split(":").pop() ?? chatId,
+  };
+}
+
+const SENDER: SenderIdentity = { name: "Tester", platformId: "tester-1", role: "owner" };
 
 describe("V2SessionManager", () => {
   let sessionStore: SessionStore;
@@ -112,7 +106,7 @@ describe("V2SessionManager", () => {
 
   describe("execute", () => {
     it("creates a new session and returns a result", async () => {
-      const result = await manager.execute("telegram:dm:123", "Hello");
+      const result = await manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
       expect(result.response).toBe("Mock response");
       expect(result.sessionId).toBeTruthy();
       expect(result.costUsd).toBe(0.01);
@@ -120,23 +114,39 @@ describe("V2SessionManager", () => {
       expect(result.isError).toBe(false);
     });
 
-    it("reuses the same session for the same key", async () => {
-      const result1 = await manager.execute("telegram:dm:123", "First message");
+    it("keeps one session alive across multiple messages", async () => {
+      const result1 = await manager.execute(makeMessage("telegram:dm:123", "First message"), SENDER);
       expect(result1.response).toBe("Mock response");
 
-      // The mock session's stream ends after each result, so the session
-      // is cleaned up. A new session will be created for the second message.
-      // What matters is that both calls succeed for the same key.
-      const result2 = await manager.execute("telegram:dm:123", "Second message");
+      const result2 = await manager.execute(makeMessage("telegram:dm:123", "Second message"), SENDER);
       expect(result2.response).toBe("Mock response");
+
+      // The whole point of streaming-input mode: the same session serves both
+      // messages, so the SDK session ID is stable and only one session exists.
+      expect(result2.sessionId).toBe(result1.sessionId);
+      expect(manager.activeSessionCount).toBe(1);
+    });
+
+    it("persists the SDK session id to the session store", async () => {
+      const result = await manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
+      expect(sessionStore.get("telegram:dm:123")).toBe(result.sessionId);
     });
 
     it("creates different sessions for different keys", async () => {
-      const r1 = manager.execute("telegram:dm:123", "Hello");
-      const r2 = manager.execute("discord:dm:456", "World");
+      const r1 = manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
+      const r2 = manager.execute(makeMessage("discord:dm:456", "World"), SENDER);
       const [result1, result2] = await Promise.all([r1, r2]);
       expect(result1.response).toBeTruthy();
       expect(result2.response).toBeTruthy();
+      expect(result1.sessionId).not.toBe(result2.sessionId);
+    });
+
+    it("resumes the stored session id after the session is closed", async () => {
+      const first = await manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
+      manager.closeSession("telegram:dm:123");
+
+      const resumed = await manager.execute(makeMessage("telegram:dm:123", "Follow up"), SENDER);
+      expect(resumed.sessionId).toBe(first.sessionId);
     });
   });
 
@@ -144,13 +154,16 @@ describe("V2SessionManager", () => {
     it("returns false when no session exists", () => {
       expect(manager.hasSession("no:such:key")).toBe(false);
     });
+
+    it("returns true while a session is open", async () => {
+      await manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
+      expect(manager.hasSession("telegram:dm:123")).toBe(true);
+    });
   });
 
   describe("closeSession", () => {
     it("removes the session from active sessions", async () => {
-      await manager.execute("telegram:dm:123", "Hello");
-      // The mock session may auto-close after stream ends,
-      // but closeSession should be safe to call
+      await manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
       manager.closeSession("telegram:dm:123");
       expect(manager.hasSession("telegram:dm:123")).toBe(false);
     });
@@ -158,7 +171,7 @@ describe("V2SessionManager", () => {
 
   describe("shutdown", () => {
     it("closes all active sessions", async () => {
-      await manager.execute("telegram:dm:123", "Hello");
+      await manager.execute(makeMessage("telegram:dm:123", "Hello"), SENDER);
       await manager.shutdown();
       expect(manager.activeSessionCount).toBe(0);
     });

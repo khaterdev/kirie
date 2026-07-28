@@ -1,13 +1,28 @@
 import {
-  unstable_v2_createSession,
-  unstable_v2_resumeSession,
-  type SDKSession,
-  type SDKSessionOptions,
+  query,
+  type Query,
+  type Options,
+  type PermissionMode,
+  type SDKUserMessage,
   type SDKResultMessage,
+  type McpServerConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import pino from "pino";
 import type { SessionStore } from "./session-store.js";
-import type { ExecutionResult } from "./agent-engine.js";
+import {
+  wrapUserMessage,
+  type AgentExecutor,
+  type ExecutionResult,
+  type IncomingMessage,
+  type ChatHistoryMessage,
+} from "./agent-engine.js";
+import {
+  buildPrompt,
+  type ChannelContext,
+  type PromptConfig,
+  type SenderIdentity,
+} from "./prompt-builder.js";
+import { makeSessionKey } from "../routing/session-key.js";
 
 const log = pino({ name: "v2-session-manager" });
 
@@ -31,11 +46,74 @@ function createDeferred<T>(): Deferred<T> {
 }
 
 /**
- * Tracks an active V2 session and its background stream consumer.
+ * A push-driven async iterable of user messages.
+ *
+ * This is what keeps a session open. `query()` treats a string prompt as a
+ * one-shot request and tears the subprocess down once it completes, but an
+ * AsyncIterable prompt puts it in streaming-input mode: the subprocess stays
+ * alive waiting for the next message. Pushing here is how we "send".
+ */
+class UserMessageQueue implements AsyncIterable<SDKUserMessage> {
+  private readonly pending: SDKUserMessage[] = [];
+  private waiter: ((result: IteratorResult<SDKUserMessage>) => void) | null = null;
+  private closed = false;
+
+  push(text: string): void {
+    if (this.closed) throw new Error("cannot send on a closed session");
+
+    const message: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+    };
+
+    const waiter = this.waiter;
+    if (waiter) {
+      this.waiter = null;
+      waiter({ value: message, done: false });
+      return;
+    }
+    this.pending.push(message);
+  }
+
+  /** Ends the input stream, which lets the subprocess shut down cleanly. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+
+    const waiter = this.waiter;
+    if (waiter) {
+      this.waiter = null;
+      waiter({ value: undefined, done: true });
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    for (;;) {
+      const queued = this.pending.shift();
+      if (queued) {
+        yield queued;
+        continue;
+      }
+      if (this.closed) return;
+
+      const next = await new Promise<IteratorResult<SDKUserMessage>>((resolve) => {
+        this.waiter = resolve;
+      });
+      if (next.done) return;
+      yield next.value;
+    }
+  }
+}
+
+/**
+ * Tracks an active session and its background stream consumer.
  */
 interface ManagedSession {
-  session: SDKSession;
+  stream: Query;
+  input: UserMessageQueue;
   sessionKey: string;
+  sdkSessionId: string | null;
   streamConsumer: Promise<void>;
   pendingResult: Deferred<ExecutionResult> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
@@ -46,37 +124,60 @@ interface ManagedSession {
  * Configuration for the V2SessionManager.
  */
 export interface V2SessionManagerConfig {
-  /** Workspace path where CLAUDE.md and .claude/settings.json live */
+  /** Workspace path used as the subprocess cwd */
   workspacePath: string;
-  /** Model to use for V2 sessions */
+  /** Model to use for sessions */
   model: string;
+  /**
+   * Prompt configuration, used to build the per-session system prompt the same
+   * way AgentEngine does. Omit only in tests.
+   */
+  prompt?: PromptConfig;
   /** Permission mode for sessions */
-  permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk";
+  permissionMode?: PermissionMode;
   /** Tools to auto-allow without permission prompts */
   allowedTools?: string[];
   /** Tools to disallow entirely (removed from model context) */
   disallowedTools?: string[];
+  /** MCP servers to expose to the session */
+  mcpServers?: Record<string, McpServerConfig>;
+  /** Maximum agent turns per message */
+  maxTurns?: number;
   /** Idle timeout in ms before closing a session (default 10 minutes) */
   idleTimeoutMs?: number;
   /** Maximum concurrent sessions (default 20) */
   maxSessions?: number;
   /** Optional environment variables to pass to subprocesses */
-  env?: Record<string, string | undefined>;
+  env?: Record<string, string>;
 }
 
 /**
- * V2SessionManager manages persistent V2 SDK sessions.
+ * Per-session values derived from the first message on that session.
  *
- * Instead of V1's one-shot query() calls that die after each message,
- * V2 sessions persist across multiple messages via send()/stream().
- * A session stays alive and can be reused for follow-up messages
- * without recreating the subprocess.
- *
- * Each V2 subprocess spawns its own stdio MCP server process (configured
- * via .claude/settings.json in the workspace directory) to access Kirie's
- * tools. All MCP server processes share the same SQLite databases.
+ * A persistent session's system prompt and model are fixed when the subprocess
+ * starts, so they come from the message that opens the session rather than
+ * being rebuilt per message the way the one-shot path does it.
  */
-export class V2SessionManager {
+interface SessionBootstrap {
+  systemPrompt?: Options["systemPrompt"];
+  model?: string;
+  maxTurns?: number;
+}
+
+/**
+ * V2SessionManager manages persistent agent sessions.
+ *
+ * The default V1 path calls `query()` with a string prompt, which spawns a
+ * subprocess, answers one message, and exits — so every message pays full
+ * startup cost. This manager instead drives `query()` in streaming-input mode,
+ * keeping one subprocess alive per session key and pushing follow-up messages
+ * into it.
+ *
+ * Sessions are keyed by session key (e.g. "telegram:dm:123"), resumed from a
+ * persisted SDK session ID when possible, closed after an idle timeout, and
+ * evicted oldest-first once the concurrency cap is reached.
+ */
+export class V2SessionManager implements AgentExecutor {
   private readonly sessions = new Map<string, ManagedSession>();
   private readonly sessionStore: SessionStore;
   private readonly config: V2SessionManagerConfig;
@@ -95,19 +196,37 @@ export class V2SessionManager {
   }
 
   /**
-   * Execute a user message through a persistent V2 session.
+   * Execute a user message through a persistent session.
    *
    * Gets or creates a session for the given session key, sends the
    * message, and waits for the result from the background stream consumer.
    *
-   * If the result is an error (e.g. from a stale/V1 session ID that can't
-   * be resumed), automatically retries with a fresh session.
+   * If the result is an error (e.g. from a stale session ID that can't be
+   * resumed), automatically retries once with a fresh session.
    */
-  async execute(sessionKey: string, userMessage: string): Promise<ExecutionResult> {
-    const result = await this.sendAndWait(sessionKey, userMessage);
+  async execute(
+    message: IncomingMessage,
+    sender: SenderIdentity,
+    sessionId?: string,
+    onQuery?: (q: Query) => void,
+    chatHistory?: ChatHistoryMessage[],
+  ): Promise<ExecutionResult> {
+    const sessionKey = makeSessionKey({
+      channel: message.channel,
+      chatType: message.chatType,
+      chatId: message.chatId,
+    });
 
-    // If the result is an error, it may be from a stale session resume.
-    // Clear the session and retry once with a fresh session.
+    const bootstrap = this.buildBootstrap(message, sender);
+    const userPrompt = wrapUserMessage(
+      message,
+      chatHistory,
+      sessionKey,
+      this.config.prompt?.timezone,
+    );
+
+    const result = await this.sendAndWait(sessionKey, userPrompt, bootstrap, sessionId, onQuery);
+
     if (result.isError) {
       log.warn(
         { sessionKey, response: result.response.slice(0, 200) },
@@ -116,41 +235,73 @@ export class V2SessionManager {
       this.cleanupSession(sessionKey);
       this.sessionStore.delete(sessionKey);
 
-      const retryResult = await this.sendAndWait(sessionKey, userMessage);
-      return retryResult;
+      return this.sendAndWait(sessionKey, userPrompt, bootstrap, undefined, onQuery);
     }
 
     return result;
   }
 
   /**
+   * Build the values that are fixed for the lifetime of a session.
+   */
+  private buildBootstrap(message: IncomingMessage, sender: SenderIdentity): SessionBootstrap {
+    if (!this.config.prompt) {
+      return { model: this.config.model, maxTurns: this.config.maxTurns };
+    }
+
+    const channel: ChannelContext = {
+      channel: message.channel,
+      chatType: message.chatType,
+      chatId: message.chatId,
+      threadId: message.threadId,
+    };
+
+    const built = buildPrompt({ config: this.config.prompt, channel, sender });
+    return {
+      systemPrompt: built.systemPrompt,
+      model: built.model ?? this.config.model,
+      maxTurns: built.maxTurns ?? this.config.maxTurns,
+    };
+  }
+
+  /**
    * Send a message and wait for the result. Handles send failures by
    * recreating the session.
    */
-  private async sendAndWait(sessionKey: string, userMessage: string): Promise<ExecutionResult> {
-    const managed = await this.getOrCreate(sessionKey);
+  private async sendAndWait(
+    sessionKey: string,
+    userMessage: string,
+    bootstrap: SessionBootstrap,
+    resumeSessionId?: string,
+    onQuery?: (q: Query) => void,
+  ): Promise<ExecutionResult> {
+    const managed = this.getOrCreate(sessionKey, bootstrap, resumeSessionId);
     managed.lastActivity = Date.now();
     this.resetIdleTimer(managed);
 
-    // Create a deferred for this execution
+    // Expose the live Query so the pipeline can interrupt this turn
+    // (/stop, /stopall, or a newer message superseding this one).
+    onQuery?.(managed.stream);
+
     const deferred = createDeferred<ExecutionResult>();
     managed.pendingResult = deferred;
 
     try {
-      await managed.session.send(userMessage);
+      managed.input.push(userMessage);
     } catch (err) {
       managed.pendingResult = null;
-      // Session might be dead — try to recreate
+      // Session is dead (input stream already closed) — recreate it.
       log.warn({ sessionKey, err }, "send failed, recreating session");
       this.cleanupSession(sessionKey);
       this.sessionStore.delete(sessionKey);
 
-      const fresh = await this.createNewSession(sessionKey);
+      const fresh = this.createNewSession(sessionKey, bootstrap);
+      onQuery?.(fresh.stream);
       const freshDeferred = createDeferred<ExecutionResult>();
       fresh.pendingResult = freshDeferred;
 
       try {
-        await fresh.session.send(userMessage);
+        fresh.input.push(userMessage);
         return await freshDeferred.promise;
       } catch (retryErr) {
         fresh.pendingResult = null;
@@ -165,19 +316,21 @@ export class V2SessionManager {
   /**
    * Get an existing session or create a new one for the given session key.
    */
-  private async getOrCreate(sessionKey: string): Promise<ManagedSession> {
-    // Check in-memory map
+  private getOrCreate(
+    sessionKey: string,
+    bootstrap: SessionBootstrap,
+    resumeSessionId?: string,
+  ): ManagedSession {
     const existing = this.sessions.get(sessionKey);
     if (existing) {
       return existing;
     }
 
-    // Check session store for a saved session ID to resume
-    const savedSessionId = this.sessionStore.get(sessionKey);
+    // Resume the caller's session ID if given, else whatever we persisted
+    const savedSessionId = resumeSessionId ?? this.sessionStore.get(sessionKey);
     if (savedSessionId) {
       try {
-        const managed = this.resumeSession(sessionKey, savedSessionId);
-        return managed;
+        return this.startSession(sessionKey, savedSessionId, bootstrap);
       } catch (err) {
         log.warn({ sessionKey, savedSessionId, err }, "failed to resume session, creating new");
       }
@@ -188,28 +341,46 @@ export class V2SessionManager {
       this.evictOldestSession();
     }
 
-    return this.createNewSession(sessionKey);
+    return this.createNewSession(sessionKey, bootstrap);
   }
 
   /**
-   * Create a brand new V2 session.
+   * Create a brand new session.
    */
-  private createNewSession(sessionKey: string): ManagedSession {
-    const options = this.createSessionOptions();
+  private createNewSession(sessionKey: string, bootstrap: SessionBootstrap): ManagedSession {
+    log.info({ sessionKey }, "creating new session");
+    return this.startSession(sessionKey, null, bootstrap);
+  }
 
-    log.info({ sessionKey }, "creating new V2 session");
-    const session = unstable_v2_createSession(options);
+  /**
+   * Start a session, optionally resuming a previous SDK session by ID.
+   */
+  private startSession(
+    sessionKey: string,
+    resumeSessionId: string | null,
+    bootstrap: SessionBootstrap,
+  ): ManagedSession {
+    if (resumeSessionId) {
+      log.info({ sessionKey, sdkSessionId: resumeSessionId }, "resuming session");
+    }
+
+    const input = new UserMessageQueue();
+    const stream = query({
+      prompt: input,
+      options: this.createOptions(resumeSessionId, bootstrap),
+    });
 
     const managed: ManagedSession = {
-      session,
+      stream,
+      input,
       sessionKey,
+      sdkSessionId: resumeSessionId,
       streamConsumer: Promise.resolve(),
       pendingResult: null,
       idleTimer: null,
       lastActivity: Date.now(),
     };
 
-    // Start the background stream consumer
     managed.streamConsumer = this.startStreamConsumer(managed);
 
     this.sessions.set(sessionKey, managed);
@@ -217,77 +388,35 @@ export class V2SessionManager {
   }
 
   /**
-   * Resume an existing V2 session by SDK session ID.
-   */
-  private resumeSession(sessionKey: string, sdkSessionId: string): ManagedSession {
-    const options = this.createSessionOptions();
-
-    log.info({ sessionKey, sdkSessionId }, "resuming V2 session");
-    const session = unstable_v2_resumeSession(sdkSessionId, options);
-
-    const managed: ManagedSession = {
-      session,
-      sessionKey,
-      streamConsumer: Promise.resolve(),
-      pendingResult: null,
-      idleTimer: null,
-      lastActivity: Date.now(),
-    };
-
-    managed.streamConsumer = this.startStreamConsumer(managed);
-
-    this.sessions.set(sessionKey, managed);
-    return managed;
-  }
-
-  /**
-   * Build SDKSessionOptions for V2 sessions.
+   * Build Options for a session.
    *
-   * Note: V2 does NOT support mcpServers or systemPrompt directly.
-   * MCP servers are discovered from .claude/settings.json in the workspace.
-   * System prompt is read from CLAUDE.md in the workspace.
+   * Unlike the removed unstable_v2 API, mainline `query()` accepts mcpServers
+   * and systemPrompt directly, so there is no need to stage them through
+   * .claude/settings.json or CLAUDE.md in the workspace.
    */
-  private createSessionOptions(): SDKSessionOptions {
-    const permMode = this.config.permissionMode ?? "bypassPermissions";
-
-    const options: SDKSessionOptions = {
-      model: this.config.model,
-      permissionMode: permMode,
-      allowedTools: this.config.allowedTools,
-      disallowedTools: this.config.disallowedTools,
+  private createOptions(resumeSessionId: string | null, bootstrap: SessionBootstrap): Options {
+    const options: Options = {
+      model: bootstrap.model ?? this.config.model,
+      permissionMode: this.config.permissionMode ?? "bypassPermissions",
+      cwd: this.config.workspacePath,
+      // Matches the one-shot path: without this the SDK discovers no
+      // filesystem skills from ~/.claude/skills or {cwd}/.claude/skills.
+      settingSources: ["user", "project"],
     };
 
-    // V2 SDKSessionOptions doesn't declare some fields used by the underlying
-    // ProcessTransport. We cast to add them since ProcessTransport destructures
-    // them from the options object regardless of the TypeScript type.
-    const extOptions = options as SDKSessionOptions & {
-      allowDangerouslySkipPermissions?: boolean;
-      cwd?: string;
-    };
-
-    if (permMode === "bypassPermissions") {
-      extOptions.allowDangerouslySkipPermissions = true;
-    }
-
-    // Set the subprocess working directory to the workspace so Claude Code
-    // discovers .claude/settings.json and CLAUDE.md from there.
-    if (this.config.workspacePath) {
-      extOptions.cwd = this.config.workspacePath;
-    }
-
-    // Pass environment variables to the subprocess
-    if (this.config.env) {
-      options.env = {
-        ...process.env,
-        ...this.config.env,
-      };
-    }
+    if (this.config.allowedTools) options.allowedTools = this.config.allowedTools;
+    if (this.config.disallowedTools) options.disallowedTools = this.config.disallowedTools;
+    if (this.config.mcpServers) options.mcpServers = this.config.mcpServers;
+    if (bootstrap.systemPrompt) options.systemPrompt = bootstrap.systemPrompt;
+    if (bootstrap.maxTurns != null) options.maxTurns = bootstrap.maxTurns;
+    if (this.config.env) options.env = { ...process.env, ...this.config.env } as Record<string, string>;
+    if (resumeSessionId) options.resume = resumeSessionId;
 
     return options;
   }
 
   /**
-   * Background stream consumer that reads messages from the V2 session.
+   * Background stream consumer that reads messages from the session.
    * Runs for the lifetime of the session, resolving pending deferreds
    * when result messages arrive.
    */
@@ -295,72 +424,50 @@ export class V2SessionManager {
     const textParts: string[] = [];
 
     try {
-      for await (const msg of managed.session.stream()) {
+      for await (const msg of managed.stream) {
         switch (msg.type) {
           case "assistant": {
-            // Collect text from assistant message content blocks
             for (const block of msg.message.content) {
               if ("type" in block && block.type === "text" && "text" in block) {
                 textParts.push(block.text as string);
               }
             }
 
-            // Persist session ID
-            try {
-              const sessionId = managed.session.sessionId;
-              if (sessionId) {
-                this.sessionStore.set(managed.sessionKey, sessionId);
-              }
-            } catch {
-              // sessionId might not be available yet
+            if (msg.session_id) {
+              managed.sdkSessionId = msg.session_id;
+              this.sessionStore.set(managed.sessionKey, msg.session_id);
             }
             break;
           }
 
           case "result": {
             const resultMsg = msg as SDKResultMessage;
-            let response: string;
-            let costUsd = 0;
-            let numTurns = 0;
-            let isError = false;
-            let sessionId = "";
+            const sessionId = resultMsg.session_id;
 
-            if (resultMsg.subtype === "success") {
-              response = resultMsg.result;
-              costUsd = resultMsg.total_cost_usd;
-              numTurns = resultMsg.num_turns;
-              isError = resultMsg.is_error;
-              sessionId = resultMsg.session_id;
-            } else {
-              // Error result
-              const errResult = resultMsg as { errors: string[]; total_cost_usd: number; num_turns: number; is_error: boolean; session_id: string };
-              response = errResult.errors.length > 0
-                ? errResult.errors.join("\n")
-                : textParts.join("");
-              costUsd = errResult.total_cost_usd;
-              numTurns = errResult.num_turns;
-              isError = errResult.is_error;
-              sessionId = errResult.session_id;
-            }
+            const response =
+              resultMsg.subtype === "success"
+                ? resultMsg.result
+                : resultMsg.errors.length > 0
+                  ? resultMsg.errors.join("\n")
+                  : textParts.join("");
 
-            // Persist session ID
             if (sessionId) {
+              managed.sdkSessionId = sessionId;
               this.sessionStore.set(managed.sessionKey, sessionId);
             }
 
-            // Resolve the pending deferred
             if (managed.pendingResult) {
               managed.pendingResult.resolve({
                 response,
                 sessionId,
-                costUsd,
-                numTurns,
-                isError,
+                costUsd: resultMsg.total_cost_usd,
+                numTurns: resultMsg.num_turns,
+                isError: resultMsg.is_error,
               });
               managed.pendingResult = null;
             }
 
-            // Clear collected text for next message
+            // Clear collected text for the next message on this session
             textParts.length = 0;
             break;
           }
@@ -374,18 +481,16 @@ export class V2SessionManager {
     } catch (err) {
       log.error({ sessionKey: managed.sessionKey, err }, "stream consumer error");
 
-      // Reject any pending deferred
       if (managed.pendingResult) {
         managed.pendingResult.reject(err);
         managed.pendingResult = null;
       }
     } finally {
-      // Stream ended — session is dead
       log.info({ sessionKey: managed.sessionKey }, "stream consumer ended");
 
-      // If there's still a pending deferred, the stream ended without a result.
-      // This happens when the subprocess exits unexpectedly (e.g. startup failure,
-      // permission issues, missing executable). Reject so the caller doesn't hang.
+      // If a deferred is still pending, the stream ended without producing a
+      // result — the subprocess exited unexpectedly (startup failure, missing
+      // executable, permissions). Reject so the caller doesn't hang forever.
       if (managed.pendingResult) {
         managed.pendingResult.reject(
           new Error("Session stream ended without producing a result"),
@@ -437,11 +542,17 @@ export class V2SessionManager {
       managed.pendingResult = null;
     }
 
+    // Ending the input stream lets the subprocess exit on its own; interrupt()
+    // covers the case where it is mid-turn and would otherwise keep running.
     try {
-      managed.session.close();
+      managed.input.close();
     } catch (err) {
-      log.debug({ sessionKey, err }, "error closing session (may already be closed)");
+      log.debug({ sessionKey, err }, "error closing session input");
     }
+
+    void Promise.resolve(managed.stream.interrupt?.()).catch(() => {
+      // Session may already be gone, or the CLI may not support interrupt
+    });
 
     this.sessions.delete(sessionKey);
   }

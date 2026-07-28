@@ -18,6 +18,21 @@ export const AgentConfigSchema = z.object({
   workspace: z.string().optional(),
   /** Maximum turns for background task agents. Default 200. */
   backgroundTaskMaxTurns: z.number().int().min(1).default(200),
+  /**
+   * How messages are executed.
+   *
+   * - "v1": one query() per message. The subprocess starts, answers, and exits,
+   *   so every message pays full startup cost. Session continuity comes from
+   *   resuming a stored session ID.
+   * - "v2": one persistent session per conversation, held open with streaming
+   *   input. Avoids per-message startup, at the cost of long-lived subprocesses
+   *   (capped by sessionIdleTimeoutMs / maxSessions).
+   */
+  sessionMode: z.enum(["v1", "v2"]).default("v1"),
+  /** v2 only: close a session after this long with no activity. Default 10 min. */
+  sessionIdleTimeoutMs: z.number().int().min(10_000).default(600_000),
+  /** v2 only: maximum concurrent live sessions before evicting the oldest idle one. */
+  maxSessions: z.number().int().min(1).default(20),
 });
 
 // ── Security ─────────────────────────────────────────────────────────────────
