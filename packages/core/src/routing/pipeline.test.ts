@@ -171,6 +171,29 @@ describe("MessagePipeline", () => {
       // Should contain generic message
       expect(sendCall.text).toContain("internal error occurred");
     });
+
+    it("reports a usage limit as a usage limit rather than a context reset", async () => {
+      // Verbatim error that blocked four messages on 2026-07-29. It contains
+      // the word "session", which the old substring match mistook for a
+      // broken session and reported as "Context has been reset".
+      (mockEngine.execute as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error(
+          "Claude Code returned an error result: You've hit your session limit · resets 2:30am (Africa/Cairo)",
+        ),
+      );
+
+      pipeline.start();
+      mockAdapter.messageListeners[0]!(makeMessage());
+
+      await vi.waitFor(() => {
+        expect(mockAdapter.sendText).toHaveBeenCalled();
+      }, { timeout: 3000 });
+
+      const sendCall = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+      expect(sendCall.text).toContain("Usage limit reached");
+      expect(sendCall.text).toContain("2:30am (Africa/Cairo)");
+      expect(sendCall.text).not.toContain("Context has been reset");
+    });
   });
 
   describe("schedule-injected messages", () => {

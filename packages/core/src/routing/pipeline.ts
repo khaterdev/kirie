@@ -24,6 +24,7 @@ import type { AutoReplyEngine } from "../auto-reply/auto-reply.js";
 import type { UsageTracker } from "../logging/usage-tracker.js";
 import type { HeartbeatService } from "../engine/heartbeat.js";
 import { isTransientNetworkError } from "../engine/network-errors.js";
+import { classifyAgentError, agentErrorUserMessage } from "../engine/agent-errors.js";
 
 const log = pino({ name: "message-pipeline" });
 
@@ -551,14 +552,11 @@ export class MessagePipeline {
         log.warn({ messageId, response: result.response }, "agent returned error result");
       }
     } catch (err) {
-      log.error({ messageId, err }, "pipeline error");
-
       // Provide a more informative error message based on the failure type
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const isSessionError = errMsg.includes("session") || errMsg.includes("resume") || errMsg.includes("spawn");
-      const userMessage = isSessionError
-        ? "Failed to start AI session. Context has been reset — please try again."
-        : "Sorry, an internal error occurred. Please try again.";
+      const errorInfo = classifyAgentError(err);
+      const userMessage = agentErrorUserMessage(errorInfo);
+
+      log.error({ messageId, err, errorKind: errorInfo.kind }, "pipeline error");
 
       await this.sendErrorResponse(
         sourceAdapter,
