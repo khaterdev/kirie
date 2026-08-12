@@ -61,6 +61,16 @@ channels:
     apiUrl: "http://localhost:8080"
     # phoneNumber: "+1234567890"   # Registered Signal phone number
 
+  # Self-healing for channels that drop offline. Adapters make exactly one
+  # connection attempt, so without this a transient DNS failure at boot leaves
+  # a channel dead until someone restarts it by hand.
+  health:
+    enabled: true
+    # checkIntervalMs: 15000       # How often to poll channel status
+    # maxRecoveryAttempts: 0       # Restart attempts before giving up (0 = never give up)
+    # baseBackoffMs: 1000          # Delay before the first restart attempt
+    # maxBackoffMs: 60000          # Ceiling on the delay between attempts
+
 memory:
   enabled: true
   backend: "sqlite"

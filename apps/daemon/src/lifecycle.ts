@@ -25,6 +25,7 @@ import {
   type McpServerConfig,
   type AgentExecutor,
   V2SessionManager,
+  HealthMonitor,
 } from "@kirie/core";
 import {
   BackgroundTaskStore,
@@ -63,6 +64,8 @@ interface DaemonState {
   pipeline: MessagePipeline;
   gateway: GatewayServer;
   heartbeat: HeartbeatService;
+  /** Set only when channels.health.enabled; restarts channels stuck in `error`. */
+  healthMonitor: HealthMonitor | null;
   mcpShutdown: () => void;
   backgroundTaskManager: BackgroundTaskManager;
   backgroundTaskStore: BackgroundTaskStore;
@@ -717,6 +720,63 @@ export async function startDaemon(): Promise<void> {
   const running = channelRegistry.getRunning();
   log.info({ channels: running }, "channels started");
 
+  // 9a. Channel health monitor — self-healing for channels stuck in `error`.
+  // Adapters connect exactly once; without this a transient DNS failure at boot
+  // leaves a channel dead until someone restarts it by hand.
+  const healthConf = config.channels.health;
+  let healthMonitor: HealthMonitor | null = null;
+  if (healthConf.enabled) {
+    healthMonitor = new HealthMonitor({
+      checkIntervalMs: healthConf.checkIntervalMs,
+      maxRecoveryAttempts: healthConf.maxRecoveryAttempts,
+      recoveryBaseBackoffMs: healthConf.baseBackoffMs,
+      recoveryMaxBackoffMs: healthConf.maxBackoffMs,
+    });
+
+    for (const adapter of channelRegistry.getAll().values()) {
+      healthMonitor.addAdapter(adapter);
+    }
+
+    healthMonitor.setRecoveryHandler(async (id) => {
+      // Clear any half-started state first — registry.start() is a no-op while
+      // the registry still believes the channel is running.
+      if (channelRegistry.isRunning(id)) {
+        await channelRegistry.stop(id);
+      }
+      await channelRegistry.start(id);
+    });
+
+    healthMonitor.onRecovery((event) => {
+      if (event.ok) {
+        log.warn(
+          { channel: event.channelId, attempt: event.attempt },
+          "channel recovered by health monitor",
+        );
+      } else {
+        log.error(
+          {
+            channel: event.channelId,
+            attempt: event.attempt,
+            error: event.error,
+            nextAttemptInMs: Math.round(event.nextBackoffMs),
+            exhausted: event.exhausted,
+          },
+          event.exhausted
+            ? "channel recovery exhausted — giving up"
+            : "channel recovery attempt failed",
+        );
+      }
+    });
+
+    healthMonitor.start();
+    log.info(
+      { intervalMs: healthConf.checkIntervalMs, channels: channelRegistry.size },
+      "channel health monitor started",
+    );
+  } else {
+    log.warn("channel health monitor disabled — offline channels will not self-heal");
+  }
+
   // 10. HeartbeatService
   const heartbeat = new HeartbeatService({
     sessionStore,
@@ -1040,6 +1100,7 @@ export async function startDaemon(): Promise<void> {
     pipeline,
     gateway,
     heartbeat,
+    healthMonitor,
     mcpShutdown,
     backgroundTaskManager,
     backgroundTaskStore,
@@ -1135,7 +1196,7 @@ export async function stopDaemon(): Promise<void> {
 
   const {
     configWatcher, sessionStore, channelRegistry, rateLimiter,
-    pipeline, gateway, heartbeat, mcpShutdown,
+    pipeline, gateway, heartbeat, healthMonitor, mcpShutdown,
     backgroundTaskManager, backgroundTaskStore, usageTracker,
     proactive: proactiveEngine,
     heartbeatLogStore: hbLogStore,
@@ -1158,6 +1219,13 @@ export async function stopDaemon(): Promise<void> {
         }
       }
     }, 3000);
+  }
+
+  // 0b. Stop the health monitor first of all — it exists to restart channels,
+  // and everything below this line is tearing them down.
+  if (healthMonitor) {
+    healthMonitor.stop();
+    log.info("channel health monitor stopped");
   }
 
   // 0. Stop proactive engine (before heartbeat so it stops receiving ticks)

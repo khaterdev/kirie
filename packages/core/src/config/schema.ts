@@ -110,12 +110,32 @@ const SignalChannelSchema = z.object({
   ...ChannelSecurityFields,
 });
 
+/**
+ * Periodic health checking and self-healing for channel adapters.
+ *
+ * A channel whose initial connect fails (e.g. no DNS yet at boot) stays in
+ * `error` forever otherwise — adapters make exactly one connection attempt.
+ */
+const ChannelHealthSchema = z.object({
+  /** Poll channel status and restart channels stuck in `error` */
+  enabled: z.boolean().default(true),
+  /** How often to poll channel status (ms) */
+  checkIntervalMs: z.number().int().min(1_000).default(15_000),
+  /** Consecutive restart attempts before giving up on a channel (0 = never give up) */
+  maxRecoveryAttempts: z.number().int().min(0).default(0),
+  /** Delay before the first restart attempt (ms) */
+  baseBackoffMs: z.number().int().min(100).default(1_000),
+  /** Ceiling on the delay between restart attempts (ms) */
+  maxBackoffMs: z.number().int().min(1_000).default(60_000),
+}).default({});
+
 export const ChannelsConfigSchema = z.object({
   telegram: TelegramChannelSchema.default({}),
   discord: DiscordChannelSchema.default({}),
   slack: SlackChannelSchema.default({}),
   whatsapp: WhatsAppChannelSchema.default({}),
   signal: SignalChannelSchema.default({}),
+  health: ChannelHealthSchema,
 }).default({});
 
 // ── Memory ───────────────────────────────────────────────────────────────────

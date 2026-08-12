@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { HealthMonitor, CircuitBreaker, DEFAULT_CIRCUIT_CONFIG } from "./health-monitor.js";
+import { HealthMonitor, CircuitBreaker, DEFAULT_CIRCUIT_CONFIG, exponentialBackoffMs } from "./health-monitor.js";
+import { ChannelRegistry } from "./registry.js";
 import type { ChannelAdapter, ChannelStatus } from "./adapter.js";
 import type { ChannelName } from "./normalizer.js";
 
@@ -268,5 +269,389 @@ describe("HealthMonitor", () => {
       expect(snapshot.has("telegram" as ChannelName)).toBe(true);
       expect(snapshot.has("discord" as ChannelName)).toBe(true);
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Recovery
+  //
+  // Regression coverage for the 2026-08-11 incident: a transient DNS failure at
+  // boot failed Telegram's single `getMe` call, leaving the channel in `error`
+  // with failureCount 1 and no retry. It stayed offline for 13 hours.
+  // ---------------------------------------------------------------------------
+
+  describe("recovery", () => {
+    const TELEGRAM = "telegram" as ChannelName;
+
+    /** Immediate-ish backoff so tests don't wait on real delays. */
+    const FAST_RECOVERY = { recoveryBaseBackoffMs: 1, recoveryMaxBackoffMs: 1 };
+
+    /** Recovery is dispatched with `void`, so let its microtasks settle. */
+    async function flush(): Promise<void> {
+      for (let i = 0; i < 3; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+
+    it("restarts a channel stuck in error", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(
+        createMockAdapter("telegram", {
+          state: "error",
+          failureCount: 1,
+          lastError: "Network request for 'getMe' failed!",
+        }),
+      );
+
+      const recover = vi.fn(async (_id: ChannelName, _status: ChannelStatus) => {});
+      monitor.setRecoveryHandler(recover);
+
+      await monitor.check();
+      await flush();
+
+      expect(recover).toHaveBeenCalledOnce();
+      expect(recover.mock.calls[0]![0]).toBe(TELEGRAM);
+      expect(recover.mock.calls[0]![1]).toMatchObject({ state: "error" });
+    });
+
+    it("does nothing without a recovery handler", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+
+      await monitor.check();
+      await flush();
+
+      expect(monitor.getRecoveryState(TELEGRAM)!.attempts).toBe(0);
+    });
+
+    it("leaves a deliberately stopped channel alone", async () => {
+      // `disconnected` is what a manual POST /channels/:id/stop produces.
+      // Recovering it would fight the operator.
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "disconnected", failureCount: 0 }));
+
+      const recover = vi.fn(async () => {});
+      monitor.setRecoveryHandler(recover);
+
+      await monitor.check();
+      await flush();
+
+      expect(recover).not.toHaveBeenCalled();
+    });
+
+    it("leaves a healthy or in-progress channel alone", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "connected", failureCount: 0 }));
+      monitor.addAdapter(createMockAdapter("discord", { state: "connecting", failureCount: 0 }));
+      monitor.addAdapter(createMockAdapter("slack", { state: "reconnecting", failureCount: 1 }));
+
+      const recover = vi.fn(async () => {});
+      monitor.setRecoveryHandler(recover);
+
+      await monitor.check();
+      await flush();
+
+      expect(recover).not.toHaveBeenCalled();
+    });
+
+    it("waits out the backoff before retrying", async () => {
+      monitor = new HealthMonitor({
+        recoveryBaseBackoffMs: 60_000,
+        recoveryMaxBackoffMs: 60_000,
+      });
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+
+      const recover = vi.fn(async () => {});
+      monitor.setRecoveryHandler(recover);
+
+      await monitor.check();
+      await flush();
+      await monitor.check();
+      await flush();
+
+      expect(recover).toHaveBeenCalledOnce();
+      expect(monitor.getRecoveryState(TELEGRAM)!.nextAttemptAt).toBeGreaterThan(Date.now());
+    });
+
+    it("keeps retrying a channel that stays broken, backing off each time", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+
+      const recover = vi.fn(async () => {
+        throw new Error("still no DNS");
+      });
+      monitor.setRecoveryHandler(recover);
+
+      for (let i = 0; i < 3; i++) {
+        await monitor.check();
+        await flush();
+      }
+
+      expect(recover).toHaveBeenCalledTimes(3);
+      const st = monitor.getRecoveryState(TELEGRAM)!;
+      expect(st.attempts).toBe(3);
+      expect(st.lastError).toBe("still no DNS");
+      expect(st.exhausted).toBe(false);
+    });
+
+    it("resets the attempt counter once the channel is healthy again", async () => {
+      const status: { state: ChannelStatus["state"]; failureCount: number } = {
+        state: "error",
+        failureCount: 1,
+      };
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter({
+        ...createMockAdapter("telegram"),
+        getStatus: () => status as ChannelStatus,
+      });
+      monitor.setRecoveryHandler(async () => {});
+
+      await monitor.check();
+      await flush();
+      expect(monitor.getRecoveryState(TELEGRAM)!.attempts).toBe(1);
+
+      status.state = "connected";
+      status.failureCount = 0;
+      await monitor.check();
+      await flush();
+
+      const st = monitor.getRecoveryState(TELEGRAM)!;
+      expect(st.attempts).toBe(0);
+      expect(st.nextAttemptAt).toBe(0);
+    });
+
+    it("gives up after maxRecoveryAttempts and reports it", async () => {
+      monitor = new HealthMonitor({ ...FAST_RECOVERY, maxRecoveryAttempts: 2 });
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+
+      const recover = vi.fn(async () => {
+        throw new Error("nope");
+      });
+      monitor.setRecoveryHandler(recover);
+
+      const events: Array<{ attempt: number; exhausted: boolean }> = [];
+      monitor.onRecovery((e) => events.push({ attempt: e.attempt, exhausted: e.exhausted }));
+
+      for (let i = 0; i < 5; i++) {
+        await monitor.check();
+        await flush();
+      }
+
+      expect(recover).toHaveBeenCalledTimes(2);
+      expect(events).toEqual([
+        { attempt: 1, exhausted: false },
+        { attempt: 2, exhausted: true },
+      ]);
+      expect(monitor.getRecoveryState(TELEGRAM)!.exhausted).toBe(true);
+    });
+
+    it("never runs two attempts for the same channel at once", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+
+      let release!: () => void;
+      const started = vi.fn();
+      monitor.setRecoveryHandler(async () => {
+        started();
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      });
+
+      await monitor.check();
+      await flush();
+      await monitor.check();
+      await flush();
+
+      expect(started).toHaveBeenCalledOnce();
+      release();
+      await flush();
+    });
+
+    it("reports a successful recovery to listeners", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+      monitor.setRecoveryHandler(async () => {});
+
+      const listener = vi.fn();
+      monitor.onRecovery(listener);
+
+      await monitor.check();
+      await flush();
+
+      expect(listener).toHaveBeenCalledOnce();
+      expect(listener.mock.calls[0]![0]).toMatchObject({
+        channelId: TELEGRAM,
+        attempt: 1,
+        ok: true,
+      });
+    });
+
+    it("does not recover after stop() — shutdown must not resurrect channels", async () => {
+      monitor = new HealthMonitor(FAST_RECOVERY);
+      monitor.addAdapter(createMockAdapter("telegram", { state: "error", failureCount: 1 }));
+
+      const recover = vi.fn(async () => {});
+      monitor.setRecoveryHandler(recover);
+
+      // Dispatch a check, then stop before its recovery gets to run.
+      const checking = monitor.check();
+      monitor.stop();
+      await checking;
+      await flush();
+
+      expect(recover).not.toHaveBeenCalled();
+    });
+
+    it("recovers a channel whose getStatus() hangs", async () => {
+      monitor = new HealthMonitor({ ...FAST_RECOVERY, checkIntervalMs: 60_000 });
+      monitor.addAdapter({
+        ...createMockAdapter("telegram"),
+        getStatus: () => {
+          throw new Error("adapter wedged");
+        },
+      });
+
+      const recover = vi.fn(async () => {});
+      monitor.setRecoveryHandler(recover);
+
+      await monitor.check();
+      await flush();
+
+      expect(recover).toHaveBeenCalledOnce();
+    });
+  });
+});
+
+/**
+ * End-to-end reproduction of the 2026-08-11 outage against a real
+ * ChannelRegistry, wired the way the daemon wires it.
+ */
+describe("health monitor + registry recovery", () => {
+  const TELEGRAM = "telegram" as ChannelName;
+
+  /** Adapter that fails its first connect the way a cold-boot DNS miss does. */
+  function createFlakyAdapter(failuresBeforeSuccess: number): ChannelAdapter & { startCount: number } {
+    const base = createMockAdapter("telegram");
+    let state: ChannelStatus["state"] = "disconnected";
+    let failureCount = 0;
+
+    const adapter = {
+      ...base,
+      startCount: 0,
+      async start() {
+        adapter.startCount++;
+        if (adapter.startCount <= failuresBeforeSuccess) {
+          state = "error";
+          failureCount++;
+          throw new Error("Network request for 'getMe' failed!");
+        }
+        state = "connected";
+        failureCount = 0;
+      },
+      async stop() {
+        state = "disconnected";
+      },
+      getStatus: (): ChannelStatus => ({ state, failureCount }),
+    };
+    return adapter;
+  }
+
+  async function flush(): Promise<void> {
+    for (let i = 0; i < 3; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  it("brings back a channel whose initial connect failed", async () => {
+    const registry = new ChannelRegistry();
+    const adapter = createFlakyAdapter(1);
+    registry.register(adapter);
+
+    // Boot: startAll swallows the failure into the returned error map, exactly
+    // as the daemon does. Before this fix, that was the end of the story.
+    const errors = await registry.startAll();
+    expect(errors.has(TELEGRAM)).toBe(true);
+    expect(registry.isRunning(TELEGRAM)).toBe(false);
+    expect(adapter.getStatus().state).toBe("error");
+
+    const monitor = new HealthMonitor({ recoveryBaseBackoffMs: 1, recoveryMaxBackoffMs: 1 });
+    monitor.addAdapter(adapter);
+    monitor.setRecoveryHandler(async (id) => {
+      if (registry.isRunning(id)) await registry.stop(id);
+      await registry.start(id);
+    });
+
+    await monitor.check();
+    await flush();
+
+    expect(adapter.startCount).toBe(2);
+    expect(registry.isRunning(TELEGRAM)).toBe(true);
+    expect(adapter.getStatus().state).toBe("connected");
+    monitor.stop();
+  });
+
+  it("keeps trying across a prolonged outage, then settles", async () => {
+    const registry = new ChannelRegistry();
+    const adapter = createFlakyAdapter(4);
+    registry.register(adapter);
+    await registry.startAll();
+
+    const monitor = new HealthMonitor({ recoveryBaseBackoffMs: 1, recoveryMaxBackoffMs: 1 });
+    monitor.addAdapter(adapter);
+    monitor.setRecoveryHandler(async (id) => {
+      if (registry.isRunning(id)) await registry.stop(id);
+      await registry.start(id);
+    });
+
+    for (let i = 0; i < 6; i++) {
+      await monitor.check();
+      await flush();
+    }
+
+    expect(registry.isRunning(TELEGRAM)).toBe(true);
+    // Recovered on attempt 5, then stopped attempting once healthy.
+    expect(adapter.startCount).toBe(5);
+    expect(monitor.getRecoveryState(TELEGRAM)!.attempts).toBe(0);
+    monitor.stop();
+  });
+});
+
+describe("exponentialBackoffMs", () => {
+  it("doubles the ceiling with each attempt", () => {
+    const spy = vi.spyOn(Math, "random").mockReturnValue(0.999_999);
+    try {
+      expect(exponentialBackoffMs(0, 1000, 60_000)).toBeCloseTo(1000, -1);
+      expect(exponentialBackoffMs(1, 1000, 60_000)).toBeCloseTo(2000, -1);
+      expect(exponentialBackoffMs(2, 1000, 60_000)).toBeCloseTo(4000, -1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("caps at maxMs", () => {
+    const spy = vi.spyOn(Math, "random").mockReturnValue(0.999_999);
+    try {
+      expect(exponentialBackoffMs(30, 1000, 60_000)).toBeLessThanOrEqual(60_000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("treats negative attempts as attempt 0", () => {
+    const spy = vi.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      expect(exponentialBackoffMs(-5, 1000, 60_000)).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("applies full jitter so channels don't retry in lockstep", () => {
+    const spy = vi.spyOn(Math, "random").mockReturnValue(0.25);
+    try {
+      expect(exponentialBackoffMs(1, 1000, 60_000)).toBe(500);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
