@@ -82,9 +82,11 @@ YAML-driven extensible skills loaded at runtime:
 
 **Development** - GitHub (issues, PRs, actions), Coding agent (background sub-agents), Code analyzer, Skill creator
 
-**Media** - Spotify player, Sonos, Bluesound, GIF search (Giphy/Tenor), Image generation (DALL-E, Gemini), ElevenLabs TTS
+**Media** - Spotify player, Sonos, Bluesound, GIF search (Giphy/Tenor), Image generation (DALL-E, Gemini, optional Atlas provider), ElevenLabs TTS
 
 **Audio** - Whisper transcription (local + API), Sherpa ONNX TTS (offline), Voice calls
+
+Atlas image generation requires `ATLASCLOUD_API_KEY` and `provider: "atlas"` on the image tool. OpenAI remains the default provider.
 
 **Smart Home** - Philips Hue (OpenHue), System health checks
 

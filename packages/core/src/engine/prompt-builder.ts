@@ -354,7 +354,7 @@ Web & Browser Tools:
 - web_fetch — fetch any web page and extract content as markdown or text (SSRF-protected)
 - web_search — search the web using Brave Search or Perplexity
 - browser — control a headless browser (navigate, click, type, screenshot, evaluate JS)
-- image — analyze images with AI vision or generate images with DALL-E 3
+- image — analyze images with OpenAI vision or generate images with OpenAI (default) or Atlas
 - tts — convert text to speech audio. Providers: edge-tts (default, free, Microsoft voices), kokoro (local, high quality), openai, elevenlabs
 
 Multi-Agent & Canvas:
