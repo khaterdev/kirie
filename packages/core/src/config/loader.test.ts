@@ -61,7 +61,7 @@ describe("loadConfig", () => {
     const config = loadConfig({ configPath: missingPath });
     expect(config.agent.customInstructions).toBeUndefined();
     expect(config.agent.maxTurns).toBe(100);
-    expect(config.agent.model).toBe("claude-opus-4-8[1m]");
+    expect(config.agent.model).toBe("claude-opus-5-5[1m]");
     expect(existsSync(missingPath)).toBe(true);
   });
 

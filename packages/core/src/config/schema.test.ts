@@ -14,7 +14,7 @@ describe("AgentConfigSchema", () => {
     const result = AgentConfigSchema.parse({});
     expect(result.customInstructions).toBeUndefined();
     expect(result.maxTurns).toBe(100);
-    expect(result.model).toBe("claude-opus-4-8[1m]");
+    expect(result.model).toBe("claude-opus-5-5[1m]");
   });
 
   it("accepts valid custom values", () => {
