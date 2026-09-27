@@ -24,11 +24,12 @@ export const AgentConfigSchema = z.object({
    * - "v1": one query() per message. The subprocess starts, answers, and exits,
    *   so every message pays full startup cost. Session continuity comes from
    *   resuming a stored session ID.
-   * - "v2": one persistent session per conversation, held open with streaming
-   *   input. Avoids per-message startup, at the cost of long-lived subprocesses
-   *   (capped by sessionIdleTimeoutMs / maxSessions).
+   * - "v2" (default): one persistent session per conversation, held open with
+   *   streaming input. Avoids per-message startup and MCP reconnects, at the
+   *   cost of long-lived subprocesses (capped by sessionIdleTimeoutMs /
+   *   maxSessions).
    */
-  sessionMode: z.enum(["v1", "v2"]).default("v1"),
+  sessionMode: z.enum(["v1", "v2"]).default("v2"),
   /** v2 only: close a session after this long with no activity. Default 10 min. */
   sessionIdleTimeoutMs: z.number().int().min(10_000).default(600_000),
   /** v2 only: maximum concurrent live sessions before evicting the oldest idle one. */

@@ -118,6 +118,10 @@ interface ManagedSession {
   pendingResult: Deferred<ExecutionResult> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastActivity: number;
+  /** Assistant text collected so far for the in-flight turn. */
+  textParts: string[];
+  /** Set when the caller closed the session mid-turn via the onQuery handle. */
+  aborted: boolean;
 }
 
 /**
@@ -281,7 +285,7 @@ export class V2SessionManager implements AgentExecutor {
 
     // Expose the live Query so the pipeline can interrupt this turn
     // (/stop, /stopall, or a newer message superseding this one).
-    onQuery?.(managed.stream);
+    onQuery?.(this.abortHandle(managed));
 
     const deferred = createDeferred<ExecutionResult>();
     managed.pendingResult = deferred;
@@ -296,7 +300,7 @@ export class V2SessionManager implements AgentExecutor {
       this.sessionStore.delete(sessionKey);
 
       const fresh = this.createNewSession(sessionKey, bootstrap);
-      onQuery?.(fresh.stream);
+      onQuery?.(this.abortHandle(fresh));
       const freshDeferred = createDeferred<ExecutionResult>();
       fresh.pendingResult = freshDeferred;
 
@@ -311,6 +315,54 @@ export class V2SessionManager implements AgentExecutor {
     }
 
     return deferred.promise;
+  }
+
+  /**
+   * Wrap a session's Query so the pipeline's close() behaves like the one-shot
+   * path: the in-flight turn resolves with its partial text marked wasAborted
+   * instead of rejecting, and the SDK session ID stays persisted so the next
+   * message resumes the conversation in a fresh subprocess.
+   *
+   * The session is detached synchronously. The pipeline sends the superseding
+   * message right after close(), and without this it would be pushed into the
+   * dying subprocess still registered under the same key.
+   */
+  private abortHandle(managed: ManagedSession): Query {
+    const close = (): void => {
+      if (managed.aborted) return;
+      managed.aborted = true;
+
+      if (this.sessions.get(managed.sessionKey) === managed) {
+        this.sessions.delete(managed.sessionKey);
+      }
+      if (managed.idleTimer) {
+        clearTimeout(managed.idleTimer);
+        managed.idleTimer = null;
+      }
+
+      if (managed.pendingResult) {
+        managed.pendingResult.resolve({
+          response: managed.textParts.join(""),
+          sessionId: managed.sdkSessionId ?? "",
+          costUsd: 0,
+          numTurns: 0,
+          isError: false,
+          wasAborted: true,
+        });
+        managed.pendingResult = null;
+      }
+
+      managed.input.close();
+      managed.stream.close();
+    };
+
+    return new Proxy(managed.stream, {
+      get(target, prop) {
+        if (prop === "close") return close;
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
 
   /**
@@ -379,6 +431,8 @@ export class V2SessionManager implements AgentExecutor {
       pendingResult: null,
       idleTimer: null,
       lastActivity: Date.now(),
+      textParts: [],
+      aborted: false,
     };
 
     managed.streamConsumer = this.startStreamConsumer(managed);
@@ -421,7 +475,7 @@ export class V2SessionManager implements AgentExecutor {
    * when result messages arrive.
    */
   private async startStreamConsumer(managed: ManagedSession): Promise<void> {
-    const textParts: string[] = [];
+    const textParts = managed.textParts;
 
     try {
       for await (const msg of managed.stream) {
@@ -479,7 +533,9 @@ export class V2SessionManager implements AgentExecutor {
         }
       }
     } catch (err) {
-      log.error({ sessionKey: managed.sessionKey, err }, "stream consumer error");
+      if (!managed.aborted) {
+        log.error({ sessionKey: managed.sessionKey, err }, "stream consumer error");
+      }
 
       if (managed.pendingResult) {
         managed.pendingResult.reject(err);
@@ -498,7 +554,11 @@ export class V2SessionManager implements AgentExecutor {
         managed.pendingResult = null;
       }
 
-      this.sessions.delete(managed.sessionKey);
+      // An aborted session is detached before its stream ends, and a
+      // replacement may already be registered under the same key.
+      if (this.sessions.get(managed.sessionKey) === managed) {
+        this.sessions.delete(managed.sessionKey);
+      }
       if (managed.idleTimer) {
         clearTimeout(managed.idleTimer);
       }

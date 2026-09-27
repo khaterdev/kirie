@@ -28,7 +28,20 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => {
           // One request/response cycle per pushed user message. The loop ends
           // when the manager closes the input queue, which is what shuts the
           // "subprocess" down.
-          for await (const _userMessage of prompt) {
+          for await (const userMessage of prompt) {
+            // A "HANG" message emits partial text and never finishes its turn,
+            // standing in for a long-running turn the pipeline interrupts.
+            const content = (userMessage as { message: { content: string } }).message.content;
+            if (content.includes("HANG")) {
+              yield {
+                type: "assistant",
+                message: { content: [{ type: "text", text: "Partial" }] },
+                parent_tool_use_id: null,
+                uuid: "mock-uuid",
+                session_id: sessionId,
+              };
+              await new Promise(() => {});
+            }
             yield {
               type: "assistant",
               message: { content: [{ type: "text", text: "Mock response" }] },
@@ -57,6 +70,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => {
 
         return Object.assign(stream, {
           interrupt: vi.fn(async () => undefined),
+          close: vi.fn(),
           setPermissionMode: vi.fn(async () => undefined),
         });
       },
@@ -147,6 +161,33 @@ describe("V2SessionManager", () => {
 
       const resumed = await manager.execute(makeMessage("telegram:dm:123", "Follow up"), SENDER);
       expect(resumed.sessionId).toBe(first.sessionId);
+    });
+
+    it("resolves an interrupted turn as aborted and resumes on the next message", async () => {
+      let handle: { close(): void } | undefined;
+      const pending = manager.execute(
+        makeMessage("telegram:dm:123", "HANG"),
+        SENDER,
+        undefined,
+        (q) => { handle = q; },
+      );
+      await vi.waitFor(() => expect(sessionStore.get("telegram:dm:123")).toBeTruthy());
+      const sdkSessionId = sessionStore.get("telegram:dm:123");
+
+      // The pipeline closes the running query, then immediately sends the
+      // superseding message.
+      handle!.close();
+      expect(manager.hasSession("telegram:dm:123")).toBe(false);
+
+      const aborted = await pending;
+      expect(aborted.wasAborted).toBe(true);
+      expect(aborted.response).toBe("Partial");
+      expect(aborted.sessionId).toBe(sdkSessionId);
+
+      const next = await manager.execute(makeMessage("telegram:dm:123", "Follow up"), SENDER);
+      expect(next.response).toBe("Mock response");
+      expect(next.sessionId).toBe(sdkSessionId);
+      expect(manager.hasSession("telegram:dm:123")).toBe(true);
     });
   });
 
