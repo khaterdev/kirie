@@ -143,9 +143,23 @@ export class TaskHealthDetector implements SignalDetector {
 
 /**
  * Checks channel adapter connection status via the ChannelRegistry.
+ *
+ * A channel is only reported once it has been unhealthy for `graceMs`
+ * (proactive.channelDownGraceSeconds). The
+ * daemon's channel health monitor retries failed channels on its own, and the
+ * common failure (a cold-boot DNS race on Telegram's getMe) clears within
+ * ~30s, so reporting the first unhealthy tick just alerts about something that
+ * has already fixed itself by the time the notification lands.
  */
 export class ChannelHealthDetector implements SignalDetector {
   readonly name = "channel-health";
+  private readonly graceMs: number;
+  /** When each channel was first seen unhealthy in the current streak. */
+  private readonly unhealthySince = new Map<string, number>();
+
+  constructor(graceMs = 0) {
+    this.graceMs = graceMs;
+  }
 
   detect(context: DetectorContext): Signal[] {
     const signals: Signal[] = [];
@@ -153,6 +167,15 @@ export class ChannelHealthDetector implements SignalDetector {
 
     for (const [channelId, adapter] of adapters) {
       const status = adapter.getStatus();
+
+      if (status.state !== "error" && status.state !== "disconnected" && status.state !== "reconnecting") {
+        this.unhealthySince.delete(channelId);
+        continue;
+      }
+
+      const since = this.unhealthySince.get(channelId) ?? context.now;
+      this.unhealthySince.set(channelId, since);
+      if (context.now - since < this.graceMs) continue;
 
       if (status.state === "error") {
         signals.push({
@@ -165,7 +188,7 @@ export class ChannelHealthDetector implements SignalDetector {
           source: this.name,
           deduplicationKey: `channel-error:${channelId}`,
         });
-      } else if (status.state === "disconnected" || status.state === "reconnecting") {
+      } else {
         signals.push({
           id: createSignalId("channel-health"),
           type: "channel-degraded",
@@ -359,7 +382,7 @@ export class TimeAwarenessDetector implements SignalDetector {
 export function createDefaultDetectors(config: ProactiveConfig): SignalDetector[] {
   return [
     new TaskHealthDetector(),
-    new ChannelHealthDetector(),
+    new ChannelHealthDetector(config.channelDownGraceSeconds * 1000),
     new SystemHealthDetector(config.memoryThresholdMB),
     new TimeAwarenessDetector(config),
   ];

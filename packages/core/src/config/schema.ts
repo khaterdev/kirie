@@ -366,6 +366,12 @@ export const ProactiveConfigSchema = z.object({
   memoryThresholdMB: z.number().int().min(128).default(1024),
   /** Cooldown in minutes before re-notifying about the same signal type (0 = no cooldown) */
   notificationCooldownMinutes: z.number().min(0).default(60),
+  /**
+   * How long a channel must stay unhealthy before it raises a signal. The
+   * daemon retries failed channels itself, and boot-time failures usually clear
+   * within ~30s, so shorter outages are not worth alerting on.
+   */
+  channelDownGraceSeconds: z.number().min(0).default(60),
   /** Heartbeat logging configuration */
   heartbeatLogging: z.object({
     enabled: z.boolean().default(true),

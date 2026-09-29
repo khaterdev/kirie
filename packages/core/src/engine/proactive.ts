@@ -110,6 +110,8 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
 
   /** Whether a triage is currently in progress */
   private triageInProgress = false;
+  /** Tick number of the most recent heartbeat, reused when revalidating signals. */
+  private lastTickNumber = 0;
 
   /** Tier 2 interval in milliseconds */
   private readonly tier2IntervalMs: number;
@@ -174,16 +176,10 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
     if (!this.running) return;
 
     const now = event.timestamp;
+    this.lastTickNumber = event.tickNumber;
 
     // ── Tier 1: Run all signal detectors ──────────────────────
-    const context: DetectorContext = {
-      channelRegistry: this.channelRegistry,
-      sessionStore: this.sessionStore,
-      now,
-      tickNumber: event.tickNumber,
-      getRunningTasks: this.getRunningTasks,
-      getFailedDeliveryCount: this.getFailedDeliveryCount,
-    };
+    const context = this.buildDetectorContext(now, event.tickNumber);
 
     for (const detector of this.detectors) {
       try {
@@ -255,8 +251,24 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
       // Call the triage runner
       const result = await this.triageRunner.triage(signals);
 
+      // The LLM call can take minutes, so conditions it was asked about may
+      // have cleared by now. Acting on those sends alerts for problems that
+      // no longer exist.
+      const resolved = this.findResolvedSignals(signals);
+
       // Process decisions
       for (const decision of result.decisions) {
+        if (
+          decision.signalId &&
+          resolved.has(decision.signalId) &&
+          (decision.action === "notify-now" || decision.action === "escalate")
+        ) {
+          log.info(
+            { signalId: decision.signalId, action: decision.action },
+            "suppressed: signal condition resolved during triage",
+          );
+          continue;
+        }
         await this.processDecision(decision, signals);
       }
 
@@ -283,6 +295,57 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
     } finally {
       this.triageInProgress = false;
     }
+  }
+
+  private buildDetectorContext(now: number, tickNumber: number): DetectorContext {
+    return {
+      channelRegistry: this.channelRegistry,
+      sessionStore: this.sessionStore,
+      now,
+      tickNumber,
+      getRunningTasks: this.getRunningTasks,
+      getFailedDeliveryCount: this.getFailedDeliveryCount,
+    };
+  }
+
+  /**
+   * Re-run the detectors behind the given signals and return the IDs of those
+   * whose condition no longer holds.
+   *
+   * Only signals with a deduplicationKey are checked: that key identifies the
+   * underlying condition (e.g. `channel-error:telegram`), so its absence from a
+   * fresh detection means the condition cleared. Signals without one are
+   * treated as still active, and detectors that produced none are not re-run,
+   * which keeps stateful detectors like time awareness untouched.
+   */
+  private findResolvedSignals(signals: Signal[]): Set<string> {
+    const resolved = new Set<string>();
+    const keyed = signals.filter((s) => s.deduplicationKey);
+    if (keyed.length === 0) return resolved;
+
+    const sources = new Set(keyed.map((s) => s.source));
+    const context = this.buildDetectorContext(Date.now(), this.lastTickNumber);
+    const activeKeys = new Set<string>();
+
+    for (const detector of this.detectors) {
+      if (!sources.has(detector.name)) continue;
+      try {
+        for (const signal of detector.detect(context)) {
+          if (signal.deduplicationKey) activeKeys.add(signal.deduplicationKey);
+        }
+      } catch (err) {
+        // Can't confirm resolution, so leave this detector's signals active
+        log.error({ detector: detector.name, err }, "signal revalidation failed");
+        for (const signal of keyed) {
+          if (signal.source === detector.name) activeKeys.add(signal.deduplicationKey!);
+        }
+      }
+    }
+
+    for (const signal of keyed) {
+      if (!activeKeys.has(signal.deduplicationKey!)) resolved.add(signal.id);
+    }
+    return resolved;
   }
 
   /**

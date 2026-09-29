@@ -43,6 +43,7 @@ function createTestConfig(overrides?: Partial<ProactiveConfig>): ProactiveConfig
     // These carry schema defaults, so they are required on the parsed type.
     memoryThresholdMB: 1024,
     notificationCooldownMinutes: 60,
+    channelDownGraceSeconds: 0,
     heartbeatLogging: {
       enabled: true,
       levels: { tier1: "info", tier2: "info", tier3: "debug", heartbeat: "info" },
@@ -247,6 +248,36 @@ describe("Signal Detectors", () => {
 
     beforeEach(() => {
       detector = new ChannelHealthDetector();
+    });
+
+    it("waits out the grace period before reporting an unhealthy channel", () => {
+      const graced = new ChannelHealthDetector(60_000);
+      const adapter = createMockAdapter("telegram", "error", 2, "Network request for 'getMe' failed!");
+      const registry = createMockRegistry(new Map([["telegram", adapter]]));
+      const t0 = 1_000_000;
+
+      expect(graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 }))).toHaveLength(0);
+      expect(graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 + 59_000 }))).toHaveLength(0);
+
+      const signals = graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 + 60_000 }));
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.type).toBe("channel-down");
+    });
+
+    it("restarts the grace period once a channel recovers", () => {
+      const graced = new ChannelHealthDetector(60_000);
+      const adapter = createMockAdapter("telegram", "error", 2);
+      const registry = createMockRegistry(new Map([["telegram", adapter]]));
+      const getStatus = adapter.getStatus as Mock;
+      const t0 = 1_000_000;
+
+      graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 }));
+      getStatus.mockReturnValue({ state: "connected", failureCount: 0 });
+      graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 + 30_000 }));
+      getStatus.mockReturnValue({ state: "error", failureCount: 1 });
+
+      expect(graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 + 70_000 }))).toHaveLength(0);
+      expect(graced.detect(createDetectorContext({ channelRegistry: registry, now: t0 + 130_000 }))).toHaveLength(1);
     });
 
     it("should detect channels in error state", () => {
@@ -885,6 +916,57 @@ describe("ProactiveEngine", () => {
         process.env.ANTHROPIC_API_KEY = originalKey;
       }
     }
+  });
+
+  describe("signal revalidation after triage", () => {
+    /** Engine with telegram in error and a triage LLM that answers notify-now for every signal. */
+    function setup(recoverDuringTriage: boolean) {
+      const adapter = createMockAdapter("telegram", "error", 2, "Network request for 'getMe' failed!");
+      const registry = createMockRegistry(new Map([["telegram", adapter]]));
+      const engine = new ProactiveEngine(
+        createEngineDeps({ config: createTestConfig({ tier2IntervalMinutes: 999 }), channelRegistry: registry }),
+      );
+
+      (mockQueryFn as Mock).mockImplementation(({ prompt }: { prompt: string }) => {
+        const signalId = /channel-health-[\w-]+/.exec(prompt)?.[0];
+        if (recoverDuringTriage) {
+          (adapter.getStatus as Mock).mockReturnValue({ state: "connected", failureCount: 0 });
+        }
+        const text = JSON.stringify([{ action: "notify-now", signalId, message: "Telegram is down" }]);
+        return mockQueryStream(text)();
+      });
+
+      return { adapter, engine };
+    }
+
+    it("drops a notification when the condition cleared while triage ran", async () => {
+      const { adapter, engine } = setup(true);
+      const sent = vi.fn();
+      engine.on("notificationSent", sent);
+      engine.start();
+      const completed = vi.fn();
+      engine.on("triageCompleted", completed);
+      // The critical signal kicks off triage on its own
+      engine.onTick(createTickEvent({ tickNumber: 1, timestamp: Date.now() }));
+
+      await vi.waitFor(() => expect(completed).toHaveBeenCalled());
+      expect(completed.mock.calls[0]![0].decisions).toHaveLength(1);
+      expect(sent).not.toHaveBeenCalled();
+      expect(adapter.sendText).not.toHaveBeenCalled();
+    });
+
+    it("still notifies when the condition persists", async () => {
+      const { engine } = setup(false);
+      const sent = vi.fn();
+      engine.on("notificationSent", sent);
+      engine.start();
+      const completed = vi.fn();
+      engine.on("triageCompleted", completed);
+      engine.onTick(createTickEvent({ tickNumber: 1, timestamp: Date.now() }));
+
+      await vi.waitFor(() => expect(completed).toHaveBeenCalled());
+      expect(sent).toHaveBeenCalledOnce();
+    });
   });
 
   it("should expose accessors for engine state", () => {
