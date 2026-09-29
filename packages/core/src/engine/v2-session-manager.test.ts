@@ -42,6 +42,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => {
               };
               await new Promise(() => {});
             }
+            // A "SLOW" message finishes its turn after 150ms, standing in for
+            // long tool use that outlasts the idle timeout.
+            if (content.includes("SLOW")) {
+              await new Promise((resolve) => setTimeout(resolve, 150));
+            }
             yield {
               type: "assistant",
               message: { content: [{ type: "text", text: "Mock response" }] },
@@ -188,6 +193,23 @@ describe("V2SessionManager", () => {
       expect(next.response).toBe("Mock response");
       expect(next.sessionId).toBe(sdkSessionId);
       expect(manager.hasSession("telegram:dm:123")).toBe(true);
+    });
+    it("does not close a session for idleness while a turn is in flight", async () => {
+      const shortIdle = new V2SessionManager(sessionStore, {
+        workspacePath: tempDir,
+        model: "claude-sonnet-4-20250514",
+        idleTimeoutMs: 50,
+      });
+      try {
+        const result = await shortIdle.execute(makeMessage("telegram:dm:789", "SLOW"), SENDER);
+        expect(result.response).toBe("Mock response");
+        expect(shortIdle.hasSession("telegram:dm:789")).toBe(true);
+
+        // Once the turn is over, the idle timer does close it.
+        await vi.waitFor(() => expect(shortIdle.hasSession("telegram:dm:789")).toBe(false));
+      } finally {
+        await shortIdle.shutdown();
+      }
     });
   });
 

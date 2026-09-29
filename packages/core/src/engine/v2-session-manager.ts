@@ -523,6 +523,10 @@ export class V2SessionManager implements AgentExecutor {
 
             // Clear collected text for the next message on this session
             textParts.length = 0;
+
+            // Idle time counts from the end of the turn, not from the send
+            managed.lastActivity = Date.now();
+            if (!managed.aborted) this.resetIdleTimer(managed);
             break;
           }
 
@@ -574,6 +578,14 @@ export class V2SessionManager implements AgentExecutor {
     }
 
     managed.idleTimer = setTimeout(() => {
+      // A long turn (e.g. slow tool use) is not idleness. Closing here would
+      // reject the in-flight turn with "Session closed"; wait for it instead.
+      if (managed.pendingResult) {
+        this.resetIdleTimer(managed);
+        return;
+      }
+      if (this.sessions.get(managed.sessionKey) !== managed) return;
+
       log.info({ sessionKey: managed.sessionKey }, "closing idle session");
       this.closeSession(managed.sessionKey);
     }, this.idleTimeoutMs);
