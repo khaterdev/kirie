@@ -69,6 +69,8 @@ export {
 } from "./routing/session-key.js";
 export * from "./gateway/server.js";
 export * from "./gateway/routes.js";
+export * from "./gateway/internal-api.js";
+export * from "./ingress/index.js";
 export * from "./mcp/server.js";
 export { MemoryStore, type MemoryManagerLike } from "./mcp/tools/memory.js";
 export * from "./auto-reply/auto-reply.js";

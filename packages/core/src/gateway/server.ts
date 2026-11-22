@@ -5,6 +5,7 @@ import { serve } from "@hono/node-server";
 import type { GatewayConfig } from "../config/schema.js";
 import { createRoutes, type GatewayDeps } from "./routes.js";
 import { createModuleLogger } from "../logging/logger.js";
+import type { InternalApi } from "./internal-api.js";
 
 const log = createModuleLogger("gateway");
 
@@ -16,6 +17,23 @@ export interface GatewayServerOptions {
   config: GatewayConfig;
   /** Dependencies for route handlers */
   deps: GatewayDeps;
+  /** Feature routes, mounted at /api/<name> (PLAN B.9). The registry is sealed here. */
+  internalApi?: InternalApi;
+}
+
+/**
+ * Host header values the loopback control plane accepts: the loopback names
+ * with the listening port, plus `gateway.extraAllowedHosts`. Compared
+ * case-insensitively. This blocks DNS rebinding: a page on a foreign name that
+ * resolves to 127.0.0.1 still sends its own name in Host.
+ */
+export function gatewayAllowedHosts(port: number, extra: readonly string[] = []): Set<string> {
+  const hosts = new Set<string>([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
+  for (const h of extra) {
+    const v = h.trim().toLowerCase();
+    if (v) hosts.add(v);
+  }
+  return hosts;
 }
 
 /**
@@ -31,6 +49,8 @@ export class GatewayServer {
   private readonly app: Hono;
   private readonly config: GatewayConfig;
   private server: Server | null = null;
+  /** The port actually bound (differs from config.port when that is 0). */
+  private boundPort: number | null = null;
 
   constructor(options: GatewayServerOptions) {
     this.config = options.config;
@@ -39,6 +59,21 @@ export class GatewayServer {
 
     // Build the top-level app with optional auth middleware
     this.app = new Hono();
+
+    // Host allowlist (DNS rebinding) on the loopback control plane. Runs first.
+    // No token is required, so local callers and the stdio MCP subprocess,
+    // which use http://127.0.0.1:<port>, keep working.
+    if (this.config.bind === "loopback") {
+      this.app.use("*", async (c, next) => {
+        const host = (c.req.header("host") ?? "").trim().toLowerCase();
+        const allowed = gatewayAllowedHosts(this.boundPort ?? this.config.port, this.config.extraAllowedHosts ?? []);
+        if (!host || !allowed.has(host)) {
+          log.warn({ host: host.slice(0, 100), path: c.req.path }, "gateway request refused: Host not allowed");
+          return c.json({ status: "error", message: "Host not allowed" }, 403);
+        }
+        await next();
+      });
+    }
 
     // Apply bearer auth when a token is configured
     if (this.config.bearerToken) {
@@ -65,6 +100,14 @@ export class GatewayServer {
       }
       await next();
     });
+
+    // Feature routes first, so /api/<name> resolves to the feature's app.
+    if (options.internalApi) {
+      for (const { name, app } of options.internalApi.apps()) {
+        this.app.route(`/api/${name}`, app);
+      }
+      options.internalApi.seal();
+    }
 
     // Mount all routes
     this.app.route("/", routes);
@@ -103,6 +146,7 @@ export class GatewayServer {
         this.server.once("listening", () => {
           const addr = this.server?.address();
           const port = typeof addr === "object" && addr ? addr.port : this.config.port;
+          this.boundPort = port;
           resolve(port);
         });
 
@@ -125,6 +169,7 @@ export class GatewayServer {
     return new Promise<void>((resolve, reject) => {
       this.server!.close((err) => {
         this.server = null;
+        this.boundPort = null;
         if (err) {
           reject(err);
         } else {
