@@ -1366,8 +1366,11 @@ function registerChannelAdapters(registry: ChannelRegistry, config: KirieConfig)
   const ch = config.channels;
 
   if (ch.telegram?.enabled && ch.telegram.token) {
-    log.info("registering Telegram adapter");
-    registry.register(new TelegramAdapter({ token: ch.telegram.token }));
+    log.info({ apiRoot: ch.telegram.apiRoot ?? "cloud" }, "registering Telegram adapter");
+    registry.register(new TelegramAdapter({
+      token: ch.telegram.token,
+      ...(ch.telegram.apiRoot ? { apiRoot: ch.telegram.apiRoot } : {}),
+    }));
   }
 
   if (ch.discord?.enabled && ch.discord.token) {
