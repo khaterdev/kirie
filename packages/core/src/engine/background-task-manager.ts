@@ -176,12 +176,22 @@ interface RunningTask {
   ctx: SdkCallContext;
   controller: TaskTurnController | undefined;
   profile: TaskProfile | undefined;
-  /** uuid of the user message whose turn is in flight. */
-  currentUuid: string | undefined;
+  /** uuids of pushed user messages that no result has answered yet, oldest first. */
+  pendingTurns: Set<string>;
+  /** Messages about to be pushed (after an interrupt) that already count as pending. */
+  reservedTurns: number;
   /** Subagents started and not yet stopped (SubagentStart/SubagentStop hooks). */
   activeSubagents: number;
-  /** Set once the task's outcome is decided; the stream is then wound down. */
+  /** Set once the task's outcome is decided or it was cancelled; the stream is then wound down. */
   finished: boolean;
+  /** Serialises final-turn handling between the read loop and the subagent safety timer. */
+  finalChain: Promise<unknown>;
+}
+
+/** A result that ended a turn, with the user-message uuids it answered. */
+interface SettledTurn {
+  turn: TaskTurnResult;
+  answered: readonly string[] | null;
 }
 
 /**
@@ -194,7 +204,8 @@ interface RunningTask {
  *
  * A task's input stream is ended as soon as its outcome is decided, so its
  * subprocess exits instead of idling until shutdown. A result that arrives
- * while a subagent is still running is treated as intermediate.
+ * while a subagent is still running, or while a message sent to the task is
+ * still unanswered, does not decide the outcome.
  *
  * This decouples the MCP server (which writes tasks to the DB)
  * from the daemon (which executes them).
@@ -287,6 +298,7 @@ export class BackgroundTaskManager {
         switch (cmd.action) {
           case "kill": {
             log.info({ taskId: cmd.task_id }, "killing task via command");
+            running.finished = true;
             if (running.query) {
               running.query.close();
             }
@@ -300,9 +312,13 @@ export class BackgroundTaskManager {
               const text = cmd.data;
               if (cmd.interrupt && running.query) {
                 log.info({ taskId: cmd.task_id }, "interrupting task and sending message");
+                // Count the message as pending now, so the result of the
+                // interrupted turn does not finish the task before it is sent.
+                running.reservedTurns += 1;
                 running.query.interrupt().then(() => {
-                  this.pushTurn(running, text);
+                  this.pushTurn(running, text, true);
                 }).catch((err) => {
+                  running.reservedTurns = Math.max(0, running.reservedTurns - 1);
                   log.error({ taskId: cmd.task_id, err }, "error interrupting task");
                 });
               } else {
@@ -388,9 +404,11 @@ export class BackgroundTaskManager {
       ctx: this.buildContext(task, profile),
       controller,
       profile,
-      currentUuid: undefined,
+      pendingTurns: new Set<string>(),
+      reservedTurns: 0,
       activeSubagents: 0,
       finished: false,
+      finalChain: Promise.resolve(),
     };
 
     // Registered before executeTask runs so its finally block always finds it.
@@ -399,9 +417,14 @@ export class BackgroundTaskManager {
   }
 
   /** Queue a user message for a task and emit turn_start for it. */
-  private pushTurn(running: RunningTask, text: string): void {
+  private pushTurn(running: RunningTask, text: string, reserved = false): void {
+    if (reserved) running.reservedTurns = Math.max(0, running.reservedTurns - 1);
+    if (running.finished) {
+      log.warn({ taskId: running.taskId }, "message for a finished task dropped");
+      return;
+    }
     const message = this.createUserMessage(text);
-    running.currentUuid = message.uuid;
+    if (message.uuid) running.pendingTurns.add(message.uuid);
     running.messageQueue.push(message);
     this.config.sdkOptions?.observe({
       type: "turn_start",
@@ -411,16 +434,47 @@ export class BackgroundTaskManager {
     });
   }
 
-  private endTurn(running: RunningTask, sdkSessionId: string | undefined, result: SdkTurnEndResult): void {
+  /**
+   * Mark the user messages a result answered (its `user_message_uuids`, or
+   * the oldest pending one when the result names none) and emit turn_end.
+   * Returns true when no sent message is still waiting for an answer.
+   */
+  private settleTurn(running: RunningTask, settled: SettledTurn, sdkSessionId: string | undefined): boolean {
+    let uuid: string | undefined;
+    const answered = settled.answered?.filter((u) => running.pendingTurns.has(u)) ?? [];
+    if (answered.length > 0) {
+      for (const u of answered) running.pendingTurns.delete(u);
+      uuid = answered[answered.length - 1];
+    } else {
+      const oldest = running.pendingTurns.values().next();
+      if (!oldest.done) {
+        running.pendingTurns.delete(oldest.value);
+        uuid = oldest.value;
+      }
+    }
+
+    const result: SdkTurnEndResult = {
+      isError: settled.turn.isError,
+      wasAborted: false,
+      costUsd: settled.turn.costUsd,
+      numTurns: settled.turn.numTurns,
+    };
     this.config.sdkOptions?.observe({
       type: "turn_end",
       ctx: running.ctx,
-      ...(running.currentUuid ? { userMessageUuid: running.currentUuid } : {}),
+      ...(uuid ? { userMessageUuid: uuid } : {}),
       ...(sdkSessionId ? { sdkSessionId } : {}),
       accountId: null,
       result,
     });
-    running.currentUuid = undefined;
+    return running.pendingTurns.size === 0 && running.reservedTurns === 0;
+  }
+
+  /** Run handleFinalTurn so that two calls never overlap. */
+  private runFinal(task: BackgroundTask, running: RunningTask, turn: TaskTurnResult): Promise<boolean> {
+    const next = running.finalChain.then(() => this.handleFinalTurn(task, running, turn));
+    running.finalChain = next.catch(() => undefined);
+    return next;
   }
 
   private buildOptions(task: BackgroundTask, running: RunningTask): Options {
@@ -478,6 +532,8 @@ export class BackgroundTaskManager {
     let signals: TurnSignals = newTurnSignals();
     let sdkSessionId: string | undefined = task.sdk_session_id ?? undefined;
     let safetyTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Last result that arrived while a subagent was running, used if no final one comes. */
+    let intermediate: SettledTurn | null = null;
     const clearSafetyTimer = (): void => {
       if (safetyTimer) {
         clearTimeout(safetyTimer);
@@ -517,11 +573,18 @@ export class BackgroundTaskManager {
         if (msg.type !== "result") continue;
 
         const turn = this.toTurnResult(msg, textParts, signals);
+        const settled: SettledTurn = {
+          turn,
+          answered: msg.user_message_uuids ?? (msg.user_message_uuid ? [msg.user_message_uuid] : null),
+        };
         if (msg.session_id) sdkSessionId = msg.session_id;
         textParts.length = 0;
         signals = newTurnSignals();
 
+        if (running.finished) continue;
+
         if (running.activeSubagents > 0) {
+          intermediate = settled;
           log.info(
             { taskId: task.id, activeSubagents: running.activeSubagents },
             "result arrived while a subagent is running; waiting for the final result",
@@ -529,13 +592,16 @@ export class BackgroundTaskManager {
           clearSafetyTimer();
           safetyTimer = setTimeout(() => {
             safetyTimer = null;
-            if (running.finished) return;
+            const pending = intermediate;
+            intermediate = null;
+            if (running.finished || !pending) return;
             log.warn(
               { taskId: task.id, activeSubagents: running.activeSubagents },
               "no final result after the subagent wait; using the last result",
             );
             running.activeSubagents = 0;
-            void this.handleFinalTurn(task, running, turn, sdkSessionId).then((stop) => {
+            if (!this.settleTurn(running, pending, sdkSessionId)) return;
+            void this.runFinal(task, running, pending.turn).then((stop) => {
               if (stop) this.windDown(running);
             });
           }, SUBAGENT_RESULT_TIMEOUT_MS);
@@ -543,11 +609,27 @@ export class BackgroundTaskManager {
         }
 
         clearSafetyTimer();
-        if (await this.handleFinalTurn(task, running, turn, sdkSessionId)) {
+        intermediate = null;
+        if (!this.settleTurn(running, settled, sdkSessionId)) {
+          log.info({ taskId: task.id, pending: running.pendingTurns.size }, "a message sent to the task is still unanswered; continuing");
+          continue;
+        }
+        if (await this.runFinal(task, running, turn)) {
           // End the input stream so the subprocess exits, and stop reading.
           running.messageQueue.end();
           break;
         }
+      }
+
+      // The stream ended while a subagent was still counted as running: the
+      // last result is the best answer there is.
+      if (!running.finished && intermediate) {
+        clearSafetyTimer();
+        const pending = intermediate;
+        intermediate = null;
+        log.warn({ taskId: task.id }, "stream ended while waiting for a subagent; using the last result");
+        this.settleTurn(running, pending, sdkSessionId);
+        await this.runFinal(task, running, pending.turn);
       }
 
       // If stream ended without a final result, mark the task as failed
@@ -610,7 +692,9 @@ export class BackgroundTaskManager {
           ? msg.errors.join("\n")
           : textParts.join("");
     const isError = msg.is_error === true;
-    const failure = isError ? classifyFailure({ text: response, signals }) : null;
+    // Classify the error text only, never the model's own words.
+    const errorText = msg.subtype === "success" ? msg.result : (msg.errors ?? []).join("\n");
+    const failure = isError ? classifyFailure({ text: errorText, signals }) : null;
     return {
       response,
       isError,
@@ -625,20 +709,8 @@ export class BackgroundTaskManager {
    * Handle a final result. Returns true when the task is done and its stream
    * should be wound down.
    */
-  private async handleFinalTurn(
-    task: BackgroundTask,
-    running: RunningTask,
-    turn: TaskTurnResult,
-    sdkSessionId: string | undefined,
-  ): Promise<boolean> {
+  private async handleFinalTurn(task: BackgroundTask, running: RunningTask, turn: TaskTurnResult): Promise<boolean> {
     if (running.finished) return true;
-
-    this.endTurn(running, sdkSessionId, {
-      isError: turn.isError,
-      wasAborted: false,
-      costUsd: turn.costUsd,
-      numTurns: turn.numTurns,
-    });
 
     const controller = running.controller;
     if (!controller) {
@@ -769,6 +841,7 @@ export class BackgroundTaskManager {
     const running = this.runningTasks.get(taskId);
     if (!running) return false;
 
+    running.finished = true;
     if (running.query) {
       running.query.close();
     }

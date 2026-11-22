@@ -20,6 +20,8 @@ vi.mock("pino", () => {
 
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import pino from "pino";
+import { failureOf } from "./failure.js";
+import { SdkOptionsPipeline, type SdkStreamEvent } from "./sdk-options.js";
 
 const mockQuery = sdkQuery as ReturnType<typeof vi.fn>;
 
@@ -202,6 +204,117 @@ describe("AgentEngine", () => {
       const callArgs = mockQuery.mock.calls[0]![0];
       expect(callArgs.options.mcpServers).toHaveProperty("server-a");
       expect(callArgs.options.mcpServers).toHaveProperty("server-b");
+    });
+  });
+
+  describe("limits and the SDK options seam", () => {
+    const LIMIT = "You've hit your weekly limit · resets 5pm (Africa/Cairo)";
+    const owner = { name: "Alice", platformId: "user-123", role: "owner" as const };
+
+    function limitResultStream(sessionId = "sess-old") {
+      return (async function* () {
+        yield {
+          type: "assistant" as const,
+          session_id: sessionId,
+          error: "rate_limit",
+          message: { model: "<synthetic>", content: [{ type: "text" as const, text: LIMIT }] },
+        };
+        yield {
+          type: "result" as const,
+          session_id: sessionId,
+          subtype: "success" as const,
+          result: LIMIT,
+          total_cost_usd: 0,
+          num_turns: 1,
+          is_error: true,
+          api_error_status: 429,
+        };
+      })();
+    }
+
+    /** The one-shot shape: the error result, then the iterator throws. */
+    function limitThenThrowStream(sessionId = "sess-old") {
+      return (async function* () {
+        yield {
+          type: "result" as const,
+          session_id: sessionId,
+          subtype: "success" as const,
+          result: LIMIT,
+          total_cost_usd: 0,
+          num_turns: 1,
+          is_error: true,
+        };
+        throw new Error(`Claude Code returned an error result: ${LIMIT}`);
+      })();
+    }
+
+    it("does not retry in a fresh session after a returned limit error", async () => {
+      mockQuery.mockReturnValueOnce(limitResultStream());
+
+      const result = await engine.execute(makeMessage(), owner, "sess-old");
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(result.isError).toBe(true);
+      expect(result.sessionId).toBe("sess-old");
+      expect(result.failure?.class).toBe("usage_limit_account");
+      expect(result.failure?.resetHint).toBe("5pm (Africa/Cairo)");
+    });
+
+    it("does not retry fresh after a thrown limit error, and the error carries its classification", async () => {
+      mockQuery.mockReturnValueOnce(limitThenThrowStream());
+
+      const err = await engine.execute(makeMessage(), owner, "sess-old").catch((e: unknown) => e);
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(err).toBeInstanceOf(Error);
+      expect(failureOf(err)?.class).toBe("usage_limit_account");
+    });
+
+    it("stops the fresh-session retries at a limit when there was no session to resume", async () => {
+      mockQuery.mockReturnValueOnce(limitThenThrowStream(""));
+
+      await expect(engine.execute(makeMessage(), owner)).rejects.toThrow(/weekly limit/);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it("still retries fresh after an unclassified error result (today's behaviour)", async () => {
+      mockQuery
+        .mockReturnValueOnce((async function* () {
+          yield { type: "result" as const, session_id: "sess-old", subtype: "success" as const, result: "weird", total_cost_usd: 0, num_turns: 1, is_error: true };
+        })())
+        .mockReturnValueOnce(makeSuccessStream("Fresh", "sess-new"));
+
+      const result = await engine.execute(makeMessage(), owner, "sess-old");
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(result.sessionId).toBe("sess-new");
+    });
+
+    it("applies the pipeline before every query and emits turn_start, message and turn_end in order", async () => {
+      const sdkOptions = new SdkOptionsPipeline();
+      const events: SdkStreamEvent[] = [];
+      sdkOptions.registerStreamObserver("test", (ev) => events.push(ev));
+      const seamEngine = new AgentEngine({ prompt: { maxTurns: 5, model: "claude-sonnet-4-20250514" }, cwd: "/tmp/ws", sdkOptions });
+      mockQuery.mockReturnValueOnce((async function* () {
+        yield { type: "assistant" as const, session_id: "s1", message: { model: "claude-sonnet-4-20250514", content: [{ type: "text" as const, text: "Hi" }] } };
+        yield { type: "result" as const, session_id: "s1", subtype: "success" as const, result: "Hi", total_cost_usd: 0.01, num_turns: 1, is_error: false };
+      })());
+
+      const result = await seamEngine.execute(makeMessage(), owner);
+
+      expect(result.model).toBe("claude-sonnet-4-20250514");
+      expect(result.accountId).toBeNull();
+      expect(result.userMessageUuid).toBeUndefined();
+      const { options } = mockQuery.mock.calls[0]![0];
+      expect(options.hooks.PreToolUse).toHaveLength(1);
+      expect(options.canUseTool).toBeTypeOf("function");
+      expect(options.permissionMode).toBe("bypassPermissions");
+
+      expect(events.map((e) => e.type)).toEqual(["turn_start", "message", "message", "turn_end"]);
+      const start = events[0]!;
+      expect(start.ctx).toMatchObject({ kind: "chat", ownerDm: true, interactive: true, sessionKey: "telegram:dm:chat-456" });
+      expect(start.type === "turn_start" && start.userMessageUuid).toBeUndefined();
+      const end = events[3]!;
+      expect(end.type === "turn_end" && end.result).toEqual({ isError: false, wasAborted: false, costUsd: 0.01, numTurns: 1, model: "claude-sonnet-4-20250514" });
     });
   });
 });

@@ -20,10 +20,18 @@ const log = pino({ name: "oneshot" });
 
 const DEFAULT_MAX_TURNS = 3;
 
-const denyAllTools: CanUseTool = async () => ({
-  behavior: "deny",
-  message: "No tools are available for this call.",
-});
+/**
+ * The SDK adds its own `StructuredOutput` tool when `outputFormat` is set
+ * (experiment E7); that is how `structured_output` is delivered. It is the
+ * one tool a no-tools call may use. The SDK handles it internally today, so
+ * this exception only matters if that ever routes through canUseTool.
+ */
+export const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
+
+const denyAllTools: CanUseTool = async (toolName, input) =>
+  toolName === STRUCTURED_OUTPUT_TOOL
+    ? { behavior: "allow", updatedInput: input }
+    : { behavior: "deny", message: "No tools are available for this call." };
 
 export function noToolsOptions(base: { model: string; systemPrompt: string; cwd: string; maxTurns?: number }): Options {
   return {

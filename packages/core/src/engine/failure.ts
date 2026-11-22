@@ -231,7 +231,7 @@ const OVERLOADED_TEXT = [
   /request rejected \(429\)/i,
   /api error:\s*(?:429|5\d\d)\b/i,
   /internal server error/i,
-  /capacity/i,
+  /temporary capacity issue/i,
 ];
 
 const NETWORK_TEXT = [
@@ -256,8 +256,12 @@ const SESSION_START_TEXT = [
 
 /** Older CLI shape: "Claude AI usage limit reached|1791915000". */
 const LEGACY_USAGE_RE = /usage limit reached\|(\d{10,13})/i;
-const USAGE_PHRASE_RE = /you've (?:hit|reached) your (.{0,40}?)\s*limit/i;
-const LEGACY_USAGE_TEXT = [/usage limit reached/i, /quota exceeded/i, /exceeded your quota/i, /insufficient credits/i, /\bsession limit\b/i, /\bweekly limit\b/i];
+/** Start of a line, after the optional SDK wrapper and "API Error: <status>" prefixes. */
+const LINE_LEAD =
+  "^\\s*(?:Claude Code returned an error result:\\s*)?(?:API Error:\\s*(?:\\d{3}\\s*)?)?";
+const USAGE_PHRASE_RE = new RegExp(`${LINE_LEAD}you've (?:hit|reached) your (.{0,40}?)\\s*limit`, "im");
+const LINE_LEAD_RE = new RegExp(LINE_LEAD, "i");
+const LEGACY_USAGE_TEXT = [/usage limit reached/i, /quota exceeded/i, /exceeded your quota/i, /insufficient credits/i];
 const MODEL_FAMILY_RE = /\b(opus|sonnet|haiku|fable|fast)\b/i;
 
 const FAILURE_TERMINAL_REASONS = new Set([
@@ -294,7 +298,10 @@ interface UsageMatch {
 function usageFromText(text: string): UsageMatch | null {
   const body = text.replace(SDK_ERROR_WRAPPER, "");
   const phrase = USAGE_PHRASE_RE.exec(body);
-  const hasPrefix = USAGE_LIMIT_PREFIXES.some((p) => body.toLowerCase().includes(p.toLowerCase()));
+  // Prefixes count only at the start of a line, so a reply that merely
+  // mentions "you've reached your ..." is not taken for a limit.
+  const lines = body.split("\n").map((line) => line.replace(LINE_LEAD_RE, "").toLowerCase());
+  const hasPrefix = USAGE_LIMIT_PREFIXES.some((p) => lines.some((line) => line.startsWith(p.toLowerCase())));
   const legacy = LEGACY_USAGE_TEXT.some((re) => re.test(body));
   if (!phrase && !hasPrefix && !legacy) return null;
 

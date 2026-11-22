@@ -7,8 +7,8 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
-import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { homedir, tmpdir, userInfo } from "node:os";
 import pino from "pino";
 import type { Signal } from "./signals.js";
 import { isUsageLimit } from "./failure.js";
@@ -46,7 +46,11 @@ export interface TriageResult {
 export interface TriageRunnerOptions {
   /** Shared SDK options seam (account env, fallback model). */
   sdkOptions?: SdkOptionsPipeline;
-  /** Empty working directory for the call. Default `~/.kirie/tmp/oneshot`. */
+  /**
+   * Empty working directory for the call. The daemon passes
+   * `<dataDir>/tmp/oneshot`; without it a private directory under the OS temp
+   * dir is used.
+   */
   cwd?: string;
 }
 
@@ -299,7 +303,7 @@ export class TriageRunner {
       label: "triage",
       parse: (parsed) => this.parseDecisions(parsed),
       ...(this.options.sdkOptions ? { sdkOptions: this.options.sdkOptions } : {}),
-      ...(this.options.cwd ? { cwd: this.options.cwd } : {}),
+      cwd: this.options.cwd ?? join(tmpdir(), `kirie-oneshot-${userInfo().uid}`),
     });
     return value;
   }

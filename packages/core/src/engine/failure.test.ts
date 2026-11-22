@@ -109,7 +109,7 @@ describe("classifyFailure: structured signals win over text", () => {
       rate_limit_info: { status: "rejected", resetsAt: 1791915000, rateLimitType: "seven_day_opus" },
       uuid: "u",
       session_id: "s",
-    } as SDKMessage);
+    } as unknown as SDKMessage);
     const info = classifyFailure({ text: "You've hit your session limit · resets 4am (Africa/Cairo)", signals, now: NOW })!;
     expect(info.class).toBe("usage_limit_model");
     expect(info.limitType).toBe("seven_day_opus");
@@ -200,7 +200,7 @@ describe("feedTurnSignals", () => {
     const s = newTurnSignals();
     feedTurnSignals(s, { type: "assistant", message: { model: "claude-opus-4-8", content: [] }, parent_tool_use_id: null, uuid: "u", session_id: "x" } as unknown as SDKMessage);
     feedTurnSignals(s, { type: "assistant", message: { model: "<synthetic>", content: [] }, error: "rate_limit", parent_tool_use_id: null, uuid: "u", session_id: "x" } as unknown as SDKMessage);
-    feedTurnSignals(s, { type: "system", subtype: "api_retry", attempt: 1, max_retries: 3, retry_delay_ms: 1, error_status: 529, error: "overloaded", uuid: "u", session_id: "x" } as SDKMessage);
+    feedTurnSignals(s, { type: "system", subtype: "api_retry", attempt: 1, max_retries: 3, retry_delay_ms: 1, error_status: 529, error: "overloaded", uuid: "u", session_id: "x" } as unknown as SDKMessage);
     feedTurnSignals(s, { type: "result", subtype: "success", is_error: true, api_error_status: 429, terminal_reason: "blocking_limit", result: "", num_turns: 1, total_cost_usd: 0 } as unknown as SDKMessage);
     expect(s).toEqual({
       model: "claude-opus-4-8",
@@ -235,5 +235,19 @@ describe("formatTaskFailure / userFacingTaskError", () => {
     expect(userFacingTaskError(stored)).toBe(agentErrorUserMessage(failure));
     expect(userFacingTaskError("Execution error: ENOENT /Users/someone/file")).toBeNull();
     expect(userFacingTaskError(null)).toBeNull();
+  });
+});
+
+describe("classifyFailure: only error-shaped text counts", () => {
+  it("a usage-limit phrase in the middle of ordinary text is not a limit", () => {
+    expect(classifyFailure({ text: "Sure. Note that once you've reached your limit of 3 drafts I stop." })).toBeNull();
+    expect(classifyFailure({ text: "I said: You've hit your session limit earlier, but that was a quote." })?.class).not.toBe("usage_limit_account");
+  });
+
+  it("finds a limit on any line, behind the SDK wrapper or an API Error prefix", () => {
+    expect(classifyFailure({ text: "partial", error: new Error(`${WRAP}You've hit your session limit · resets 4am (UTC)`), now: NOW })!.class).toBe(
+      "usage_limit_account",
+    );
+    expect(classifyFailure({ text: "API Error: 429 You've hit your weekly limit · resets 5pm (UTC)", now: NOW })!.class).toBe("usage_limit_account");
   });
 });

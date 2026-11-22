@@ -7,6 +7,10 @@ import type { SecurityGate, GateResult } from "../security/gate.js";
 import type { SessionStore } from "../engine/session-store.js";
 import type { AgentEngine, ExecutionResult } from "../engine/agent-engine.js";
 import type { HeartbeatService } from "../engine/heartbeat.js";
+import type { ChatHistoryStore } from "../mcp/tools/chat-history.js";
+import type { UsageTracker } from "../logging/usage-tracker.js";
+import type { BackgroundTask } from "../engine/background-task-store.js";
+import { classifyFailure, formatTaskFailure } from "../engine/failure.js";
 
 function makeMessage(overrides: Partial<UnifiedMessage> = {}): UnifiedMessage {
   return {
@@ -588,6 +592,148 @@ describe("MessagePipeline retry integration", () => {
       expect.stringContaining("ETIMEDOUT"),
       undefined,
     );
+  });
+});
+
+describe("MessagePipeline limit handling and unsolicited results", () => {
+  const LIMIT_TEXT = "You've hit your weekly limit · resets 5pm (Africa/Cairo)";
+  let mockAdapter: ReturnType<typeof createMockAdapter>;
+  let sessionStore: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
+  let engine: { execute: ReturnType<typeof vi.fn> };
+  let history: { recent: ReturnType<typeof vi.fn>; append: ReturnType<typeof vi.fn> };
+  let usage: { record: ReturnType<typeof vi.fn> };
+  let pipeline: MessagePipeline;
+
+  beforeEach(() => {
+    mockAdapter = createMockAdapter();
+    const registry = {
+      getAll: vi.fn(() => new Map([["telegram", mockAdapter]])),
+      getById: vi.fn(() => mockAdapter),
+      isRunning: vi.fn(() => true),
+      on: vi.fn(),
+    } as unknown as ChannelRegistry;
+    const gate = {
+      check: vi.fn((): GateResult => ({
+        passed: true,
+        identity: { canonicalId: "user-123", senderId: "user-123", role: "owner" as const, channel: "telegram" },
+        wrappedText: "",
+      })),
+    } as unknown as SecurityGate;
+    sessionStore = { get: vi.fn(() => "sdk-old"), set: vi.fn(), delete: vi.fn() };
+    engine = { execute: vi.fn() };
+    history = { recent: vi.fn(() => []), append: vi.fn() };
+    usage = { record: vi.fn() };
+    pipeline = new MessagePipeline({
+      channelRegistry: registry,
+      securityGate: gate,
+      sessionStore: sessionStore as unknown as SessionStore,
+      agentEngine: engine as unknown as AgentEngine,
+      chatHistoryStore: history as unknown as ChatHistoryStore,
+      usageTracker: usage as unknown as UsageTracker,
+      model: "config-model",
+      debounceMs: 0,
+    });
+    pipeline.start();
+  });
+
+  afterEach(() => {
+    pipeline.stop();
+  });
+
+  async function sendAndWait(): Promise<string> {
+    mockAdapter.messageListeners[0]!(makeMessage());
+    await vi.waitFor(() => expect(mockAdapter.sendText).toHaveBeenCalled(), { timeout: 3000 });
+    return (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls[0]![0].text as string;
+  }
+
+  it("answers a returned, classified error result with the fixed message, never the raw text", async () => {
+    const failure = classifyFailure({ text: LIMIT_TEXT })!;
+    engine.execute.mockResolvedValue({
+      response: LIMIT_TEXT, sessionId: "sdk-old", costUsd: 0, numTurns: 1, isError: true, failure,
+    } satisfies ExecutionResult);
+
+    const text = await sendAndWait();
+
+    expect(text).toContain("Usage limit reached");
+    expect(text).toContain("5pm (Africa/Cairo)");
+    expect(text).not.toContain("You've hit");
+    const assistantRows = history.append.mock.calls.filter((c) => c[1] === "assistant");
+    expect(assistantRows[0]![2]).toContain("Usage limit reached");
+    expect(sessionStore.delete).not.toHaveBeenCalled();
+    expect(sessionStore.set).toHaveBeenCalledWith("telegram:dm:chat-456", "sdk-old");
+  });
+
+  it("an unclassified error result is still sent as before", async () => {
+    engine.execute.mockResolvedValue({
+      response: "Partial work before max turns", sessionId: "s", costUsd: 0, numTurns: 9, isError: true,
+    } satisfies ExecutionResult);
+    expect(await sendAndWait()).toBe("Partial work before max turns");
+  });
+
+  it("keeps the session mapping when execution throws a limit error", async () => {
+    engine.execute.mockRejectedValue(new Error(`Claude Code returned an error result: ${LIMIT_TEXT}`));
+    const text = await sendAndWait();
+    expect(text).toContain("Usage limit reached");
+    expect(sessionStore.delete).not.toHaveBeenCalled();
+  });
+
+  it("still clears a stale mapping when execution throws anything else", async () => {
+    engine.execute.mockRejectedValue(new Error("Claude Code process exited with code 1"));
+    const text = await sendAndWait();
+    expect(text).toContain("Failed to start AI session");
+    expect(sessionStore.delete).toHaveBeenCalledWith("telegram:dm:chat-456");
+  });
+
+  it("records usage under the model that answered, falling back to the configured model", async () => {
+    engine.execute.mockResolvedValueOnce({
+      response: "hi", sessionId: "s", costUsd: 0.2, numTurns: 1, isError: false, model: "claude-fallback-model",
+    } satisfies ExecutionResult);
+    await sendAndWait();
+    expect(usage.record).toHaveBeenCalledWith(expect.objectContaining({ model: "claude-fallback-model", costUsd: 0.2 }));
+
+    engine.execute.mockResolvedValueOnce({ response: "hi", sessionId: "s", costUsd: 0.1, numTurns: 1, isError: false });
+    mockAdapter.messageListeners[0]!(makeMessage({ id: "msg-2" }));
+    await vi.waitFor(() => expect(usage.record).toHaveBeenCalledTimes(2), { timeout: 3000 });
+    expect(usage.record.mock.calls[1]![0]).toMatchObject({ model: "config-model" });
+  });
+
+  it("delivers an unsolicited session result to the chat and stores it", async () => {
+    await pipeline.deliverUnsolicitedResult("telegram:dm:chat-456", {
+      response: "Agent findings", sessionId: "s", costUsd: 0, numTurns: 1, isError: false,
+    });
+    expect(mockAdapter.sendText).toHaveBeenCalledWith({ ctx: { chatId: "chat-456" }, text: "Agent findings" });
+    expect(history.append).toHaveBeenCalledWith("telegram:dm:chat-456", "assistant", "Agent findings", { channel: "telegram" });
+  });
+
+  it("does not deliver unsolicited error results, empty results, or anything after stop", async () => {
+    await pipeline.deliverUnsolicitedResult("telegram:dm:chat-456", {
+      response: LIMIT_TEXT, sessionId: "s", costUsd: 0, numTurns: 1, isError: true,
+    });
+    await pipeline.deliverUnsolicitedResult("telegram:dm:chat-456", {
+      response: "  ", sessionId: "s", costUsd: 0, numTurns: 1, isError: false,
+    });
+    await pipeline.stop();
+    await pipeline.deliverUnsolicitedResult("telegram:dm:chat-456", {
+      response: "late", sessionId: "s", costUsd: 0, numTurns: 1, isError: false,
+    });
+    expect(mockAdapter.sendText).not.toHaveBeenCalled();
+  });
+
+  it("pushBackgroundTaskFailure shows only the classified sentence, never raw error text", async () => {
+    const base: BackgroundTask = {
+      id: "t1", session_key: "telegram:dm:chat-456", description: "Research", prompt: "p", status: "failed",
+      result: null, error: null, cost_usd: 0, num_turns: 0, created_at: "", updated_at: "", sdk_session_id: null,
+    };
+    const failure = classifyFailure({ text: LIMIT_TEXT })!;
+    await pipeline.pushBackgroundTaskFailure({ ...base, error: formatTaskFailure(failure) });
+    await pipeline.pushBackgroundTaskFailure({ ...base, error: "Execution error: ENOENT /Users/someone/private.txt" });
+
+    const texts = (mockAdapter.sendText as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0].text as string);
+    expect(texts[0]).toContain("Background task failed: Research");
+    expect(texts[0]).toContain("Usage limit reached");
+    expect(texts[0]).not.toContain("[usage_limit_account]");
+    expect(texts[1]).toContain("Background task failed: Research");
+    expect(texts[1]).not.toContain("/Users/someone");
   });
 });
 

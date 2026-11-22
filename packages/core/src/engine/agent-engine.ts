@@ -371,6 +371,8 @@ export class AgentEngine implements AgentExecutor {
     const textParts: string[] = [];
     let wasAborted = false;
     let gotResult = false;
+    /** Error text of the result, for classification. Never the model's own words. */
+    let errorText = "";
 
     // The v1 path sends a string prompt, so there is no user message uuid.
     sdkOptions?.observe({ type: "turn_start", ctx, accountId: null });
@@ -417,7 +419,9 @@ export class AgentEngine implements AgentExecutor {
 
             if (msg.subtype === "success") {
               resultText = msg.result;
+              errorText = msg.result;
             } else {
+              errorText = "errors" in msg ? msg.errors.join("\n") : "";
               // For error results, join any collected text or use error details
               resultText =
                 "errors" in msg && msg.errors.length > 0
@@ -448,7 +452,7 @@ export class AgentEngine implements AgentExecutor {
         endTurn(true, false);
         // One-shot paths see the error result first and then this throw; the
         // signals gathered from the stream make the classification exact.
-        const failure = classifyFailure({ error: err, signals, ...(resultText ? { text: resultText } : {}) });
+        const failure = classifyFailure({ error: err, signals, ...(errorText ? { text: errorText } : {}) });
         if (failure) attachFailure(err, failure);
         throw err;
       }
@@ -468,7 +472,7 @@ export class AgentEngine implements AgentExecutor {
 
     endTurn(isError, wasAborted);
 
-    const failure = isError ? classifyFailure({ text: resultText, signals }) : null;
+    const failure = isError ? classifyFailure({ text: errorText, signals }) : null;
 
     return {
       response: resultText,

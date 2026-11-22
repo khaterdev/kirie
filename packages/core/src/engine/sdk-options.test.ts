@@ -12,9 +12,11 @@ import {
   addHook,
   chatCallContext,
   installCanUseToolWarningFilter,
+  isSubagentTool,
   CAN_USE_TOOL_SHADOWED_WARNING,
   GATE_ERROR_REASON,
   PRE_TOOL_USE_TIMEOUT_SECONDS,
+  UNASKED_PERMISSION_REASON,
   SdkOptionsPipeline,
   type SdkCallContext,
   type SdkCallKind,
@@ -112,25 +114,18 @@ describe("SdkOptionsPipeline: contributors", () => {
     expect(() => pipeline.apply(chatOptions(), ctxOf())).toThrow(/"sandbox" failed: no docker/);
   });
 
-  it("core-defaults hides reserved MCP prefixes and sets strictMcpConfig only when configured", () => {
+  it("core-defaults sets strictMcpConfig only when configured and leaves disallowedTools alone (E8)", () => {
     let strict = false;
     const pipeline = new SdkOptionsPipeline({ strictMcpConfig: () => strict });
+    pipeline.claimMcpPrefix("mcp__cua-driver", (ctx) => ctx.ownerDm);
     const a = pipeline.apply({ ...chatOptions(), disallowedTools: ["WebFetch"] }, ctxOf());
-    expect(a.disallowedTools).toEqual(["WebFetch", "mcp__cua-driver", "mcp__cua-computer-use"]);
+    expect(a.disallowedTools).toEqual(["WebFetch"]);
     expect(a.strictMcpConfig).toBeUndefined();
+    expect(pipeline.apply(chatOptions(), ctxOf()).disallowedTools).toBeUndefined();
 
     strict = true;
     const b = pipeline.apply(chatOptions(), ctxOf());
     expect(b.strictMcpConfig).toBe(true);
-  });
-
-  it("does not hide a claimed prefix from a context the claim accepts", () => {
-    const pipeline = new SdkOptionsPipeline();
-    pipeline.claimMcpPrefix("mcp__cua-driver", (ctx) => ctx.ownerDm);
-    const owner = pipeline.apply(chatOptions(), ctxOf("chat", { ownerDm: true }));
-    expect(owner.disallowedTools).toEqual(["mcp__cua-computer-use"]);
-    const other = pipeline.apply(chatOptions(), ctxOf("chat", { ownerDm: false }));
-    expect(other.disallowedTools).toEqual(["mcp__cua-driver", "mcp__cua-computer-use"]);
   });
 });
 
@@ -209,11 +204,27 @@ describe("SdkOptionsPipeline: behaviour with only the built-in gates", () => {
     expect(raced).toEqual({});
   });
 
-  it("canUseTool for a call with no stored ask allows it with the input unchanged", async () => {
+  it("canUseTool for a request no gate raised refuses it, as a headless session did before", async () => {
     const pipeline = new SdkOptionsPipeline();
     const options = pipeline.apply(chatOptions(), ctxOf());
-    const input = { command: "ls" };
-    expect(await callCanUse(options, "Bash", input, "tu-2")).toEqual({ behavior: "allow", updatedInput: input });
+    expect(await callCanUse(options, "Bash", { command: "ls" }, "tu-2")).toEqual({
+      behavior: "deny",
+      message: UNASKED_PERMISSION_REASON,
+    });
+  });
+
+  it("canUseTool for a request no gate raised still resolves a gate's ask when the re-run chain asks", async () => {
+    const pipeline = new SdkOptionsPipeline();
+    pipeline.registerGate(gate("approvals", 900, () => ({
+      decision: "ask",
+      summary: "?",
+      resolve: async () => ({ approved: true, reason: "owner ok" }),
+    })));
+    const options = pipeline.apply(chatOptions(), ctxOf());
+    expect(await callCanUse(options, "Bash", { command: "ls" }, "tu-unstored")).toEqual({
+      behavior: "allow",
+      updatedInput: { command: "ls" },
+    });
   });
 
   it("subagent calls are seen with their agent id", async () => {
@@ -442,6 +453,17 @@ describe("SdkOptionsPipeline: built-in gates", () => {
     const stranger = pipeline.apply(chatOptions(), ctxOf("chat", { ownerDm: false }));
     expect(await runPre(owner, "mcp__cua-driver__click")).toEqual({});
     expect(await runPre(stranger, "mcp__cua-driver__click")).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+  });
+
+  it("task-profile treats Agent and Task as the same subagent tool (E5)", async () => {
+    const pipeline = new SdkOptionsPipeline();
+    const withTask = pipeline.apply(chatOptions(), ctxOf("goal", { toolAllowlist: ["Task", "Read"] }));
+    expect(await runPre(withTask, "Agent")).toEqual({});
+    const withAgent = pipeline.apply(chatOptions(), ctxOf("goal", { toolAllowlist: ["Agent"] }));
+    expect(await runPre(withAgent, "Task")).toEqual({});
+    const without = pipeline.apply(chatOptions(), ctxOf("goal", { toolAllowlist: ["Read"] }));
+    expect(await runPre(without, "Agent")).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(isSubagentTool("Agent") && isSubagentTool("Task") && !isSubagentTool("Bash")).toBe(true);
   });
 
   it("a claim callback that throws counts as not allowed", async () => {

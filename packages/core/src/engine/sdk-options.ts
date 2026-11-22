@@ -165,6 +165,9 @@ export const GATE_CHAIN_TIMEOUT_MS = 10_000;
 export const PRE_TOOL_USE_TIMEOUT_SECONDS = 30;
 /** Reason given to the model when a gate throws or the chain times out. */
 export const GATE_ERROR_REASON = "tool gate error";
+/** Reason for refusing a permission request that no Kirie gate raised (see canUseTool). */
+export const UNASKED_PERMISSION_REASON =
+  "This action needs interactive permission, which is not available in this session.";
 
 const NO_TOOL_KINDS: ReadonlySet<SdkCallKind> = new Set<SdkCallKind>(["judge", "triage", "oneshot"]);
 const PENDING_ASK_TTL_MS = 60 * 60 * 1000;
@@ -201,10 +204,25 @@ export function chatCallContext(input: {
   };
 }
 
-/** True when `tool` is on an allowlist of exact names or "prefix*" entries. */
+/**
+ * The subagent tool has two names: the init message lists it as "Task", tool
+ * calls and hook input use "Agent" (experiment E5). Anything that matches the
+ * subagent tool must accept both.
+ */
+export const SUBAGENT_TOOL_NAMES: readonly string[] = ["Agent", "Task"];
+
+export function isSubagentTool(tool: string): boolean {
+  return SUBAGENT_TOOL_NAMES.includes(tool);
+}
+
+/**
+ * True when `tool` is on an allowlist of exact names or "prefix*" entries.
+ * "Agent" and "Task" are treated as the same tool.
+ */
 export function toolMatchesAllowlist(tool: string, allowlist: readonly string[]): boolean {
+  const names = isSubagentTool(tool) ? SUBAGENT_TOOL_NAMES : [tool];
   return allowlist.some((entry) =>
-    entry.endsWith("*") ? tool.startsWith(entry.slice(0, -1)) : tool === entry,
+    names.some((name) => (entry.endsWith("*") ? name.startsWith(entry.slice(0, -1)) : name === entry)),
   );
 }
 
@@ -272,7 +290,7 @@ export class SdkOptionsPipeline {
 
     for (const prefix of RESERVED_MCP_PREFIXES) this.reserveMcpPrefix(prefix);
 
-    this.registerContributor("core-defaults", (options, ctx) => this.applyCoreDefaults(options, ctx), 10);
+    this.registerContributor("core-defaults", (options) => this.applyCoreDefaults(options), 10);
     this.registerGate({
       name: "reserved-mcp",
       order: 50,
@@ -424,14 +442,13 @@ export class SdkOptionsPipeline {
     return { decision: "deny", reason: `The tool ${call.tool} is not available in this session.` };
   }
 
-  private applyCoreDefaults(options: Options, ctx: SdkCallContext): void {
+  /**
+   * Only `strictMcpConfig`. Reserved MCP prefixes are not appended to
+   * `disallowedTools`: experiment E8 showed a server-level name there hides
+   * nothing, so the `reserved-mcp` gate is the binding control.
+   */
+  private applyCoreDefaults(options: Options): void {
     if (this.strictMcpConfig()) options.strictMcpConfig = true;
-
-    const hidden = [...this.reservedPrefixes].filter((p) => !this.claimAllows(p, ctx));
-    if (hidden.length === 0) return;
-    const existing = options.disallowedTools ?? [];
-    const additions = hidden.filter((p) => !existing.includes(p));
-    if (additions.length > 0) options.disallowedTools = [...existing, ...additions];
   }
 
   // ── The gate chain ─────────────────────────────────────────────────────
@@ -543,7 +560,11 @@ export class SdkOptionsPipeline {
         asks = pending.asks;
         finalInput = pending.input;
       } else {
-        // Not expected under bypassPermissions: re-run the chain for this call.
+        // No gate asked for this call, so the request comes from the CLI
+        // itself (a settings ask rule, a safety check, a tool that always
+        // asks). Re-run the chain so a deny or an ask still applies; a plain
+        // pass is refused, which is what a headless session without
+        // canUseTool did before the pipeline existed.
         const outcome = await this.runChain({
           tool: toolName,
           input,
@@ -553,6 +574,13 @@ export class SdkOptionsPipeline {
           ...(opts.agentID ? { agentId: opts.agentID } : {}),
         });
         if (outcome.kind === "deny") return { behavior: "deny", message: outcome.reason };
+        if (outcome.asks.length === 0) {
+          log.info(
+            { tool: toolName, label: ctx.label, decisionReason: opts.decisionReason },
+            "permission request not raised by a Kirie gate; refusing as before",
+          );
+          return { behavior: "deny", message: UNASKED_PERMISSION_REASON };
+        }
         asks = outcome.asks;
         finalInput = outcome.input;
       }

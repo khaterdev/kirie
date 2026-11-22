@@ -583,8 +583,10 @@ export class V2SessionManager implements AgentExecutor {
               this.sessionStore.set(managed.sessionKey, sessionId);
             }
 
+            // Classify the error text only, never the model's own words.
+            const errorText = resultMsg.subtype === "success" ? resultMsg.result : resultMsg.errors.join("\n");
             const failure = resultMsg.is_error
-              ? classifyFailure({ text: response, signals: managed.signals })
+              ? classifyFailure({ text: errorText, signals: managed.signals })
               : null;
             const model = managed.signals.model;
             const uuid = managed.currentUuid;
@@ -600,7 +602,8 @@ export class V2SessionManager implements AgentExecutor {
               ...(uuid ? { userMessageUuid: uuid } : {}),
             };
 
-            this.endTurn(managed, {
+            // An aborted turn already emitted its turn_end; a late result for it is not a new turn.
+            if (!managed.aborted) this.endTurn(managed, {
               isError: resultMsg.is_error,
               wasAborted: false,
               costUsd: resultMsg.total_cost_usd,
@@ -759,9 +762,13 @@ export class V2SessionManager implements AgentExecutor {
     }
 
     if (managed.pendingResult) {
+      this.endTurn(managed, { isError: false, wasAborted: true, costUsd: 0, numTurns: 0 });
       managed.pendingResult.reject(new Error("Session closed"));
       managed.pendingResult = null;
     }
+    // A closed session is done: a result still in flight is neither a new
+    // turn nor an unsolicited answer for the chat.
+    managed.aborted = true;
 
     // Ending the input stream lets the subprocess exit on its own; interrupt()
     // covers the case where it is mid-turn and would otherwise keep running.

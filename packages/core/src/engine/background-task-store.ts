@@ -275,27 +275,29 @@ export class BackgroundTaskStore {
   }
 
   /**
-   * Update task with completion result.
+   * Update task with completion result. A task already cancelled, completed
+   * or failed keeps its outcome.
    */
   markCompleted(id: string, result: string, costUsd: number, numTurns: number): void {
     this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'completed', result = ?, cost_usd = ?, num_turns = ?, updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
       .run(result, costUsd, numTurns, id);
   }
 
   /**
-   * Update task with failure info.
+   * Update task with failure info. A task already cancelled, completed or
+   * failed keeps its outcome.
    */
   markFailed(id: string, error: string): void {
     this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'failed', error = ?, updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
       .run(error, id);
   }

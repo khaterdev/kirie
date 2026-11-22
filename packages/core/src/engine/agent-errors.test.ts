@@ -103,3 +103,34 @@ describe("extractResetHint", () => {
     expect(extractResetHint(`resets ${"x".repeat(80)}`)).toBeUndefined();
   });
 });
+
+describe("weekly, fast and monthly-spend limits", () => {
+  it.each([
+    "Claude Code returned an error result: You've hit your weekly limit · resets 5pm (Africa/Cairo)",
+    "Claude Code returned an error result: You've hit your fast limit · resets 4am (Africa/Cairo)",
+    "You've hit your monthly spend limit · raise it in the console",
+  ])("classifyAgentError treats %j as a usage limit", (msg) => {
+    expect(classifyAgentError(new Error(msg)).kind).toBe("usage_limit");
+  });
+
+  it("shows the weekly reset time", () => {
+    const info = classifyAgentError(new Error("You've hit your weekly limit · resets Aug 11 at 5pm (Africa/Cairo)"));
+    expect(agentErrorUserMessage(info)).toContain("Aug 11 at 5pm (Africa/Cairo)");
+  });
+});
+
+describe("agentErrorUserMessage with a FailureInfo", () => {
+  it("renders every class with a fixed sentence and only the reset hint interpolated", () => {
+    const msg = (cls: Parameters<typeof agentErrorUserMessage>[0]) => agentErrorUserMessage(cls);
+    expect(msg({ class: "usage_limit_account", message: "x", resetHint: "4am (Africa/Cairo)" })).toContain("4am (Africa/Cairo)");
+    expect(msg({ class: "usage_limit_model", message: "x" })).toContain("Retrying won't help");
+    expect(msg({ class: "auth", message: "secret detail" })).toContain("log in to Claude again");
+    expect(msg({ class: "model_unavailable", message: "x" })).toContain("model isn't available");
+    expect(msg({ class: "overloaded", message: "x" })).toContain("overloaded");
+    expect(msg({ class: "prompt_too_long", message: "x" })).toContain("/clear");
+    expect(msg({ class: "session_start", message: "x" })).toBe("Failed to start AI session. Context has been reset — please try again.");
+    expect(msg({ class: "network", message: "ECONNREFUSED /home/user" })).toBe("Sorry, an internal error occurred. Please try again.");
+    expect(msg({ class: "unknown", message: "secret detail" })).toBe("Sorry, an internal error occurred. Please try again.");
+    expect(msg({ class: "auth", message: "secret detail" })).not.toContain("secret detail");
+  });
+});
