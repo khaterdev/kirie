@@ -331,8 +331,8 @@ describe("ChannelRegistry", () => {
         updateInteractive: (p: unknown) => Promise<unknown>;
       };
       extra.bot = { api: "raw-bot" };
-      extra.sendInteractive = record("sendInteractive");
-      extra.updateInteractive = record("updateInteractive");
+      extra.sendInteractive = record("sendInteractive") as unknown as typeof extra.sendInteractive;
+      extra.updateInteractive = record("updateInteractive") as unknown as typeof extra.updateInteractive;
       return { adapter: extra, calls };
     }
 
