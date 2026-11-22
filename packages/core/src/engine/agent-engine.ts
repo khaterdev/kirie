@@ -13,8 +13,8 @@ import {
   type PromptConfig,
 } from "./prompt-builder.js";
 import { makeSessionKey } from "../routing/session-key.js";
-import type { MediaType } from "../channels/normalizer.js";
-import type { ResolvedMedia } from "../channels/adapter.js";
+import type { FailedMedia, ResolvedMedia } from "../channels/adapter.js";
+import { formatFailedMediaNote, mediaTypeLabel } from "../channels/media-failure.js";
 
 const log = pino({ name: "agent-engine" });
 
@@ -66,6 +66,8 @@ export interface IncomingMessage {
   };
   /** Resolved media attachments with local file paths */
   media?: ResolvedMedia[];
+  /** Attachments that were on the message but could not be downloaded */
+  failedMedia?: FailedMedia[];
 }
 
 /**
@@ -383,19 +385,6 @@ export class AgentEngine implements AgentExecutor {
   }
 }
 
-function mediaTypeLabel(type: MediaType): string {
-  switch (type) {
-    case "photo": return "Image";
-    case "video": return "Video";
-    case "audio": return "Audio";
-    case "voice": return "Voice message";
-    case "document": return "Document";
-    case "sticker": return "Sticker";
-    case "animation": return "Animation";
-    default: return "File";
-  }
-}
-
 
 /**
  * Wraps the raw user message text with XML context tags for the InputGuard.
@@ -469,6 +458,15 @@ export function wrapUserMessage(
       }
     }
     parts.push("(Use the Read tool to view attached images)");
+  }
+
+  // Attachments that failed to download must still be visible, otherwise a
+  // media-only message reaches the agent as an empty message.
+  if (message.failedMedia && message.failedMedia.length > 0) {
+    parts.push("");
+    for (const f of message.failedMedia) {
+      parts.push(formatFailedMediaNote(f));
+    }
   }
 
   // Include reaction event context

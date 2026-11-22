@@ -132,6 +132,28 @@ export interface ResolvedMedia {
   readonly transcript?: string;
 }
 
+/**
+ * A media attachment that was present on the inbound message but could not be
+ * downloaded or saved. Surfaced to the agent so an attachment is never dropped
+ * silently (otherwise a media-only message reaches the agent as empty text).
+ */
+export interface FailedMedia {
+  /** Media type */
+  readonly type: MediaType;
+  /** Original filename, if the platform provided one */
+  readonly filename?: string;
+  /** MIME type, if the platform provided one */
+  readonly mimeType?: string;
+  /** File size in bytes, if the platform provided it */
+  readonly sizeBytes?: number;
+  /** Caption from the original message */
+  readonly caption?: string;
+  /** Human-readable reason the download failed */
+  readonly reason: string;
+  /** Whether the failure was caused by the file being too large */
+  readonly tooBig: boolean;
+}
+
 /** A sent message receipt */
 export interface SentMessage {
   /** Platform-assigned message ID */

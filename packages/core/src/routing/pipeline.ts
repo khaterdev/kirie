@@ -7,7 +7,13 @@ import { checkSizeCap, kindFromMime } from "@kirie/media";
 import type { TranscriptionProvider } from "@kirie/media";
 import type { UnifiedMessage, ChannelName, UnifiedMedia, MediaType } from "../channels/normalizer.js";
 import type { ChannelRegistry } from "../channels/registry.js";
-import type { ChannelAdapter, ResolvedMedia } from "../channels/adapter.js";
+import type { ChannelAdapter, FailedMedia, ResolvedMedia } from "../channels/adapter.js";
+import {
+  describeMediaDownloadError,
+  formatBytes,
+  formatFailedMediaNote,
+  toFailedMedia,
+} from "../channels/media-failure.js";
 import { splitMediaFromOutput } from "../engine/media-output-parser.js";
 import { SecurityGate, type GateResult } from "../security/gate.js";
 import { resolveRoute } from "./resolve-route.js";
@@ -295,12 +301,15 @@ export class MessagePipeline {
 
     // Step 2: Download and save media attachments to disk
     let resolvedMedia: ResolvedMedia[] | undefined;
+    let failedMedia: FailedMedia[] | undefined;
     if (message.media && message.media.length > 0 && sourceAdapter.downloadMedia) {
-      resolvedMedia = await downloadAndSaveMedia(
+      const downloads = await downloadAndSaveMedia(
         message.media,
         sourceAdapter,
         this.config.transcriptionProvider,
       );
+      resolvedMedia = downloads.resolved;
+      if (downloads.failed.length > 0) failedMedia = downloads.failed;
     }
 
     // Step 3: Route resolution
@@ -315,7 +324,7 @@ export class MessagePipeline {
     }
 
     const route = resolveRoute(
-      unifiedToIncoming(message, resolvedMedia, reactionContext),
+      unifiedToIncoming(message, resolvedMedia, reactionContext, failedMedia),
       this.config.sessionStore,
     );
 
@@ -373,6 +382,10 @@ export class MessagePipeline {
             let historyText = message.text;
             if (message.isEdited) {
               historyText = `[edited] ${historyText}`;
+            }
+            if (failedMedia) {
+              const notes = failedMedia.map(formatFailedMediaNote).join("\n");
+              historyText = historyText ? `${historyText}\n${notes}` : notes;
             }
             if (message.reaction) {
               const verb = message.reaction.action === "add" ? "reacted with" : "removed";
@@ -805,6 +818,7 @@ function unifiedToIncoming(
   message: UnifiedMessage,
   resolvedMedia?: ResolvedMedia[],
   reactionContext?: { isTargetFromBot?: boolean; targetContent?: string },
+  failedMedia?: FailedMedia[],
 ): IncomingMessage {
   return {
     id: message.id,
@@ -818,6 +832,7 @@ function unifiedToIncoming(
     replyToId: message.replyToId,
     replyTo: message.replyTo,
     media: resolvedMedia,
+    failedMedia,
     isEdited: message.isEdited,
     reaction: message.reaction
       ? {
@@ -837,18 +852,17 @@ const MEDIA_DIR = join(homedir(), ".kirie", "media");
 /**
  * Download media attachments from a channel and save them to disk.
  * Checks size caps and optionally auto-transcribes audio/voice media.
- * Returns resolved media descriptors with local file paths.
+ * Returns resolved media descriptors with local file paths, plus a record of
+ * every attachment that could not be downloaded or saved (never dropped
+ * silently, so the agent can tell the sender it didn't come through).
  */
-async function downloadAndSaveMedia(
+export async function downloadAndSaveMedia(
   mediaItems: readonly UnifiedMedia[],
   adapter: ChannelAdapter,
   transcriptionProvider?: TranscriptionProvider,
-): Promise<ResolvedMedia[]> {
-  if (!existsSync(MEDIA_DIR)) {
-    mkdirSync(MEDIA_DIR, { recursive: true });
-  }
-
+): Promise<{ resolved: ResolvedMedia[]; failed: FailedMedia[] }> {
   const results: ResolvedMedia[] = [];
+  const failed: FailedMedia[] = [];
 
   for (const media of mediaItems) {
     try {
@@ -862,7 +876,16 @@ async function downloadAndSaveMedia(
           { mediaType: media.type, size: downloaded.buffer.length, kind: mediaKind },
           "media exceeds size cap, skipping",
         );
+        failed.push(toFailedMedia(
+          { ...media, sizeBytes: media.sizeBytes ?? downloaded.buffer.length },
+          `file is too big (${formatBytes(downloaded.buffer.length)} exceeds Kirie's ${mediaKind} size cap)`,
+          true,
+        ));
         continue;
+      }
+
+      if (!existsSync(MEDIA_DIR)) {
+        mkdirSync(MEDIA_DIR, { recursive: true });
       }
 
       const hash = createHash("sha256").update(downloaded.buffer).digest("hex").slice(0, 12);
@@ -899,11 +922,16 @@ async function downloadAndSaveMedia(
 
       log.debug({ localPath, type: media.type, size: downloaded.buffer.length }, "media saved to disk");
     } catch (err) {
-      log.warn({ err, mediaType: media.type, url: media.url.slice(0, 100) }, "failed to download media (skipping)");
+      const { reason, tooBig } = describeMediaDownloadError(err, adapter.id);
+      log.warn(
+        { err, mediaType: media.type, sizeBytes: media.sizeBytes, url: media.url.slice(0, 100), reason },
+        "failed to download media (agent will be told)",
+      );
+      failed.push(toFailedMedia(media, reason, tooBig));
     }
   }
 
-  return results;
+  return { resolved: results, failed };
 }
 
 function extensionFromMime(mimeType: string): string | null {
