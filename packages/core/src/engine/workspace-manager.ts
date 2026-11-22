@@ -1,9 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import pino from "pino";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompt-builder.js";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "workspace-manager" });
+const log = createModuleLogger("workspace-manager");
 
 /**
  * Configuration for the WorkspaceManager.

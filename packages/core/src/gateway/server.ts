@@ -4,6 +4,9 @@ import { bearerAuth } from "hono/bearer-auth";
 import { serve } from "@hono/node-server";
 import type { GatewayConfig } from "../config/schema.js";
 import { createRoutes, type GatewayDeps } from "./routes.js";
+import { createModuleLogger } from "../logging/logger.js";
+
+const log = createModuleLogger("gateway");
 
 /**
  * Options for creating the gateway server.
@@ -73,7 +76,7 @@ export class GatewayServer {
 
     // Global error handler
     this.app.onError((err, c) => {
-      console.error("[gateway] unhandled error:", err);
+      log.error({ err }, "unhandled gateway error");
       return c.json({ status: "error", message: "An internal error occurred" }, 500);
     });
   }

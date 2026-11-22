@@ -3,6 +3,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { scrubSecrets } from "../../security/secret-scrubber.js";
+import { sanitizeFTS5Query } from "./memory.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "chat-history.db");
 
@@ -123,16 +125,21 @@ export class ChatHistoryStore {
     };
   }
 
+  /**
+   * Append a message and return its row id. The content is scrubbed for secrets before it is
+   * stored (and before it is embedded); the live turn still sees the original text.
+   */
   append(
     sessionKey: string,
     role: "user" | "assistant",
-    content: string,
+    rawContent: string,
     opts?: {
       senderName?: string;
       senderId?: string;
       channel?: string;
     },
-  ): void {
+  ): number {
+    const content = scrubSecrets(rawContent, { sink: "chat-history" });
     const result = this.db
       .prepare(
         `INSERT INTO messages (session_key, role, sender_name, sender_id, content, channel)
@@ -147,11 +154,12 @@ export class ChatHistoryStore {
         opts?.channel ?? "unknown",
       );
 
+    const msgId = Number(result.lastInsertRowid);
     // Fire-and-forget: embed the message asynchronously for semantic search
     if (this.embeddingProvider && this.embeddingProvider.model !== "noop") {
-      const msgId = Number(result.lastInsertRowid);
       void this.embedMessage(msgId, content);
     }
+    return msgId;
   }
 
   private async embedMessage(messageId: number, content: string): Promise<void> {
@@ -187,14 +195,20 @@ export class ChatHistoryStore {
     return rows.map((row) => this.rowToEntry(row));
   }
 
+  /**
+   * Full-text search. The query is treated as plain words (each token quoted), the same as
+   * memory search, so FTS5 operators in user or agent text cannot cause syntax errors.
+   */
   search(
-    query: string,
+    rawQuery: string,
     opts?: {
       sessionKey?: string;
       limit?: number;
     },
   ): ChatHistoryEntry[] {
     const limit = opts?.limit ?? 20;
+    const query = sanitizeFTS5Query(rawQuery);
+    if (!query) return [];
 
     if (opts?.sessionKey) {
       const rows = this.db

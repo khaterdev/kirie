@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import pino from "pino";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelRegistry } from "../channels/registry.js";
@@ -8,8 +7,10 @@ import type { ChannelName } from "../channels/normalizer.js";
 import type { UsageDashboard } from "../logging/usage-dashboard.js";
 import type { ScheduleStore, WebhookFireEvent } from "../mcp/tools/schedule.js";
 import type { ProactiveEngine } from "../engine/proactive.js";
+import { createModuleLogger } from "../logging/logger.js";
+import { scrubSecrets } from "../security/secret-scrubber.js";
 
-const log = pino({ name: "gateway-routes" });
+const log = createModuleLogger("gateway-routes");
 
 /**
  * Dependencies injected into the gateway routes.
@@ -70,7 +71,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
         state: status.state,
         failureCount: status.failureCount,
         connectedAt: status.connectedAt ?? null,
-        lastError: status.lastError ?? null,
+        lastError: status.lastError != null ? scrubSecrets(status.lastError, { sink: "http" }) : null,
         running: deps.channelRegistry.isRunning(id),
       };
     }
@@ -513,7 +514,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
       }
     } catch (err) {
       log.error({ err }, "channel action failed");
-      const message = err instanceof Error ? err.message : "An internal error occurred";
+      const message = err instanceof Error ? scrubSecrets(err.message, { sink: "http" }) : "An internal error occurred";
       return c.json({ status: "error", message }, 500);
     }
   });

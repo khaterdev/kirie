@@ -212,4 +212,51 @@ describe("Gateway routes", () => {
       expect(body.total).toBe(0);
     });
   });
+
+  describe("secret scrubbing of HTTP responses", () => {
+    const token = (): string => ["gh", "p_", "Rt5Yu6Io7Pa8Sd9Fg0Hj1Kl2Zx3Cv4Bn5Mq6We7"].join("");
+    const MARK = "«redacted:github-token»";
+
+    it("scrubs lastError in GET /status", async () => {
+      const adapter = createMockAdapter("telegram");
+      adapter.getStatus = () => ({ state: "error", failureCount: 2, lastError: `401 for https://x/bot?token=${token()}` });
+      channelRegistry.register(adapter);
+      const res = await createRoutes(deps).request("/status");
+      const body = await res.json() as { channels: Record<string, { lastError: string }> };
+      expect(body.channels.telegram!.lastError).not.toContain(token());
+      expect(JSON.stringify(body)).not.toContain(token().slice(4));
+    });
+
+    it("scrubs the channel-action error message", async () => {
+      const adapter = createMockAdapter("telegram");
+      adapter.sendText = async () => {
+        throw new Error(`send failed with ${token()}`);
+      };
+      channelRegistry.register(adapter);
+      const res = await createRoutes(deps).request("/api/channel-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "telegram", action: "send_text", chatId: "1", text: "hello" }),
+      });
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ status: "error", message: `send failed with ${MARK}` });
+    });
+
+    it("scrubs text sent through /api/channel-action (adapter proxy)", async () => {
+      const sent: string[] = [];
+      const adapter = createMockAdapter("telegram");
+      adapter.sendText = async (p) => {
+        sent.push(p.text);
+        return [];
+      };
+      channelRegistry.register(adapter);
+      const res = await createRoutes(deps).request("/api/channel-action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "telegram", action: "send_text", chatId: "1", text: `key ${token()}` }),
+      });
+      expect(res.status).toBe(200);
+      expect(sent).toEqual([`key ${MARK}`]);
+    });
+  });
 });

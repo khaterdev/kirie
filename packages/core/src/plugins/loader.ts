@@ -4,6 +4,9 @@ import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import type { PluginDefinition, PluginFactory } from "./types.js";
 import type { HookRegistry } from "../hooks/registry.js";
+import { createModuleLogger } from "../logging/logger.js";
+
+const log = createModuleLogger("plugin-loader");
 
 const PLUGINS_DIR = join(homedir(), ".kirie", "plugins");
 
@@ -123,7 +126,7 @@ export class PluginLoader {
         const def = await this.loadPlugin(entry.name);
         definitions.push(def);
       } catch (error) {
-        console.error(`[PluginLoader] Failed to load plugin ${entry.name}:`, error);
+        log.error({ err: error, plugin: entry.name }, "failed to load plugin");
       }
     }
 
@@ -145,7 +148,7 @@ export class PluginLoader {
         const def = await this.loadPlugin(entry.package, entry.config);
         definitions.push(def);
       } catch (error) {
-        console.error(`[PluginLoader] Failed to load plugin ${entry.package}:`, error);
+        log.error({ err: error, plugin: entry.package }, "failed to load plugin");
       }
     }
 

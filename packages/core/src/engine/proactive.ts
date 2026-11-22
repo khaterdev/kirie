@@ -13,7 +13,6 @@
  */
 
 import { EventEmitter } from "node:events";
-import pino from "pino";
 import type { ProactiveConfig } from "../config/schema.js";
 import type { HeartbeatTickEvent, HeartbeatService } from "./heartbeat.js";
 import type {
@@ -30,8 +29,9 @@ import type { ChannelRegistry } from "../channels/registry.js";
 import type { SessionStore } from "./session-store.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { HeartbeatLogStore } from "../mcp/tools/heartbeat-logs.js";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "proactive" });
+const log = createModuleLogger("proactive");
 
 // ---------------------------------------------------------------------------
 // Events

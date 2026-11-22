@@ -1,11 +1,11 @@
-import pino from "pino";
 import type { UnifiedMessage } from "../channels/normalizer.js";
 import { IdentityResolver, type ResolvedIdentity } from "./auth.js";
 import { AuthorizationEngine, type AuthorizationResult } from "./authz.js";
 import { RateLimiter, type RateLimitResult } from "./rate-limiter.js";
 import { InputGuard, InputGuardError } from "./input-guard.js";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "security-gate" });
+const log = createModuleLogger("security-gate");
 
 /**
  * Per-channel security restrictions extracted from channel config.

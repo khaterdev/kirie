@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { EmbeddingProvider } from "./chat-history.js";
+import { getScrubber, SCRUB_WITHHELD } from "../../security/secret-scrubber.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "heartbeat-logs.db");
 
@@ -184,13 +185,36 @@ export class HeartbeatLogStore {
 
   /**
    * Insert a log entry if it meets the minimum level for its tier.
+   * Title, content and metadata are scrubbed for secrets before they are stored.
    * Fire-and-forget embedding on title + content.
    */
-  log(entry: HeartbeatLogInput): void {
-    const minLevel = this.minLevels[entry.tier];
-    if (!levelMeetsMin(entry.level, minLevel)) return;
+  log(rawEntry: HeartbeatLogInput): void {
+    const minLevel = this.minLevels[rawEntry.tier];
+    if (!levelMeetsMin(rawEntry.level, minLevel)) return;
 
-    const metadataStr = entry.metadata ? JSON.stringify(entry.metadata) : null;
+    const scrubber = getScrubber();
+    const entry: HeartbeatLogInput = {
+      ...rawEntry,
+      title: scrubber.scrub(rawEntry.title, { sink: "heartbeat-log" }),
+      content: scrubber.scrub(rawEntry.content, { sink: "heartbeat-log" }),
+    };
+    let metadataStr = rawEntry.metadata ? JSON.stringify(rawEntry.metadata) : null;
+    // Scrub structurally (keeps the JSON valid), and only when something would be redacted,
+    // so metadata without secrets is stored exactly as before.
+    if (metadataStr && scrubber.isSinkEnabled("heartbeat-log") && scrubber.detect(metadataStr).length > 0) {
+      metadataStr = JSON.stringify(scrubber.scrubDeep(rawEntry.metadata, { sink: "heartbeat-log" }));
+      // Belt and braces: anything the structural pass missed is scrubbed in the JSON text,
+      // and a result that is no longer valid JSON is withheld rather than stored.
+      if (scrubber.detect(metadataStr).length > 0) {
+        const flat = scrubber.scrub(metadataStr, { sink: "heartbeat-log" });
+        try {
+          JSON.parse(flat);
+          metadataStr = flat;
+        } catch {
+          metadataStr = JSON.stringify({ withheld: SCRUB_WITHHELD });
+        }
+      }
+    }
 
     const result = this.db
       .prepare(

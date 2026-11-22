@@ -5,6 +5,9 @@ import type {
   HookHandler,
   HookRegistration,
 } from "./types.js";
+import { createModuleLogger } from "../logging/logger.js";
+
+const log = createModuleLogger("hook-registry");
 
 const DEFAULT_HOOK_TIMEOUT_MS = 5_000;
 
@@ -116,9 +119,9 @@ export class HookRegistry {
         }
       } catch (error) {
         // Log but don't throw - a failing hook should not break the pipeline
-        console.error(
-          `[HookRegistry] Error in hook ${registration.id} (${registration.pluginName ?? "anonymous"}) for ${event.type}:`,
-          error,
+        log.error(
+          { err: error, hookId: registration.id, plugin: registration.pluginName ?? "anonymous", event: event.type },
+          "hook failed",
         );
       }
     }

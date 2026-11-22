@@ -5,14 +5,14 @@
  * TriageRunner and delivers messages through channel adapters.
  */
 
-import pino from "pino";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { Signal } from "./signals.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { HeartbeatService } from "./heartbeat.js";
 import { isTransientNetworkError } from "./network-errors.js";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "notifications" });
+const log = createModuleLogger("notifications");
 
 /**
  * Configuration for the NotificationManager.
