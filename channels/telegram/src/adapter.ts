@@ -14,7 +14,7 @@ import { readFile } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
 import { InputFile } from "grammy";
 import type { Bot } from "grammy";
-import type { InputMediaPhoto } from "grammy/types";
+import type { InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto } from "grammy/types";
 import type {
   ChannelAdapter,
   ChannelCapabilities,
@@ -29,10 +29,18 @@ import type {
   MessageListener,
   DownloadedMedia,
   UnifiedMedia,
+  ChannelContext,
+  InlineButton,
+  InteractionListener,
+  SendInteractiveParams,
+  UpdateInteractiveParams,
+  AckInteractionParams,
+  RegisterCommandsOptions,
 } from "@kirie/core";
 import { createBot, type TelegramBotConfig } from "./bot.js";
 import { validateBotToken } from "./auth.js";
 import {
+  TELEGRAM_ALLOWED_UPDATES,
   setWebhook,
   deleteWebhook,
   generateSecretToken,
@@ -41,6 +49,8 @@ import {
 } from "./webhook.js";
 
 const MAX_TEXT_LENGTH = 4000;
+/** Telegram's limit on callback_data. */
+const MAX_CALLBACK_DATA_BYTES = 64;
 
 /** Telegram's hosted Bot API. */
 export const DEFAULT_TELEGRAM_API_ROOT = "https://api.telegram.org";
@@ -83,7 +93,7 @@ export class TelegramAdapter implements ChannelAdapter {
     sendMedia: true,
     sendReaction: true,
     editMessage: true,
-    deleteMessage: false,
+    deleteMessage: true,
     sendTyping: true,
     threads: true,
     multipleImages: true,
@@ -91,6 +101,7 @@ export class TelegramAdapter implements ChannelAdapter {
     replyContext: true,
     voiceMessages: true,
     maxTextLength: MAX_TEXT_LENGTH,
+    interactiveButtons: true,
   };
 
   private bot: Bot | null = null;
@@ -100,8 +111,10 @@ export class TelegramAdapter implements ChannelAdapter {
   private lastError: string | undefined;
   private lastErrorAt: number | undefined;
   private readonly listeners: MessageListener[] = [];
+  private readonly interactionListeners: InteractionListener[] = [];
   private readonly config: TelegramAdapterConfig;
   private botId: number | undefined;
+  private botUsername: string | undefined;
   private webhookHandler:
     | ((body: unknown, secretHeader: string | null | undefined) => Promise<boolean>)
     | null = null;
@@ -119,6 +132,7 @@ export class TelegramAdapter implements ChannelAdapter {
       // Validate token and get bot info
       const botInfo = await validateBotToken(this.config.token, this.config.apiRoot);
       this.botId = botInfo.id;
+      this.botUsername = botInfo.username || undefined;
 
       const botConfig: TelegramBotConfig = {
         token: this.config.token,
@@ -126,7 +140,7 @@ export class TelegramAdapter implements ChannelAdapter {
         apiRoot: this.config.apiRoot,
       };
 
-      this.bot = createBot(botConfig, this.listeners);
+      this.bot = createBot(botConfig, this.listeners, this.interactionListeners);
 
       if (this.config.webhook) {
         // Webhook mode
@@ -145,7 +159,7 @@ export class TelegramAdapter implements ChannelAdapter {
           onStart: () => {
             // This callback fires when polling starts successfully
           },
-          allowed_updates: ["message", "edited_message", "message_reaction"],
+          allowed_updates: [...TELEGRAM_ALLOWED_UPDATES],
         });
       }
 
@@ -201,10 +215,28 @@ export class TelegramAdapter implements ChannelAdapter {
     this.listeners.push(listener);
   }
 
+  onInteraction(listener: InteractionListener): void {
+    this.interactionListeners.push(listener);
+  }
+
+  getSelf(): { id: string; username?: string } | null {
+    if (this.botId === undefined) return null;
+    return this.botUsername
+      ? { id: String(this.botId), username: this.botUsername }
+      : { id: String(this.botId) };
+  }
+
   async sendText(params: SendTextParams): Promise<SentMessage[]> {
     this.ensureConnected();
     const chunks = chunkText(params.text, MAX_TEXT_LENGTH);
     const results: SentMessage[] = [];
+
+    if (params.plain) {
+      for (const chunk of chunks) {
+        results.push(await this.sendPlainChunk(params.ctx, chunk));
+      }
+      return results;
+    }
 
     for (const chunk of chunks) {
       const threadOpts = params.ctx.threadId
@@ -289,6 +321,110 @@ export class TelegramAdapter implements ChannelAdapter {
     }
 
     return results;
+  }
+
+  /**
+   * Send one chunk with no parse mode. When replying fails, retry without
+   * reply_parameters so the message is not lost.
+   */
+  private async sendPlainChunk(
+    ctx: ChannelContext,
+    text: string,
+    extra: { reply_markup?: InlineKeyboardMarkup } = {},
+  ): Promise<SentMessage> {
+    const threadOpts = ctx.threadId ? { message_thread_id: Number(ctx.threadId) } : {};
+    const replyOpts = ctx.replyToId ? { reply_parameters: { message_id: Number(ctx.replyToId) } } : {};
+    let sent;
+    try {
+      sent = await this.bot!.api.sendMessage(ctx.chatId, text, { ...replyOpts, ...threadOpts, ...extra });
+    } catch (err) {
+      if (!ctx.replyToId) throw err;
+      sent = await this.bot!.api.sendMessage(ctx.chatId, text, { ...threadOpts, ...extra });
+    }
+    return { id: String(sent.message_id), timestamp: sent.date * 1000 };
+  }
+
+  async sendInteractive(params: SendInteractiveParams): Promise<SentMessage> {
+    this.ensureConnected();
+    const reply_markup = toInlineKeyboard(params.buttons);
+    const chunks = chunkText(params.text, MAX_TEXT_LENGTH);
+    const last = chunks.pop() ?? "";
+    // Long text: earlier chunks go first, the buttons ride on the last one.
+    if (chunks.length > 0) {
+      await this.sendText({ ctx: params.ctx, text: chunks.join("\n"), plain: params.plain });
+    }
+    if (params.plain) {
+      return this.sendPlainChunk(params.ctx, last, { reply_markup });
+    }
+    const threadOpts = params.ctx.threadId ? { message_thread_id: Number(params.ctx.threadId) } : {};
+    const replyOpts = params.ctx.replyToId
+      ? { reply_parameters: { message_id: Number(params.ctx.replyToId) } }
+      : {};
+    try {
+      const sent = await this.bot!.api.sendMessage(params.ctx.chatId, last, {
+        ...replyOpts,
+        ...threadOpts,
+        reply_markup,
+        parse_mode: "Markdown",
+      });
+      return { id: String(sent.message_id), timestamp: sent.date * 1000 };
+    } catch (err) {
+      if (!isParseError(err)) throw err;
+      return this.sendPlainChunk(params.ctx, last, { reply_markup });
+    }
+  }
+
+  async updateInteractive(params: UpdateInteractiveParams): Promise<void> {
+    this.ensureConnected();
+    const chatId = params.ctx.chatId;
+    const messageId = Number(params.messageId);
+    const reply_markup =
+      params.buttons === null
+        ? { inline_keyboard: [] }
+        : params.buttons
+          ? toInlineKeyboard(params.buttons)
+          : undefined;
+    try {
+      if (params.text !== undefined) {
+        const text = params.text.length > MAX_TEXT_LENGTH
+          ? params.text.slice(0, MAX_TEXT_LENGTH - 1) + "…"
+          : params.text;
+        const opts = reply_markup ? { reply_markup } : {};
+        if (params.plain) {
+          await this.bot!.api.editMessageText(chatId, messageId, text, opts);
+        } else {
+          try {
+            await this.bot!.api.editMessageText(chatId, messageId, text, { ...opts, parse_mode: "Markdown" });
+          } catch (err) {
+            if (!isParseError(err)) throw err;
+            await this.bot!.api.editMessageText(chatId, messageId, text, opts);
+          }
+        }
+      } else if (reply_markup) {
+        await this.bot!.api.editMessageReplyMarkup(chatId, messageId, { reply_markup });
+      }
+    } catch (err) {
+      // Editing to identical content is not a failure.
+      if (err instanceof Error && err.message.includes("message is not modified")) return;
+      throw err;
+    }
+  }
+
+  async ackInteraction(params: AckInteractionParams): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.api.answerCallbackQuery(params.interactionId, {
+        ...(params.text ? { text: params.text.slice(0, 200) } : {}),
+        ...(params.alert ? { show_alert: true } : {}),
+      });
+    } catch {
+      // "query is too old" and similar: the press can no longer be acknowledged.
+    }
+  }
+
+  async deleteMessage(params: { ctx: ChannelContext; messageId: string }): Promise<void> {
+    this.ensureConnected();
+    await this.bot!.api.deleteMessage(params.ctx.chatId, Number(params.messageId));
   }
 
   async sendTyping(params: SendTypingParams): Promise<void> {
@@ -460,14 +596,21 @@ export class TelegramAdapter implements ChannelAdapter {
     return { buffer, mimeType, filename };
   }
 
-  async registerCommands(commands: Array<{ command: string; description: string }>): Promise<void> {
+  async registerCommands(
+    commands: Array<{ command: string; description: string }>,
+    opts?: RegisterCommandsOptions,
+  ): Promise<void> {
     this.ensureConnected();
-    await this.bot!.api.setMyCommands(
-      commands.map((c) => ({
-        command: c.command,
-        description: c.description,
-      })),
-    );
+    const list = commands.map((c) => ({
+      command: c.command,
+      description: c.description,
+    }));
+    if (opts?.chatId) {
+      const chatId = /^-?\d+$/.test(opts.chatId) ? Number(opts.chatId) : opts.chatId;
+      await this.bot!.api.setMyCommands(list, { scope: { type: "chat", chat_id: chatId } });
+      return;
+    }
+    await this.bot!.api.setMyCommands(list);
   }
 
   /**
@@ -491,6 +634,36 @@ export class TelegramAdapter implements ChannelAdapter {
       throw new Error("Telegram adapter is not connected");
     }
   }
+}
+
+function isParseError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("can't parse entities");
+}
+
+/**
+ * Convert rows of InlineButton into Telegram's inline keyboard.
+ * Throws on a button with neither or both of data/url, or data over 64 bytes.
+ */
+export function toInlineKeyboard(rows: readonly (readonly InlineButton[])[]): InlineKeyboardMarkup {
+  const inline_keyboard: InlineKeyboardButton[][] = [];
+  for (const row of rows) {
+    const out: InlineKeyboardButton[] = [];
+    for (const b of row) {
+      const hasData = typeof b.data === "string";
+      const hasUrl = typeof b.url === "string";
+      if (hasData === hasUrl) throw new Error(`Button "${b.label}" needs exactly one of data or url`);
+      if (hasData) {
+        if (Buffer.byteLength(b.data!, "utf8") > MAX_CALLBACK_DATA_BYTES) {
+          throw new Error(`Button "${b.label}" callback data exceeds ${MAX_CALLBACK_DATA_BYTES} bytes`);
+        }
+        out.push({ text: b.label, callback_data: b.data! });
+      } else {
+        out.push({ text: b.label, url: b.url! });
+      }
+    }
+    if (out.length > 0) inline_keyboard.push(out);
+  }
+  return { inline_keyboard };
 }
 
 function guessMimeType(ext: string): string {

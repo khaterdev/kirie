@@ -5,7 +5,13 @@
 
 import { Bot, type Context } from "grammy";
 import type { ReactionTypeEmoji } from "grammy/types";
-import type { UnifiedMessage, MessageListener, ChatType } from "@kirie/core";
+import type {
+  UnifiedMessage,
+  MessageListener,
+  ChatType,
+  UnifiedInteraction,
+  InteractionListener,
+} from "@kirie/core";
 import { makeDisplayName, makeSenderId } from "./auth.js";
 
 /** Configuration for the Telegram bot */
@@ -167,13 +173,43 @@ function extractMedia(msg: NonNullable<Context["message"]>): TelegramMediaInfo[]
 }
 
 /**
+ * Normalize a callback query (inline button press) into a UnifiedInteraction.
+ * Null when the press has no data or no originating message (inline-mode
+ * messages), which Kirie never sends.
+ */
+export function normalizeCallbackQuery(ctx: Context): UnifiedInteraction | null {
+  const cq = ctx.callbackQuery;
+  if (!cq || typeof cq.data !== "string" || !cq.from) return null;
+  const msg = cq.message;
+  if (!msg) return null;
+  return {
+    id: cq.id,
+    channel: "telegram",
+    senderId: makeSenderId(cq.from.id),
+    senderName: makeDisplayName(cq.from.first_name, cq.from.last_name, cq.from.username),
+    chatId: String(msg.chat.id),
+    chatType: resolveChatType(msg.chat.type),
+    messageId: String(msg.message_id),
+    data: cq.data,
+    timestamp: Date.now(),
+    raw: cq,
+  };
+}
+
+/**
  * Create and configure a Grammy Bot with the Kirie middleware pipeline.
  *
  * @param config - Bot configuration
  * @param listeners - Message listeners to invoke on incoming messages
+ * @param interactionListeners - Listeners for inline button presses. Whether a
+ *   press is honoured is decided by the core InteractionRouter, not here.
  * @returns The configured Bot instance
  */
-export function createBot(config: TelegramBotConfig, listeners: MessageListener[]): Bot {
+export function createBot(
+  config: TelegramBotConfig,
+  listeners: MessageListener[],
+  interactionListeners: InteractionListener[] = [],
+): Bot {
   const bot = config.apiRoot
     ? new Bot(config.token, { client: { apiRoot: config.apiRoot } })
     : new Bot(config.token);
@@ -251,6 +287,23 @@ export function createBot(config: TelegramBotConfig, listeners: MessageListener[
         for (const l of listeners) {
           void Promise.resolve(l(unified)).catch(() => {});
         }
+      }
+    }
+  });
+
+  // Handle inline button presses
+  bot.on("callback_query:data", (ctx) => {
+    const interaction = normalizeCallbackQuery(ctx);
+    if (!interaction || interactionListeners.length === 0) {
+      // Nobody will acknowledge it: stop the client's spinner here.
+      void Promise.resolve(ctx.answerCallbackQuery()).catch(() => {});
+      return;
+    }
+    for (const l of interactionListeners) {
+      try {
+        void Promise.resolve(l(interaction)).catch(() => {});
+      } catch {
+        // A listener bug must not stop the other listeners.
       }
     }
   });

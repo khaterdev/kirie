@@ -7,6 +7,14 @@
 import type { Bot } from "grammy";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 
+/** Update types Kirie subscribes to, in polling and webhook mode alike. */
+export const TELEGRAM_ALLOWED_UPDATES = [
+  "message",
+  "edited_message",
+  "message_reaction",
+  "callback_query",
+] as const;
+
 /** Webhook configuration */
 export interface WebhookConfig {
   /** Public URL where the webhook is accessible */
@@ -47,7 +55,7 @@ export function generateSecretToken(): string {
 export async function setWebhook(bot: Bot, config: WebhookConfig): Promise<void> {
   await bot.api.setWebhook(config.url, {
     secret_token: config.secretToken,
-    allowed_updates: ["message", "edited_message", "message_reaction"],
+    allowed_updates: [...TELEGRAM_ALLOWED_UPDATES],
   });
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { UnifiedMessage, MessageListener } from "@kirie/core";
+import type { UnifiedMessage, MessageListener, UnifiedInteraction } from "@kirie/core";
 
 // Mock the Grammy Bot class
 const mockOn = vi.fn();
@@ -442,5 +442,87 @@ describe("Telegram bot", () => {
 
     const msg: UnifiedMessage = listener.mock.calls[0]![0];
     expect(msg.senderName).toBe("@testbot");
+  });
+
+  describe("callback queries", () => {
+    function callbackHandler(): (ctx: unknown) => Promise<void> | void {
+      const call = mockOn.mock.calls.find((c) => c[0] === "callback_query:data");
+      expect(call).toBeDefined();
+      return call![1] as (ctx: unknown) => Promise<void> | void;
+    }
+
+    function cbCtx(over: Record<string, unknown> = {}) {
+      const answerCallbackQuery = vi.fn(async () => true);
+      return {
+        answerCallbackQuery,
+        callbackQuery: {
+          id: "cbq-1",
+          from: { id: 1001, first_name: "Owner", username: "own" },
+          data: "k1|ask|0123456789abcdef:approve",
+          message: { message_id: 77, date: 1700000000, chat: { id: 1001, type: "private" } },
+          ...over,
+        },
+      };
+    }
+
+    it("registers a callback_query:data handler after the message handlers", () => {
+      createBot({ token: "test-token" }, []);
+      expect(mockOn.mock.calls[0]![0]).toEqual(["message", "edited_message"]);
+      expect(mockOn.mock.calls.map((c) => c[0])).toContain("callback_query:data");
+    });
+
+    it("normalizes a press into a UnifiedInteraction and fans out to interaction listeners", async () => {
+      const onInteraction = vi.fn();
+      const onMessage = vi.fn();
+      createBot({ token: "test-token", botId: 999 }, [onMessage], [onInteraction]);
+      const ctx = cbCtx();
+      await callbackHandler()(ctx);
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(onInteraction).toHaveBeenCalledTimes(1);
+      const i: UnifiedInteraction = onInteraction.mock.calls[0]![0];
+      expect(i).toMatchObject({
+        id: "cbq-1",
+        channel: "telegram",
+        senderId: "1001",
+        senderName: "Owner",
+        chatId: "1001",
+        chatType: "dm",
+        messageId: "77",
+        data: "k1|ask|0123456789abcdef:approve",
+      });
+      // The router acks, not the bot.
+      expect(ctx.answerCallbackQuery).not.toHaveBeenCalled();
+    });
+
+    it("reports group presses as group chat type", async () => {
+      const onInteraction = vi.fn();
+      createBot({ token: "test-token" }, [], [onInteraction]);
+      await callbackHandler()(cbCtx({ message: { message_id: 5, date: 1, chat: { id: -100123, type: "supergroup" } } }));
+      expect(onInteraction.mock.calls[0]![0]).toMatchObject({ chatType: "group", chatId: "-100123" });
+    });
+
+    it("acks presses itself when no interaction listener is registered", async () => {
+      createBot({ token: "test-token" }, []);
+      const ctx = cbCtx();
+      await callbackHandler()(ctx);
+      expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it("acks and drops presses with no originating message (inline mode)", async () => {
+      const onInteraction = vi.fn();
+      createBot({ token: "test-token" }, [], [onInteraction]);
+      const ctx = cbCtx({ message: undefined, inline_message_id: "im-1" });
+      await callbackHandler()(ctx);
+      expect(onInteraction).not.toHaveBeenCalled();
+      expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not let a throwing listener break the others", async () => {
+      const bad = vi.fn(() => { throw new Error("boom"); });
+      const good = vi.fn();
+      createBot({ token: "test-token" }, [], [bad, good]);
+      await callbackHandler()(cbCtx());
+      expect(good).toHaveBeenCalledTimes(1);
+    });
   });
 });

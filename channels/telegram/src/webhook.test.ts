@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
-import { verifySecretToken, generateSecretToken } from "./webhook.js";
+import { describe, it, expect, vi } from "vitest";
+import type { Bot } from "grammy";
+import { verifySecretToken, generateSecretToken, setWebhook, TELEGRAM_ALLOWED_UPDATES } from "./webhook.js";
 
 describe("Telegram webhook", () => {
   describe("verifySecretToken", () => {
@@ -39,6 +40,19 @@ describe("Telegram webhook", () => {
       const t1 = generateSecretToken();
       const t2 = generateSecretToken();
       expect(t1).not.toBe(t2);
+    });
+  });
+
+  describe("setWebhook", () => {
+    it("subscribes to callback queries alongside the existing update types", async () => {
+      const setWebhookApi = vi.fn(async () => true);
+      const bot = { api: { setWebhook: setWebhookApi } } as unknown as Bot;
+      await setWebhook(bot, { url: "https://example.test/tg", secretToken: "s" });
+      expect(setWebhookApi).toHaveBeenCalledWith("https://example.test/tg", {
+        secret_token: "s",
+        allowed_updates: ["message", "edited_message", "message_reaction", "callback_query"],
+      });
+      expect([...TELEGRAM_ALLOWED_UPDATES]).toEqual(["message", "edited_message", "message_reaction", "callback_query"]);
     });
   });
 });
