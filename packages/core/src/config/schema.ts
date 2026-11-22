@@ -1,4 +1,23 @@
 import { z } from "zod/v3";
+import { CommandsConfigSchema } from "./sections/commands.js";
+import { FallbackConfigSchema } from "./sections/fallback.js";
+import { AccountsConfigSchema } from "./sections/accounts.js";
+import { IngressConfigSchema } from "./sections/ingress.js";
+import { WebhooksConfigSchema } from "./sections/webhooks.js";
+import { ScrubbingConfigSchema } from "./sections/scrubbing.js";
+import { LearningConfigSchema } from "./sections/learning.js";
+import { CuratorConfigSchema } from "./sections/curator.js";
+import { UserModelConfigSchema } from "./sections/usermodel.js";
+import { GoalsConfigSchema } from "./sections/goals.js";
+import { LoopsConfigSchema } from "./sections/loops.js";
+import { ApprovalsConfigSchema } from "./sections/approvals.js";
+import { SandboxConfigSchema } from "./sections/sandbox.js";
+import { UndoConfigSchema } from "./sections/undo.js";
+import { ComputerUseConfigSchema } from "./sections/computer-use.js";
+import { VoiceConfigSchema } from "./sections/voice.js";
+import { PluginsConfigSchema } from "./sections/plugins.js";
+
+export * from "./sections/index.js";
 
 /**
  * A string value that may contain a $credential:key reference,
@@ -34,6 +53,14 @@ export const AgentConfigSchema = z.object({
   sessionIdleTimeoutMs: z.number().int().min(10_000).default(600_000),
   /** v2 only: maximum concurrent live sessions before evicting the oldest idle one. */
   maxSessions: z.number().int().min(1).default(20),
+  /**
+   * Pass strictMcpConfig to chat and task sessions, so only Kirie's own MCP
+   * servers load (user-scope servers and claude.ai connectors do not).
+   * Off by default: Kirie inherits user-scope MCP servers today (DECISIONS 6).
+   */
+  strictMcpConfig: z.boolean().default(false),
+  /** Fallback model chain (item 2). */
+  fallback: FallbackConfigSchema,
 });
 
 // ── Security ─────────────────────────────────────────────────────────────────
@@ -61,6 +88,8 @@ export const SecurityConfigSchema = z.object({
     perUser: RateLimitBucketSchema.default({ maxRequests: 30, windowMs: 60_000 }),
     perGroup: RateLimitBucketSchema.default({ maxRequests: 60, windowMs: 60_000 }),
   }).default({}),
+  /** Secret scrubbing (item 12). Read once at process start. */
+  scrubbing: ScrubbingConfigSchema,
 });
 
 // ── Channels ─────────────────────────────────────────────────────────────────
@@ -170,14 +199,12 @@ export const GatewayConfigSchema = z.object({
   port: z.number().int().min(1).max(65535).default(18789),
   bind: z.enum(["loopback", "all"]).default("loopback"),
   bearerToken: credentialRef.optional(),
-});
-
-// ── Plugins ──────────────────────────────────────────────────────────────────
-
-const PluginEntrySchema = z.object({
-  package: z.string(),
-  enabled: z.boolean().default(true),
-  config: z.record(z.unknown()).default({}),
+  /**
+   * Extra Host header values accepted on the loopback control plane, e.g.
+   * "kirie.local:18789". The defaults 127.0.0.1:<port>, localhost:<port> and
+   * [::1]:<port> are always accepted.
+   */
+  extraAllowedHosts: z.array(z.string()).default([]),
 });
 
 // ── Multi-Agent ─────────────────────────────────────────────────────────────
@@ -250,27 +277,6 @@ const MediaUnderstandingSchema = z.object({
   }).default({}),
 }).default({});
 
-// -- Voice ----------------------------------------------------------------
-
-const VoiceConfigSchema = z.object({
-  enabled: z.boolean().default(false),
-  provider: z.enum(["twilio"]).default("twilio"),
-  twilio: z.object({
-    accountSid: z.string().optional(),
-    authToken: z.string().optional(),
-    fromNumber: z.string().optional(),
-  }).default({}),
-  maxConcurrentCalls: z.number().int().min(1).default(3),
-  tts: z.object({
-    provider: z.enum(["openai", "elevenlabs", "edge"]).default("openai"),
-    voice: z.string().default("alloy"),
-  }).default({}),
-  stt: z.object({
-    provider: z.enum(["openai", "groq"]).default("openai"),
-    model: z.string().default("whisper-1"),
-  }).default({}),
-}).default({});
-
 // ── Logging ─────────────────────────────────────────────────────────────────
 
 const LoggingConfigSchema = z.object({
@@ -292,26 +298,6 @@ const RoutingConfigSchema = z.object({
       chatId: z.string(),
     })),
   })).default({}),
-}).default({});
-
-// ── Sandbox ─────────────────────────────────────────────────────────────────
-
-const SandboxConfigSchema = z.object({
-  mode: z.enum(["off", "docker"]).default("off"),
-  scope: z.enum(["shared", "agent", "session"]).default("agent"),
-  workspaceAccess: z.enum(["rw", "none"]).default("rw"),
-  docker: z.object({
-    image: z.string().default("kirie-sandbox:latest"),
-    readOnlyRoot: z.boolean().default(true),
-    network: z.enum(["none", "bridge", "host"]).default("none"),
-    capDrop: z.array(z.string()).default(["ALL"]),
-    memory: z.string().default("512m"),
-    cpus: z.number().default(1),
-  }).default({}),
-  prune: z.object({
-    idleHours: z.number().default(24),
-    maxAgeDays: z.number().default(7),
-  }).default({}),
 }).default({});
 
 // ── Nodes ───────────────────────────────────────────────────────────────────
@@ -357,6 +343,8 @@ export const ProactiveConfigSchema = z.object({
   enabled: z.boolean().default(true),
   /** Interval in minutes between Tier 2 triage runs */
   tier2IntervalMinutes: z.number().default(15),
+  /** Largest HEARTBEAT.md checklist the triage reads, in bytes. */
+  maxChecklistBytes: z.number().int().min(512).max(65_536).default(8192),
   /** Model to use for Tier 2 triage (fast, cheap) */
   tier2Model: z.string().default("claude-haiku-4-5"),
   /** Model to use for Tier 3 escalation (deep reasoning) */
@@ -439,7 +427,7 @@ export const KirieConfigSchema = z.object({
   channels: ChannelsConfigSchema.default({}),
   memory: MemoryConfigSchema.default({}),
   gateway: GatewayConfigSchema.default({}),
-  plugins: z.array(PluginEntrySchema).default([]),
+  plugins: PluginsConfigSchema,
   agents: z.array(AgentDefinitionSchema).default([]),
   canvas: CanvasConfigSchema.default({}),
   tools: ToolsConfigSchema,
@@ -455,22 +443,42 @@ export const KirieConfigSchema = z.object({
   mcpServers: McpServersConfigSchema,
   /** Message-level settings (TTS, etc.) */
   messages: MessagesConfigSchema,
+  // Hermes-parity sections (PLAN B.11). Each lives in config/sections/<name>.ts.
+  commands: CommandsConfigSchema,
+  accounts: AccountsConfigSchema,
+  ingress: IngressConfigSchema,
+  webhooks: WebhooksConfigSchema,
+  learning: LearningConfigSchema,
+  curator: CuratorConfigSchema,
+  userModel: UserModelConfigSchema,
+  goals: GoalsConfigSchema,
+  loops: LoopsConfigSchema,
+  approvals: ApprovalsConfigSchema,
+  undo: UndoConfigSchema,
+  computerUse: ComputerUseConfigSchema,
 });
 
 export type KirieConfig = z.infer<typeof KirieConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
-export type SecurityConfig = z.infer<typeof SecurityConfigSchema>;
+/**
+ * Keys added by the Hermes-parity program are optional on the standalone
+ * section types (they are always present on a parsed `KirieConfig`), so code
+ * and fixtures that build these objects by hand keep compiling.
+ */
+export type SecurityConfig = Omit<z.infer<typeof SecurityConfigSchema>, "scrubbing"> & {
+  scrubbing?: z.infer<typeof ScrubbingConfigSchema>;
+};
 export type ChannelsConfig = z.infer<typeof ChannelsConfigSchema>;
 export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
 export type GatewayConfig = z.infer<typeof GatewayConfigSchema>;
 export type LoggingConfig = z.infer<typeof LoggingConfigSchema>;
 export type MediaUnderstandingConfig = z.infer<typeof MediaUnderstandingSchema>;
-export type VoiceConfig = z.infer<typeof VoiceConfigSchema>;
 export type ToolsConfig = z.infer<typeof ToolsConfigSchema>;
 export type RoutingConfig = z.infer<typeof RoutingConfigSchema>;
-export type SandboxSchemaConfig = z.infer<typeof SandboxConfigSchema>;
 export type NodesConfig = z.infer<typeof NodesConfigSchema>;
-export type ProactiveConfig = z.infer<typeof ProactiveConfigSchema>;
+export type ProactiveConfig = Omit<z.infer<typeof ProactiveConfigSchema>, "maxChecklistBytes"> & {
+  maxChecklistBytes?: number;
+};
 export type BrowserConfig = z.infer<typeof BrowserConfigSchema>;
 export type McpServerEntry = z.infer<typeof McpServerEntrySchema>;
 export type McpServersConfig = z.infer<typeof McpServersConfigSchema>;
