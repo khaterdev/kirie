@@ -38,6 +38,7 @@ channels:
     token: "$credential:telegram.bot_token"
     # webhookUrl: "https://example.com/webhooks/telegram"  # Use webhook instead of polling
     # pollingTimeout: 30           # Long-polling timeout in seconds
+    # apiRoot: "http://127.0.0.1:8081"  # Self-hosted telegram-bot-api (2 GB files). See docs/telegram-local-bot-api.md
     # allowedUserIds: [123456789]  # Only allow these user IDs (empty = global policy)
     # allowGroups: true            # Whether bot responds in group chats
     # allowAddToGroups: true       # Whether bot can be added to new groups

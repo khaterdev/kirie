@@ -10,6 +10,8 @@
  *   - Typing indicators
  */
 
+import { readFile } from "node:fs/promises";
+import { basename, isAbsolute } from "node:path";
 import { InputFile } from "grammy";
 import type { Bot } from "grammy";
 import type { InputMediaPhoto } from "grammy/types";
@@ -40,12 +42,39 @@ import {
 
 const MAX_TEXT_LENGTH = 4000;
 
+/** Telegram's hosted Bot API. */
+export const DEFAULT_TELEGRAM_API_ROOT = "https://api.telegram.org";
+
 /** Configuration for the Telegram adapter */
 export interface TelegramAdapterConfig {
   /** Bot API token */
   token: string;
   /** Use webhook mode instead of polling */
   webhook?: WebhookConfig;
+  /**
+   * Custom Bot API root, e.g. "http://127.0.0.1:8081" for a self-hosted
+   * telegram-bot-api server. Raises the download limit from 20 MB to 2 GB.
+   * When the server runs with --local, getFile returns an absolute path on
+   * this machine and files are read from disk. Unset = api.telegram.org.
+   */
+  apiRoot?: string;
+}
+
+/**
+ * Resolve where to fetch a file returned by getFile.
+ *
+ * - Local-mode server: `file_path` is an absolute path on disk.
+ * - Cloud (or non-local self-hosted) server: `file_path` is relative and is
+ *   served under `<apiRoot>/file/bot<token>/<file_path>`.
+ */
+export function resolveTelegramFileSource(
+  filePath: string,
+  token: string,
+  apiRoot?: string,
+): { kind: "disk"; path: string } | { kind: "url"; url: string } {
+  if (isAbsolute(filePath)) return { kind: "disk", path: filePath };
+  const root = (apiRoot ?? DEFAULT_TELEGRAM_API_ROOT).replace(/\/+$/, "");
+  return { kind: "url", url: `${root}/file/bot${token}/${filePath}` };
 }
 
 export class TelegramAdapter implements ChannelAdapter {
@@ -88,12 +117,13 @@ export class TelegramAdapter implements ChannelAdapter {
 
     try {
       // Validate token and get bot info
-      const botInfo = await validateBotToken(this.config.token);
+      const botInfo = await validateBotToken(this.config.token, this.config.apiRoot);
       this.botId = botInfo.id;
 
       const botConfig: TelegramBotConfig = {
         token: this.config.token,
         botId: this.botId,
+        apiRoot: this.config.apiRoot,
       };
 
       this.bot = createBot(botConfig, this.listeners);
@@ -398,16 +428,32 @@ export class TelegramAdapter implements ChannelAdapter {
     this.ensureConnected();
     // Telegram media URLs are file_ids, not HTTP URLs.
     // We need to resolve them via the Bot API.
-    const file = await this.bot!.api.getFile(media.url);
+    let file: Awaited<ReturnType<Bot["api"]["getFile"]>>;
+    try {
+      file = await this.bot!.api.getFile(media.url);
+    } catch (err) {
+      // Name the actual limit so the agent can tell the sender what happened.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/file is too big/i.test(msg)) {
+        const limit = this.config.apiRoot ? "2 GB, local Bot API server" : "20 MB";
+        throw new Error(`file is too big (Telegram bot limit ${limit})`, { cause: err });
+      }
+      throw err;
+    }
     const filePath = file.file_path;
     if (!filePath) throw new Error("Telegram getFile returned no file_path");
 
-    const downloadUrl = `https://api.telegram.org/file/bot${this.config.token}/${filePath}`;
-    const resp = await fetch(downloadUrl);
-    if (!resp.ok) throw new Error(`Failed to download Telegram file: ${resp.statusText}`);
+    const source = resolveTelegramFileSource(filePath, this.config.token, this.config.apiRoot);
+    let buffer: Buffer;
+    if (source.kind === "disk") {
+      buffer = await readFile(source.path);
+    } else {
+      const resp = await fetch(source.url);
+      if (!resp.ok) throw new Error(`Failed to download Telegram file: ${resp.statusText}`);
+      buffer = Buffer.from(await resp.arrayBuffer());
+    }
 
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    const ext = filePath.split(".").pop() ?? "bin";
+    const ext = basename(filePath).split(".").pop() ?? "bin";
     const filename = media.filename ?? `telegram-${Date.now()}.${ext}`;
     const mimeType = media.mimeType ?? guessMimeType(ext);
 

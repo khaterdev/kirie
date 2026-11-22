@@ -14,6 +14,8 @@ export interface TelegramBotConfig {
   token: string;
   /** Bot's own user ID, set after getMe() */
   botId?: number;
+  /** Custom Bot API root (self-hosted telegram-bot-api server). Default: api.telegram.org */
+  apiRoot?: string;
 }
 
 /**
@@ -172,7 +174,9 @@ function extractMedia(msg: NonNullable<Context["message"]>): TelegramMediaInfo[]
  * @returns The configured Bot instance
  */
 export function createBot(config: TelegramBotConfig, listeners: MessageListener[]): Bot {
-  const bot = new Bot(config.token);
+  const bot = config.apiRoot
+    ? new Bot(config.token, { client: { apiRoot: config.apiRoot } })
+    : new Bot(config.token);
 
   // Handle text messages, photos, videos, etc.
   bot.on(["message", "edited_message"], (ctx) => {

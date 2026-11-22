@@ -6,15 +6,16 @@ import { Bot } from "grammy";
 
 /**
  * Validate a bot token by calling getMe().
+ * @param apiRoot - Optional custom Bot API root (self-hosted telegram-bot-api server).
  * @returns The bot's user info if valid.
  * @throws If the token is invalid or the API is unreachable.
  */
-export async function validateBotToken(token: string): Promise<{
+export async function validateBotToken(token: string, apiRoot?: string): Promise<{
   id: number;
   username: string;
   firstName: string;
 }> {
-  const bot = new Bot(token);
+  const bot = apiRoot ? new Bot(token, { client: { apiRoot } }) : new Bot(token);
   const me = await bot.api.getMe();
   return {
     id: me.id,

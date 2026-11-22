@@ -80,6 +80,15 @@ const TelegramChannelSchema = z.object({
   token: credentialRef.optional(),
   webhookUrl: z.string().url().optional(),
   pollingTimeout: z.number().int().positive().default(30),
+  /**
+   * Custom Bot API root for a self-hosted telegram-bot-api server, e.g.
+   * "http://127.0.0.1:8081". Lifts the 20 MB download limit to 2 GB.
+   * Unset = Telegram's cloud API (api.telegram.org). Before switching a bot to
+   * a local server, call logOut once on the cloud API (see docs/telegram-local-bot-api.md).
+   */
+  apiRoot: z.string().url()
+    .refine((v) => /^https?:\/\//i.test(v), "apiRoot must be an http(s) URL, e.g. http://127.0.0.1:8081")
+    .optional(),
   ...ChannelSecurityFields,
 });
 

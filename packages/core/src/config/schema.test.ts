@@ -133,6 +133,23 @@ describe("ChannelsConfigSchema", () => {
     expect(result.telegram.webhookUrl).toBe("https://example.com/webhook");
   });
 
+  it("leaves telegram apiRoot unset by default (cloud Bot API)", () => {
+    const result = ChannelsConfigSchema.parse({});
+    expect(result.telegram.apiRoot).toBeUndefined();
+  });
+
+  it("accepts a self-hosted telegram apiRoot", () => {
+    const result = ChannelsConfigSchema.parse({
+      telegram: { apiRoot: "http://127.0.0.1:8081" },
+    });
+    expect(result.telegram.apiRoot).toBe("http://127.0.0.1:8081");
+  });
+
+  it("rejects an invalid or scheme-less telegram apiRoot", () => {
+    expect(() => ChannelsConfigSchema.parse({ telegram: { apiRoot: "not a url" } })).toThrow();
+    expect(() => ChannelsConfigSchema.parse({ telegram: { apiRoot: "localhost:8081" } })).toThrow();
+  });
+
   it("rejects invalid webhook URL", () => {
     expect(() =>
       ChannelsConfigSchema.parse({
