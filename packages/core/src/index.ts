@@ -22,6 +22,7 @@ export * from "./engine/failure.js";
 export * from "./engine/reset-time.js";
 export * from "./engine/oneshot.js";
 export * from "./engine/agent-errors.js";
+export * from "./engine/prompt-addenda.js";
 // prompt-builder: ChannelContext renamed to PromptChannelContext to avoid collision with adapter.ts
 export {
   type ChannelContext as PromptChannelContext,

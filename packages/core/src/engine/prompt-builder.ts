@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
+import { appendPromptAddenda, type PromptAddendaRenderer } from "./prompt-addenda.js";
 
 /**
  * Channel context passed into the prompt builder to give the agent
@@ -43,6 +44,8 @@ export interface PromptConfig {
   dataDir?: string;
   /** IANA timezone for current time display (e.g. "Africa/Cairo") */
   timezone?: string;
+  /** Feature prompt additions (PLAN B.10 seam 7), appended at the end of the prompt */
+  addenda?: PromptAddendaRenderer;
 }
 
 /**
@@ -371,11 +374,9 @@ Session & Channel Tools:
 - gateway_config_reload — hot-reload configuration
 - gateway_restart — full daemon restart (stops everything, re-reads config, reconnects channels, re-initializes all subsystems). Use this after you make changes to config, skills, SOUL.md, or other files that need a restart to take effect. The process stays alive.
 
-Auto-Reply Commands (handled before agent, no AI invocation):
-- Users can type /help, /status, /sessions, /channels for quick info
-- /restart triggers a full daemon restart (reload config, reconnect channels, re-init everything)
-- /context shows current chat session info (session key, message count, session age)
-- /usage shows API usage stats (daily/weekly costs, requests, model breakdown, per-chat cost)
+Slash Commands (handled before the agent, no AI invocation):
+- Users can type slash commands such as /help. The <slash_commands> section, when present, lists the ones this sender can run.
+- Scheduled and other injected messages are never run as commands, even when their text starts with "/".
 
 Session Key:
 Every message includes a <session_context> tag with your session_key (e.g. "telegram:dm:12345").
@@ -494,7 +495,13 @@ function buildAppendedPrompt(
     lines.push(SELF_LEARNING_RULES.replace("{dataDir}", config.dataDir));
   }
 
-  return lines.join("\n");
+  return appendPromptAddenda(lines.join("\n"), config.addenda, {
+    kind: "chat",
+    channel: channel.channel,
+    chatType: channel.chatType,
+    senderRole: sender.role,
+    ownerDm: sender.role === "owner" && channel.chatType === "dm",
+  });
 }
 
 /**
@@ -608,5 +615,5 @@ export function buildBackgroundTaskSystemPrompt(config: PromptConfig): string {
     lines.push(SELF_LEARNING_RULES.replace("{dataDir}", config.dataDir));
   }
 
-  return lines.join("\n");
+  return appendPromptAddenda(lines.join("\n"), config.addenda, { kind: "background", ownerDm: false });
 }
