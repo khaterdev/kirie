@@ -26,6 +26,7 @@ import {
   type AgentExecutor,
   V2SessionManager,
   HealthMonitor,
+  checkClaudeBinary,
 } from "@kirie/core";
 import {
   BackgroundTaskStore,
@@ -81,6 +82,10 @@ let state: DaemonState | null = null;
 let shuttingDown = false;
 let restarting = false;
 let signalHandlersRegistered = false;
+let claudeBinaryWatch: NodeJS.Timeout | null = null;
+
+/** How often a running daemon re-verifies the SDK's native binary is still on disk. */
+const CLAUDE_BINARY_CHECK_INTERVAL_MS = 60_000;
 
 /**
  * Start the Kirie daemon.
@@ -102,6 +107,15 @@ let signalHandlersRegistered = false;
  */
 export async function startDaemon(): Promise<void> {
   log.info("starting Kirie daemon");
+
+  // 0. Refuse to start without the SDK's native Claude binary. Without it every
+  //    query fails at runtime while channels stay connected, so the daemon looks
+  //    healthy but answers nothing. Failing here lets launchd's launcher reinstall.
+  const claudeBinary = checkClaudeBinary();
+  if (!claudeBinary.ok) {
+    throw new Error(`Claude Agent SDK is unusable: ${claudeBinary.error}`);
+  }
+  log.info({ path: claudeBinary.path }, "Claude native binary found");
 
   // 1. Load config with credential resolution
   const credentialStore = new CredentialStore();
@@ -1170,6 +1184,18 @@ export async function startDaemon(): Promise<void> {
     });
   }
 
+  // A running daemon keeps its JS in memory but spawns the native binary per
+  // query, so deleting node_modules under it breaks every reply while it still
+  // looks healthy. Exit instead: launchd restarts the launcher, which reinstalls.
+  if (claudeBinaryWatch) clearInterval(claudeBinaryWatch);
+  claudeBinaryWatch = setInterval(() => {
+    const check = checkClaudeBinary();
+    if (check.ok || shuttingDown || restarting) return;
+    log.fatal({ error: check.error }, "Claude native binary disappeared — exiting so the launcher can reinstall");
+    void stopDaemon().finally(() => process.exit(1));
+  }, CLAUDE_BINARY_CHECK_INTERVAL_MS);
+  claudeBinaryWatch.unref();
+
   log.info("Kirie daemon is running");
 }
 
@@ -1193,6 +1219,11 @@ export async function stopDaemon(): Promise<void> {
   shuttingDown = true;
 
   log.info("beginning graceful shutdown");
+
+  if (claudeBinaryWatch) {
+    clearInterval(claudeBinaryWatch);
+    claudeBinaryWatch = null;
+  }
 
   const {
     configWatcher, sessionStore, channelRegistry, rateLimiter,
