@@ -30,7 +30,15 @@ import type { AutoReplyEngine } from "../auto-reply/auto-reply.js";
 import type { UsageTracker } from "../logging/usage-tracker.js";
 import type { HeartbeatService } from "../engine/heartbeat.js";
 import { isTransientNetworkError } from "../engine/network-errors.js";
-import { classifyAgentError, agentErrorUserMessage } from "../engine/agent-errors.js";
+import { agentErrorUserMessage } from "../engine/agent-errors.js";
+import {
+  attachFailure,
+  classifyFailure,
+  failureOf,
+  isHardFailure,
+  userFacingTaskError,
+  type FailureInfo,
+} from "../engine/failure.js";
 
 const log = pino({ name: "message-pipeline" });
 
@@ -430,10 +438,19 @@ export class MessagePipeline {
           );
         } catch (execErr) {
           this.runningQueries.delete(route.sessionKey);
+          const failure = failureOf(execErr) ?? classifyFailure({ error: execErr });
+          if (failure) attachFailure(execErr, failure);
           // If execution throws entirely (e.g. stale/expired session that can't
           // be resumed and fresh session also fails), clear the bad session ID
           // from the store so the next message doesn't hit the same failure loop.
-          if (route.sdkSessionId) {
+          // A limit, auth, model or overload failure is not a stale session:
+          // the mapping is kept so the conversation resumes once it clears.
+          if (route.sdkSessionId && isHardFailure(failure)) {
+            log.warn(
+              { sessionKey: route.sessionKey, failureClass: failure.class },
+              "keeping session mapping after a limit/account failure",
+            );
+          } else if (route.sdkSessionId) {
             log.warn(
               { sessionKey: route.sessionKey, sdkSessionId: route.sdkSessionId },
               "clearing stale session after execution failure",
@@ -443,6 +460,18 @@ export class MessagePipeline {
           throw execErr;
         }
         this.runningQueries.delete(route.sessionKey);
+
+        // A returned error result the engine could classify (usage limit,
+        // auth, overload, ...) is answered with the fixed user message, never
+        // the raw provider text.
+        const classified = classifiedFailure(executionResult);
+        if (classified) {
+          log.warn(
+            { messageId, sessionKey: route.sessionKey, failureClass: classified.class },
+            "agent returned a classified error result",
+          );
+          executionResult = { ...executionResult, response: agentErrorUserMessage(classified) };
+        }
 
         // Step 7: Persist the new/updated session ID
         if (executionResult.sessionId) {
@@ -456,6 +485,7 @@ export class MessagePipeline {
             costUsd: executionResult.costUsd,
             numTurns: executionResult.numTurns,
             isError: executionResult.isError,
+            ...(executionResult.model ? { model: executionResult.model } : {}),
           },
           "agent execution complete",
         );
@@ -464,7 +494,7 @@ export class MessagePipeline {
         if (this.config.usageTracker) {
           try {
             this.config.usageTracker.record({
-              model: this.config.model ?? "unknown",
+              model: executionResult.model ?? this.config.model ?? "unknown",
               inputTokens: 0,
               outputTokens: 0,
               cacheTokens: 0,
@@ -562,14 +592,17 @@ export class MessagePipeline {
       }
 
       if (result.isError) {
-        log.warn({ messageId, response: result.response }, "agent returned error result");
+        log.warn(
+          { messageId, failureClass: result.failure?.class, responseLength: result.response.length },
+          "agent returned error result",
+        );
       }
     } catch (err) {
       // Provide a more informative error message based on the failure type
-      const errorInfo = classifyAgentError(err);
-      const userMessage = agentErrorUserMessage(errorInfo);
+      const failure = failureOf(err) ?? classifyFailure({ error: err });
+      const userMessage = agentErrorUserMessage(failure ?? { kind: "unknown" });
 
-      log.error({ messageId, err, errorKind: errorInfo.kind }, "pipeline error");
+      log.error({ messageId, err, errorKind: failure?.class ?? "unknown" }, "pipeline error");
 
       await this.sendErrorResponse(
         sourceAdapter,
@@ -648,6 +681,108 @@ export class MessagePipeline {
       // On transient network errors, queue for retry instead of losing the result
       if (!this.queueForRetry(parts.channel, parts.chatId, text, err)) {
         log.error({ taskId: task.id, err }, "failed to push background task result");
+      }
+    }
+  }
+
+  /**
+   * Tell the originating chat that a background task failed.
+   * Called by the BackgroundTaskManager's onTaskFailed callback. Only a
+   * classified, user-safe sentence is shown; raw error text stays in the task row.
+   */
+  async pushBackgroundTaskFailure(task: BackgroundTask): Promise<void> {
+    const parts = parseSessionKey(task.session_key);
+    if (!parts) {
+      log.warn({ sessionKey: task.session_key }, "cannot parse session key for task failure push");
+      return;
+    }
+
+    const adapter = this.config.channelRegistry.getById(parts.channel);
+    if (!adapter || !this.config.channelRegistry.isRunning(parts.channel)) {
+      log.warn({ channel: parts.channel }, "channel not available for task failure push");
+      return;
+    }
+
+    const detail =
+      userFacingTaskError(task.error) ??
+      "It stopped with an internal error. Ask me about this task to see the details.";
+    const text = `Background task failed: ${task.description}\n\n${detail}`;
+
+    try {
+      await adapter.sendText({ ctx: { chatId: parts.chatId }, text });
+      log.info({ taskId: task.id, channel: parts.channel }, "pushed background task failure");
+    } catch (err) {
+      if (!this.queueForRetry(parts.channel, parts.chatId, text, err)) {
+        log.error({ taskId: task.id, err }, "failed to push background task failure");
+      }
+    }
+  }
+
+  /**
+   * Deliver a result that a persistent session produced with no turn waiting
+   * for it (for example an async subagent's final answer, after the turn
+   * already returned "waiting for the agent"). Sent to the chat and stored in
+   * chat history. Error results are logged, not sent.
+   */
+  async deliverUnsolicitedResult(sessionKey: string, result: ExecutionResult): Promise<void> {
+    if (!this.started) return;
+    if (result.isError) {
+      log.warn(
+        { sessionKey, failureClass: result.failure?.class },
+        "unsolicited error result not delivered",
+      );
+      return;
+    }
+    if (!result.response.trim()) return;
+
+    const parts = parseSessionKey(sessionKey);
+    if (!parts) {
+      log.warn({ sessionKey }, "cannot parse session key for unsolicited result");
+      return;
+    }
+    const adapter = this.config.channelRegistry.getById(parts.channel);
+    if (!adapter || !this.config.channelRegistry.isRunning(parts.channel)) {
+      log.warn({ channel: parts.channel }, "channel not available for unsolicited result");
+      return;
+    }
+
+    if (this.config.chatHistoryStore) {
+      try {
+        this.config.chatHistoryStore.append(sessionKey, "assistant", result.response, {
+          channel: parts.channel,
+        });
+      } catch (historyErr) {
+        log.warn({ historyErr }, "failed to store unsolicited result in chat history (non-fatal)");
+      }
+    }
+
+    const ctx = { chatId: parts.chatId };
+    const parsed = splitMediaFromOutput(result.response);
+
+    if (parsed.mediaUrls && parsed.mediaUrls.length > 0 && adapter.sendMedia) {
+      for (const url of parsed.mediaUrls) {
+        try {
+          const mediaType: MediaType = parsed.audioAsVoice && isAudioUrl(url) ? "voice" : guessMediaType(url);
+          await adapter.sendMedia({ ctx, media: { type: mediaType, url } });
+        } catch (mediaErr) {
+          if (!this.queueForRetry(parts.channel, parts.chatId, `[media: ${url}]`, mediaErr)) {
+            log.warn({ mediaErr, url }, "failed to send media from unsolicited result (non-fatal)");
+          }
+        }
+      }
+    }
+
+    if (parsed.text && parsed.text.trim()) {
+      try {
+        const receipts = await adapter.sendText({ ctx, text: parsed.text });
+        for (const receipt of receipts) {
+          this.trackSentMessage(parts.chatId, receipt.id, parsed.text);
+        }
+        log.info({ sessionKey, channel: parts.channel }, "delivered unsolicited session result");
+      } catch (err) {
+        if (!this.queueForRetry(parts.channel, parts.chatId, parsed.text, err)) {
+          log.error({ sessionKey, err }, "failed to deliver unsolicited session result");
+        }
       }
     }
   }
@@ -778,6 +913,15 @@ export class MessagePipeline {
       }
     }
   }
+}
+
+/**
+ * The failure of a returned error result, when it was classified into a known
+ * class. Aborted turns and unrecognised errors return undefined.
+ */
+function classifiedFailure(result: ExecutionResult): FailureInfo | undefined {
+  if (!result.isError || result.wasAborted || !result.failure) return undefined;
+  return result.failure.class === "unknown" ? undefined : result.failure;
 }
 
 /**

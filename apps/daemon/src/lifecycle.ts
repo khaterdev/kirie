@@ -27,6 +27,10 @@ import {
   V2SessionManager,
   HealthMonitor,
   checkClaudeBinary,
+  SdkOptionsPipeline,
+  TurnContextRegistry,
+  installCanUseToolWarningFilter,
+  defaultOneShotCwd,
 } from "@kirie/core";
 import {
   BackgroundTaskStore,
@@ -76,6 +80,10 @@ interface DaemonState {
   kokoroProcess: ChildProcess | null;
   /** Set only when sessionMode is "v2"; holds live sessions that must be closed on shutdown. */
   v2Sessions: V2SessionManager | null;
+  /** The one SDK options seam every query() call site applies (PLAN B.1). */
+  sdkOptions: SdkOptionsPipeline;
+  /** Per-turn origin registry (PLAN B.2). The message pipeline becomes its writer in a later wave. */
+  turnContext: TurnContextRegistry;
 }
 
 let state: DaemonState | null = null;
@@ -482,6 +490,13 @@ export async function startDaemon(): Promise<void> {
     log.info({ agents: agentRegistry.list().length }, "agent definitions loaded");
   }
 
+  // 4c. SDK options seam shared by every query() call site, and the per-turn
+  //     context registry. The pipeline sets canUseTool on purpose, so the SDK's
+  //     "canUseTool is shadowed under bypassPermissions" warning is dropped.
+  installCanUseToolWarningFilter();
+  const sdkOptions = new SdkOptionsPipeline();
+  const turnContext = new TurnContextRegistry();
+
   // 4. Agent engine (uses V1 query() with mcpServers passed directly)
   const agentConfig: AgentEngineConfig = {
     prompt: {
@@ -494,6 +509,7 @@ export async function startDaemon(): Promise<void> {
     cwd: config.agent.workspace || dataDir,
     allowedTools,
     mcpServers,
+    sdkOptions,
   };
   // The V1 engine is always constructed: background tasks and the proactive
   // layer use it directly for one-shot work regardless of sessionMode.
@@ -512,6 +528,7 @@ export async function startDaemon(): Promise<void> {
           mcpServers,
           idleTimeoutMs: config.agent.sessionIdleTimeoutMs,
           maxSessions: config.agent.maxSessions,
+          sdkOptions,
         })
       : agentEngine;
 
@@ -635,6 +652,7 @@ export async function startDaemon(): Promise<void> {
           backgroundTaskStore.create(sessionKey, description, prompt);
         },
         heartbeatLogStore: heartbeatLogStore ?? undefined,
+        triage: { sdkOptions, cwd: defaultOneShotCwd(dataDir) },
       });
       log.info("proactive engine created");
     } else {
@@ -723,6 +741,14 @@ export async function startDaemon(): Promise<void> {
     model: config.agent.model,
     transcriptionProvider,
   });
+
+  // A persistent session can produce a result after its turn already returned
+  // (an async subagent finishing). Deliver it to the chat instead of dropping it.
+  if (pipelineExecutor instanceof V2SessionManager) {
+    pipelineExecutor.setUnsolicitedResultHandler((sessionKey, result) => {
+      void pipeline.deliverUnsolicitedResult(sessionKey, result);
+    });
+  }
 
   // 9. Start channels
   pipeline.start();
@@ -1034,6 +1060,11 @@ export async function startDaemon(): Promise<void> {
       // Push completed task result proactively to the originating channel
       await pipeline.pushBackgroundTaskResult(task);
     },
+    onTaskFailed: async (task) => {
+      // A limit or account failure is a failure, not a "completed" result
+      await pipeline.pushBackgroundTaskFailure(task);
+    },
+    sdkOptions,
   });
 
   backgroundTaskManager.resumeOnStartup();
@@ -1123,6 +1154,8 @@ export async function startDaemon(): Promise<void> {
     heartbeatLogStore,
     kokoroProcess,
     v2Sessions: pipelineExecutor instanceof V2SessionManager ? pipelineExecutor : null,
+    sdkOptions,
+    turnContext,
   };
 
   // 14. Signal handlers (registered once to avoid stacking on restart)

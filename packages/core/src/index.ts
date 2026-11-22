@@ -15,6 +15,13 @@ export * from "./engine/v2-session-manager.js";
 export * from "./engine/workspace-manager.js";
 export * from "./engine/background-task-store.js";
 export * from "./engine/background-task-manager.js";
+// Engine seam, turn context, failure classification, no-tools runner (PLAN B.1 to B.3)
+export * from "./engine/sdk-options.js";
+export * from "./engine/turn-context.js";
+export * from "./engine/failure.js";
+export * from "./engine/reset-time.js";
+export * from "./engine/oneshot.js";
+export * from "./engine/agent-errors.js";
 // prompt-builder: ChannelContext renamed to PromptChannelContext to avoid collision with adapter.ts
 export {
   type ChannelContext as PromptChannelContext,

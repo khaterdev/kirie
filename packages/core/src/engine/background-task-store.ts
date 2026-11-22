@@ -30,6 +30,17 @@ interface BackgroundTaskCommandRow {
   created_at: string;
 }
 
+/**
+ * Free-form task metadata, stored as JSON in `background_tasks.meta`.
+ * `profile` selects a TaskProfile and controller from the daemon's task hooks;
+ * `origin` says what created the task ("goal", "webhook", ...).
+ */
+export interface BackgroundTaskMeta {
+  origin?: string;
+  profile?: string;
+  data?: Record<string, unknown>;
+}
+
 export interface BackgroundTask {
   id: string;
   session_key: string;
@@ -43,6 +54,8 @@ export interface BackgroundTask {
   created_at: string;
   updated_at: string;
   sdk_session_id: string | null;
+  /** Parsed `meta` column. Absent or null for tasks created without metadata. */
+  meta?: BackgroundTaskMeta | null;
 }
 
 interface BackgroundTaskRow {
@@ -58,6 +71,19 @@ interface BackgroundTaskRow {
   created_at: string;
   updated_at: string;
   sdk_session_id: string | null;
+  meta?: string | null;
+}
+
+function parseMeta(raw: string | null | undefined): BackgroundTaskMeta | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as BackgroundTaskMeta)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -114,28 +140,37 @@ export class BackgroundTaskStore {
       CREATE INDEX IF NOT EXISTS idx_btc_unprocessed
         ON background_task_commands(processed) WHERE processed = 0;
     `);
+
+    // Nullable JSON metadata (profile, origin). Added after the first release,
+    // so existing databases get the column on open.
+    const columns = this.db.prepare("PRAGMA table_info(background_tasks)").all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === "meta")) {
+      this.db.exec("ALTER TABLE background_tasks ADD COLUMN meta TEXT");
+    }
   }
 
   private rowToTask(row: BackgroundTaskRow): BackgroundTask {
     return {
       ...row,
       status: row.status as BackgroundTaskStatus,
+      meta: parseMeta(row.meta),
     };
   }
 
   /**
    * Create a new background task in pending state.
    */
-  create(sessionKey: string, description: string, prompt: string): BackgroundTask {
+  create(sessionKey: string, description: string, prompt: string, meta?: BackgroundTaskMeta): BackgroundTask {
     const id = randomUUID();
     const now = new Date().toISOString();
+    const metaJson = meta ? JSON.stringify(meta) : null;
 
     this.db
       .prepare(
-        `INSERT INTO background_tasks (id, session_key, description, prompt, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO background_tasks (id, session_key, description, prompt, status, created_at, updated_at, meta)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
       )
-      .run(id, sessionKey, description, prompt, now, now);
+      .run(id, sessionKey, description, prompt, now, now, metaJson);
 
     return {
       id,
@@ -150,6 +185,7 @@ export class BackgroundTaskStore {
       created_at: now,
       updated_at: now,
       sdk_session_id: null,
+      meta: metaJson ? parseMeta(metaJson) : null,
     };
   }
 
@@ -265,16 +301,19 @@ export class BackgroundTaskStore {
   }
 
   /**
-   * Mark a task as cancelled.
+   * Mark a task as cancelled. Only a pending or running task can be cancelled:
+   * a task that already completed or failed keeps its outcome (shutdown used to
+   * relabel finished tasks as cancelled). Returns true when the row changed.
    */
-  markCancelled(id: string): void {
-    this.db
+  markCancelled(id: string): boolean {
+    const info = this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'cancelled', updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
       .run(id);
+    return info.changes > 0;
   }
 
   // ── Command methods ──────────────────────────────────────────────────────

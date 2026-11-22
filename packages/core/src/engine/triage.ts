@@ -9,9 +9,11 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
-import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import pino from "pino";
 import type { Signal } from "./signals.js";
+import { isUsageLimit } from "./failure.js";
+import { OneShotError, runOneShot } from "./oneshot.js";
+import type { SdkOptionsPipeline } from "./sdk-options.js";
 import type { ProactiveConfig } from "../config/schema.js";
 import type { HeartbeatLogStore } from "../mcp/tools/heartbeat-logs.js";
 
@@ -40,6 +42,22 @@ export interface TriageResult {
   llmCalled: boolean;
 }
 
+/** Optional wiring for the triage model call. */
+export interface TriageRunnerOptions {
+  /** Shared SDK options seam (account env, fallback model). */
+  sdkOptions?: SdkOptionsPipeline;
+  /** Empty working directory for the call. Default `~/.kirie/tmp/oneshot`. */
+  cwd?: string;
+}
+
+/** How long triage pauses after a usage limit whose reset time is unknown. */
+const LIMIT_PAUSE_UNKNOWN_MS = 15 * 60 * 1000;
+/** Never resume before this much time has passed after a limit. */
+const LIMIT_PAUSE_MIN_MS = 60 * 1000;
+
+const TRIAGE_SYSTEM_PROMPT =
+  "You are a triage decision engine. Return only valid JSON arrays. No tools, no conversation — just analyze and return decisions.";
+
 // ---------------------------------------------------------------------------
 // TriageRunner
 // ---------------------------------------------------------------------------
@@ -55,10 +73,14 @@ export class TriageRunner {
   private readonly config: ProactiveConfig;
   private readonly heartbeatFilePath: string;
   private readonly heartbeatLogStore: HeartbeatLogStore | null;
+  private readonly options: TriageRunnerOptions;
+  /** Epoch ms until which triage is skipped because the account is out of usage. 0 = not limited. */
+  private limitedUntil = 0;
 
-  constructor(config: ProactiveConfig, heartbeatLogStore?: HeartbeatLogStore) {
+  constructor(config: ProactiveConfig, heartbeatLogStore?: HeartbeatLogStore, options: TriageRunnerOptions = {}) {
     this.config = config;
     this.heartbeatLogStore = heartbeatLogStore ?? null;
+    this.options = options;
     // Resolve ~ in heartbeat file path
     const rawPath = config.heartbeatFile;
     this.heartbeatFilePath = rawPath.startsWith("~")
@@ -77,6 +99,17 @@ export class TriageRunner {
     // If no checklist and no signals, skip entirely
     if (!checklist && signals.length === 0) {
       return { decisions: [], signalsProcessed: 0, llmCalled: false };
+    }
+
+    // While the account is out of usage every call fails the same way, so skip
+    // cycles until the reset instead of spawning a doomed subprocess each time.
+    const now = Date.now();
+    if (now < this.limitedUntil) {
+      return { decisions: [], signalsProcessed: signals.length, llmCalled: false };
+    }
+    if (this.limitedUntil !== 0) {
+      this.limitedUntil = 0;
+      log.info("usage-limit pause over; triage resumes");
     }
 
     // Build the triage prompt
@@ -111,7 +144,27 @@ export class TriageRunner {
         llmCalled: true,
       };
     } catch (err) {
-      log.error({ err }, "triage LLM call failed");
+      if (err instanceof OneShotError && err.reason === "parse") {
+        log.warn({ err }, "failed to parse triage LLM response");
+        return { decisions: [], signalsProcessed: signals.length, llmCalled: true };
+      }
+      const failure = err instanceof OneShotError ? err.failure : undefined;
+      const failureClass = failure?.class;
+      if (isUsageLimit(failure)) {
+        const fallback = now + LIMIT_PAUSE_UNKNOWN_MS;
+        this.limitedUntil = Math.max(failure.resetAtMs ?? fallback, now + LIMIT_PAUSE_MIN_MS);
+        log.warn(
+          {
+            failureClass: failure.class,
+            limitType: failure.limitType,
+            resetKnown: failure.resetAtMs !== undefined,
+            pausedUntil: new Date(this.limitedUntil).toISOString(),
+          },
+          "triage hit a usage limit; skipping triage cycles until it resets",
+        );
+        return { decisions: [], signalsProcessed: signals.length, llmCalled: false };
+      }
+      log.error({ err, failureClass }, "triage LLM call failed");
       return { decisions: [], signalsProcessed: signals.length, llmCalled: false };
     }
   }
@@ -227,101 +280,52 @@ export class TriageRunner {
     return parts.join("\n");
   }
 
-  /**
-   * Call the triage LLM via the Claude Agent SDK.
-   * Uses the same auth as the main agent — no API key env var needed.
-   */
-  private async callTriageLLM(prompt: string): Promise<TriageDecision[]> {
-    const model = this.config.tier2Model;
-
-    const stream = query({
-      prompt,
-      options: {
-        model,
-        maxTurns: 1,
-        systemPrompt: "You are a triage decision engine. Return only valid JSON arrays. No tools, no conversation — just analyze and return decisions.",
-        permissionMode: "bypassPermissions",
-        allowedTools: [],
-      },
-    });
-
-    let resultText = "";
-
-    for await (const msg of stream as AsyncGenerator<SDKMessage, void>) {
-      switch (msg.type) {
-        case "assistant": {
-          for (const block of msg.message.content) {
-            if (block.type === "text") {
-              resultText += block.text;
-            }
-          }
-          break;
-        }
-        case "result": {
-          if (msg.subtype === "success" && msg.result) {
-            resultText = msg.result;
-          }
-          break;
-        }
-        default:
-          break;
-      }
-    }
-
-    if (!resultText) {
-      log.warn("triage LLM returned no text content");
-      return [];
-    }
-
-    return this.parseDecisions(resultText);
+  /** Epoch ms until which triage is paused by a usage limit, or 0. */
+  get pausedUntil(): number {
+    return this.limitedUntil;
   }
 
   /**
-   * Parse the LLM response text into TriageDecision objects.
-   * Handles various formatting issues (markdown code blocks, etc.)
+   * Call the triage LLM via the Claude Agent SDK with no tools at all
+   * (`noToolsOptions`). Uses the same auth as the main agent.
    */
-  private parseDecisions(text: string): TriageDecision[] {
-    // Strip markdown code blocks if present
-    let cleaned = text.trim();
-    if (cleaned.startsWith("```")) {
-      cleaned = cleaned.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-    }
+  private async callTriageLLM(prompt: string): Promise<TriageDecision[]> {
+    const { value } = await runOneShot<TriageDecision[]>({
+      kind: "triage",
+      model: this.config.tier2Model,
+      system: TRIAGE_SYSTEM_PROMPT,
+      prompt,
+      maxTurns: 1,
+      label: "triage",
+      parse: (parsed) => this.parseDecisions(parsed),
+      ...(this.options.sdkOptions ? { sdkOptions: this.options.sdkOptions } : {}),
+      ...(this.options.cwd ? { cwd: this.options.cwd } : {}),
+    });
+    return value;
+  }
 
-    try {
-      const parsed = JSON.parse(cleaned) as unknown;
-
-      if (!Array.isArray(parsed)) {
-        log.warn("triage LLM returned non-array JSON");
-        return [];
-      }
-
-      const decisions: TriageDecision[] = [];
-      for (const item of parsed) {
-        if (
-          typeof item === "object" &&
-          item !== null &&
-          "action" in item &&
-          typeof (item as Record<string, unknown>).action === "string"
-        ) {
-          const action = (item as Record<string, unknown>).action as string;
-          if (["notify-now", "queue-digest", "silent", "escalate"].includes(action)) {
-            decisions.push({
-              action: action as TriageDecision["action"],
-              message: typeof (item as Record<string, unknown>).message === "string"
-                ? (item as Record<string, unknown>).message as string
-                : undefined,
-              signalId: typeof (item as Record<string, unknown>).signalId === "string"
-                ? (item as Record<string, unknown>).signalId as string
-                : undefined,
-            });
-          }
-        }
-      }
-
-      return decisions;
-    } catch (err) {
-      log.warn({ err, text: cleaned.slice(0, 200) }, "failed to parse triage LLM response");
+  /**
+   * Turn the parsed JSON into TriageDecision objects, dropping anything malformed.
+   */
+  private parseDecisions(parsed: unknown): TriageDecision[] {
+    if (!Array.isArray(parsed)) {
+      log.warn("triage LLM returned non-array JSON");
       return [];
     }
+
+    const decisions: TriageDecision[] = [];
+    for (const item of parsed) {
+      if (typeof item !== "object" || item === null) continue;
+      const record = item as Record<string, unknown>;
+      const action = record.action;
+      if (typeof action !== "string") continue;
+      if (!["notify-now", "queue-digest", "silent", "escalate"].includes(action)) continue;
+      decisions.push({
+        action: action as TriageDecision["action"],
+        message: typeof record.message === "string" ? record.message : undefined,
+        signalId: typeof record.signalId === "string" ? record.signalId : undefined,
+      });
+    }
+    return decisions;
   }
 }

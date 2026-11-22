@@ -15,6 +15,17 @@ import {
 import { makeSessionKey } from "../routing/session-key.js";
 import type { FailedMedia, ResolvedMedia } from "../channels/adapter.js";
 import { formatFailedMediaNote, mediaTypeLabel } from "../channels/media-failure.js";
+import {
+  attachFailure,
+  classifyFailure,
+  failureOf,
+  feedTurnSignals,
+  isHardFailure,
+  logSdkSignal,
+  newTurnSignals,
+  type FailureInfo,
+} from "./failure.js";
+import { chatCallContext, type SdkCallContext, type SdkOptionsPipeline } from "./sdk-options.js";
 
 const log = pino({ name: "agent-engine" });
 
@@ -96,6 +107,16 @@ export interface ExecutionResult {
   isError: boolean;
   /** Whether the execution was aborted mid-stream (partial response) */
   wasAborted?: boolean;
+  /** Classification of an error result (set only when isError and the failure was recognised) */
+  failure?: FailureInfo;
+  /** Model that answered, from the last assistant message's `message.model` */
+  model?: string;
+  /** Account the turn ran on; null = the default account (CLAUDE_CONFIG_DIR unset) */
+  accountId?: string | null;
+  /** uuid stamped on the streamed user message that opened this turn (streaming paths only) */
+  userMessageUuid?: string;
+  /** Short notices for the user about how the turn ran (e.g. a model fallback) */
+  notices?: string[];
 }
 
 /**
@@ -110,6 +131,8 @@ export interface AgentEngineConfig {
   allowedTools?: string[];
   /** Working directory for the agent session */
   cwd?: string;
+  /** Shared SDK options seam (hooks, gates, contributors, stream observers) */
+  sdkOptions?: SdkOptionsPipeline;
 }
 
 /**
@@ -226,19 +249,34 @@ export class AgentEngine implements AgentExecutor {
 
     const sessionKey = makeSessionKey({ channel: message.channel, chatType: message.chatType, chatId: message.chatId });
 
-    const options: Options = {
-      systemPrompt: builtPrompt.systemPrompt,
-      // Use bypassPermissions so agents can use all tools without prompts.
-      // V1 query() supports this mode fully (unlike V2 which hardcodes it off).
-      permissionMode: "bypassPermissions",
-      maxTurns: builtPrompt.maxTurns,
-      model: builtPrompt.model,
-      allowedTools: this.config.allowedTools,
-      mcpServers: this.config.mcpServers,
-      cwd: this.config.cwd,
-      // Load skills from both user (~/.claude/skills/) and project ({cwd}/.claude/skills/) directories.
-      // Without this, the SDK does NOT discover any filesystem-based skills.
-      settingSources: ["user", "project"],
+    const ctx = chatCallContext({
+      sessionKey,
+      channel: message.channel,
+      chatType: message.chatType,
+      senderRole: sender.role,
+      cwd: this.config.cwd ?? process.cwd(),
+    });
+
+    // Options are rebuilt for every attempt: apply() appends hooks, so one
+    // object must never pass through it twice.
+    const buildOptions = (resume?: string): Options => {
+      const options: Options = {
+        systemPrompt: builtPrompt.systemPrompt,
+        // Use bypassPermissions so agents can use all tools without prompts.
+        // V1 query() supports this mode fully (unlike V2 which hardcodes it off).
+        permissionMode: "bypassPermissions",
+        maxTurns: builtPrompt.maxTurns,
+        model: builtPrompt.model,
+        allowedTools: this.config.allowedTools,
+        mcpServers: this.config.mcpServers,
+        cwd: this.config.cwd,
+        // Load skills from both user (~/.claude/skills/) and project ({cwd}/.claude/skills/) directories.
+        // Without this, the SDK does NOT discover any filesystem-based skills.
+        settingSources: ["user", "project"],
+      };
+      if (resume) options.resume = resume;
+      this.config.sdkOptions?.apply(options, ctx);
+      return options;
     };
 
     const userPrompt = wrapUserMessage(message, chatHistory, sessionKey, this.config.prompt?.timezone);
@@ -246,13 +284,21 @@ export class AgentEngine implements AgentExecutor {
     // Attempt to resume an existing session. If the session is stale or from
     // a different process (e.g., CLI resuming a daemon session), the SDK will
     // fail. In that case, retry without resume to start a fresh session.
+    //
+    // A usage limit, auth failure, unavailable model or overload is not a
+    // stale session: a fresh session would hit the same wall and lose the
+    // conversation. Those return or throw as they are.
     if (sessionId) {
-      options.resume = sessionId;
       try {
-        const stream = query({ prompt: userPrompt, options });
-        onQuery?.(stream);
-        const result = await this.consumeStream(stream);
+        const result = await this.runQuery(userPrompt, buildOptions(sessionId), ctx, onQuery);
         if (!result.isError) {
+          return result;
+        }
+        if (isHardFailure(result.failure)) {
+          log.warn(
+            { sessionId, failureClass: result.failure.class },
+            "session returned a limit/account error; keeping the session, not retrying fresh",
+          );
           return result;
         }
         log.warn(
@@ -260,9 +306,16 @@ export class AgentEngine implements AgentExecutor {
           "session returned error result, retrying with fresh session",
         );
       } catch (err) {
+        const failure = failureOf(err);
+        if (isHardFailure(failure)) {
+          log.warn(
+            { sessionId, failureClass: failure.class },
+            "session resume hit a limit/account error; keeping the session, not retrying fresh",
+          );
+          throw err;
+        }
         log.error({ sessionId, err }, "session resume failed, starting fresh session");
       }
-      delete options.resume;
     }
 
     // Fresh session attempt with retry. If the first attempt fails (e.g. transient
@@ -276,17 +329,26 @@ export class AgentEngine implements AgentExecutor {
           log.info({ attempt, delayMs }, "retrying fresh session after delay");
           await new Promise((r) => setTimeout(r, delayMs));
         }
-        const stream = query({ prompt: userPrompt, options });
-        onQuery?.(stream);
-        return await this.consumeStream(stream);
+        return await this.runQuery(userPrompt, buildOptions(), ctx, onQuery);
       } catch (err) {
         lastErr = err;
         log.error({ attempt, err }, "fresh session attempt failed");
+        if (isHardFailure(failureOf(err))) break;
       }
     }
     throw lastErr;
   }
 
+  private async runQuery(
+    prompt: string,
+    options: Options,
+    ctx: SdkCallContext,
+    onQuery?: (q: Query) => void,
+  ): Promise<ExecutionResult> {
+    const stream = query({ prompt, options });
+    onQuery?.(stream);
+    return this.consumeStream(stream, ctx);
+  }
 
   /**
    * Consumes the SDK message stream, collecting assistant text and
@@ -297,7 +359,10 @@ export class AgentEngine implements AgentExecutor {
    */
   private async consumeStream(
     stream: AsyncGenerator<SDKMessage, void>,
+    ctx: SdkCallContext,
   ): Promise<ExecutionResult> {
+    const sdkOptions = this.config.sdkOptions;
+    const signals = newTurnSignals();
     let resultSessionId = "";
     let costUsd = 0;
     let numTurns = 0;
@@ -307,8 +372,30 @@ export class AgentEngine implements AgentExecutor {
     let wasAborted = false;
     let gotResult = false;
 
+    // The v1 path sends a string prompt, so there is no user message uuid.
+    sdkOptions?.observe({ type: "turn_start", ctx, accountId: null });
+    const endTurn = (failed: boolean, aborted: boolean): void => {
+      sdkOptions?.observe({
+        type: "turn_end",
+        ctx,
+        ...(resultSessionId ? { sdkSessionId: resultSessionId } : {}),
+        accountId: null,
+        result: {
+          isError: failed,
+          wasAborted: aborted,
+          costUsd,
+          numTurns,
+          ...(signals.model ? { model: signals.model } : {}),
+        },
+      });
+    };
+
     try {
       for await (const msg of stream) {
+        sdkOptions?.observe({ type: "message", ctx, message: msg });
+        feedTurnSignals(signals, msg);
+        logSdkSignal(log, ctx.label, msg);
+
         switch (msg.type) {
           case "assistant": {
             // Extract text from the assistant message content blocks
@@ -358,6 +445,11 @@ export class AgentEngine implements AgentExecutor {
         wasAborted = true;
         log.info({ sessionId: resultSessionId, partialTextLength: textParts.join("").length }, "stream aborted, returning partial result");
       } else {
+        endTurn(true, false);
+        // One-shot paths see the error result first and then this throw; the
+        // signals gathered from the stream make the classification exact.
+        const failure = classifyFailure({ error: err, signals, ...(resultText ? { text: resultText } : {}) });
+        if (failure) attachFailure(err, failure);
         throw err;
       }
     }
@@ -374,6 +466,10 @@ export class AgentEngine implements AgentExecutor {
       resultText = textParts.join("");
     }
 
+    endTurn(isError, wasAborted);
+
+    const failure = isError ? classifyFailure({ text: resultText, signals }) : null;
+
     return {
       response: resultText,
       sessionId: resultSessionId,
@@ -381,6 +477,9 @@ export class AgentEngine implements AgentExecutor {
       numTurns,
       isError,
       wasAborted,
+      ...(failure ? { failure } : {}),
+      ...(signals.model ? { model: signals.model } : {}),
+      accountId: null,
     };
   }
 }

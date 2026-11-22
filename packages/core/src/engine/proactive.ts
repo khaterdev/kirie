@@ -24,7 +24,7 @@ import type {
 } from "./signals.js";
 import { createDefaultDetectors } from "./signals.js";
 import type { TriageDecision } from "./triage.js";
-import { TriageRunner } from "./triage.js";
+import { TriageRunner, type TriageRunnerOptions } from "./triage.js";
 import { NotificationManager } from "./notifications.js";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { SessionStore } from "./session-store.js";
@@ -64,6 +64,8 @@ export interface ProactiveEngineDeps {
   createBackgroundTask?: (sessionKey: string, description: string, prompt: string) => void;
   /** Optional HeartbeatLogStore for triage context injection */
   heartbeatLogStore?: HeartbeatLogStore;
+  /** Optional wiring for the triage model call (SDK options seam, working directory) */
+  triage?: TriageRunnerOptions;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +143,7 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
     this.detectors = createDefaultDetectors(deps.config);
 
     // Initialize triage runner (with optional heartbeat log store for context injection)
-    this.triageRunner = new TriageRunner(deps.config, deps.heartbeatLogStore);
+    this.triageRunner = new TriageRunner(deps.config, deps.heartbeatLogStore, deps.triage);
 
     // Initialize notification manager
     this.notificationManager = new NotificationManager(deps.channelRegistry, {
