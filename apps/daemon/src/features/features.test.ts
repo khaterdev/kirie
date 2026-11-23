@@ -35,7 +35,7 @@ function fakeContext(over: Partial<DaemonContext> = {}): DaemonContext {
     commands,
     owners,
     ownerPrompts: { pending: () => [], answerByCode: () => "not-found" },
-    settings: {},
+    settings: { effective: (_key: string, _schema: unknown, configValue: unknown) => configValue },
     audit: {},
     scrubber: new SecretScrubber(),
     sdkOptions: {},
@@ -84,13 +84,11 @@ describe("FEATURES", () => {
     expect(handles.map((h) => h.name)).toEqual(FEATURES.map((f) => f.name));
     const started = await startFeatures(handles);
     expect(started).toHaveLength(FEATURES.length);
-    // Only core-commands registers commands and an addendum; only scrubbing sets an env key.
     // The 14 built-in commands are always present. Filled-in features add their own and
     // check them in their own tests (features/<name>.test.ts).
     expect(ctx.commands.list().length).toBeGreaterThanOrEqual(14);
-    expect(ctx.promptAddenda.names()).toEqual(["commands"]);
+    expect(ctx.promptAddenda.names()).toContain("commands");
     expect(Object.keys(ctx.kirieToolsEnv)).toContain("KIRIE_SCRUB_CONFIG");
-    expect(ctx.internalApi.apps()).toEqual([]);
     expect(ctx.notifyOwner).not.toHaveBeenCalled();
     await stopFeatures(started);
   });

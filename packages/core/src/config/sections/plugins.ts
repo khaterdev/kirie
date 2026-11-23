@@ -7,14 +7,18 @@ const PluginsObjectSchema = z.object({
   dir: z.string().default("~/.kirie/plugins"),
   /** Optional static outer bound. Empty means "whatever the owner approved". */
   allow: z.array(z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/)).default([]),
-  /** Per-plugin settings passed to the factory. */
+  /** Per-plugin settings passed (as a copy) to the factory and setup. Never secrets: plugins can log them. */
   config: z.record(z.record(z.unknown())).default({}),
   hookTimeoutMs: z.number().int().min(100).max(30_000).default(2000),
   loadTimeoutMs: z.number().int().min(500).max(60_000).default(10_000),
   maxConsecutiveFailures: z.number().int().min(1).max(100).default(5),
   maxQueuedEventsPerPlugin: z.number().int().min(1).max(10_000).default(100),
+  /** Scrub secrets from every event payload handed to a plugin. */
   scrubEventPayloads: z.boolean().default(true),
-  /** Refuse to load a plugin whose files differ from the approved hash. */
+  /**
+   * Refuse to load a plugin whose files differ from the approved hash. Kept for
+   * config compatibility: `false` is ignored with a warning, the pin is always on.
+   */
   requireHashPin: z.boolean().default(true),
 });
 

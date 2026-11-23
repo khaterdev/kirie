@@ -32,14 +32,16 @@ describe("feature tool seam", () => {
     ]);
   });
 
-  it("the stubs register nothing and do no I/O when called", () => {
+  it("the stubs register nothing, filled factories only their own tools, and none do I/O when called", () => {
+    // Factories already filled in by their workstreams, and the tools they define.
+    const filled: Record<string, string[]> = { createPluginsTools: ["plugins_list"] };
     for (const factory of FEATURE_TOOL_FACTORIES) {
-      expect(factory(ctx), factory.name).toEqual({});
+      expect(Object.keys(factory(ctx)), factory.name).toEqual(filled[factory.name] ?? []);
     }
-    expect(featureToolNames(ctx)).toEqual([]);
-    let called = false;
-    registerFeatureTools(() => { called = true; }, ctx);
-    expect(called).toBe(false);
+    expect(featureToolNames(ctx)).toEqual(Object.values(filled).flat());
+    const registered: string[] = [];
+    registerFeatureTools((h) => { registered.push(...Object.keys(h)); }, ctx);
+    expect(registered).toEqual(Object.values(filled).flat());
     expect(existsSync(ctx.dbDir)).toBe(false);
   });
 
