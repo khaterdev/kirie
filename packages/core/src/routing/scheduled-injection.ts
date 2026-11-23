@@ -3,8 +3,10 @@
  * never interrupts a user turn (DECISIONS 16, PLAN B.14).
  *
  * The first attempt runs when the schedule fires. If the chat is busy (a turn
- * is running or queued), the event waits here and is retried on heartbeat
- * ticks every 30 s until the chat is idle. It is never dropped for being busy
+ * is running or queued), or the scheduled turn was cut short by a new user
+ * message, the event waits here and is retried on heartbeat ticks every 30 s
+ * until it runs to the end. A schedule that fires again while an earlier fire
+ * of it still waits for the same chat is coalesced into the waiting one. It is never dropped for being busy
  * and never falls back to interrupting. After it has waited 30 minutes the
  * owner gets one notice naming the schedule; the retries continue.
  *
@@ -62,8 +64,12 @@ export class ScheduledInjectionQueue {
 
   /** First attempt, when the schedule fires. A busy chat queues the event for retry. */
   async deliver(event: ScheduledInjectionEvent): Promise<InjectMessageResult> {
+    if (this.waiting.some((w) => sameSchedule(w.event, event))) {
+      log.info({ schedule: event.name, channel: event.channel }, "schedule fired again while waiting; coalesced");
+      return { status: "busy" };
+    }
     const result = await this.attemptOnce(event);
-    if (result.status === "busy" && !this.stopped) {
+    if (shouldWait(result) && !this.stopped) {
       const now = this.now();
       this.waiting.push({
         event,
@@ -106,7 +112,7 @@ export class ScheduledInjectionQueue {
     try {
       const result = await this.attemptOnce(w.event);
       if (this.stopped) return;
-      if (result.status === "busy") {
+      if (shouldWait(result)) {
         w.nextAttemptAt = this.now() + this.retryIntervalMs;
         if (!w.noticed && this.now() - w.firstAttemptAt >= this.noticeAfterMs) {
           w.noticed = true;
@@ -147,4 +153,13 @@ export class ScheduledInjectionQueue {
     const i = this.waiting.indexOf(w);
     if (i >= 0) this.waiting.splice(i, 1);
   }
+}
+
+/** Busy, or started and then interrupted by the user: try again when idle. */
+function shouldWait(result: InjectMessageResult): boolean {
+  return result.status === "busy" || result.status === "aborted";
+}
+
+function sameSchedule(a: ScheduledInjectionEvent, b: ScheduledInjectionEvent): boolean {
+  return a.name === b.name && a.channel === b.channel && a.chatId === b.chatId;
 }

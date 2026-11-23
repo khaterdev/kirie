@@ -138,6 +138,24 @@ export function daemonScrubbingConfig(config: KirieConfig): ScrubbingSchemaConfi
   return resolveScrubbingConfig(config);
 }
 
+let frozenScrubbing: ScrubbingSchemaConfig | null = null;
+
+/**
+ * The scrubbing config of this process: the first call fixes it, later calls
+ * (in-process restarts after a config change) return that first value. The
+ * daemon's scrubber and the stdio subprocess env both use it, so a restart can
+ * never loosen one without the other.
+ */
+export function freezeScrubbingConfig(cfg: ScrubbingSchemaConfig): ScrubbingSchemaConfig {
+  frozenScrubbing ??= cfg;
+  return frozenScrubbing;
+}
+
+/** Tests only. */
+export function resetFrozenScrubbingConfigForTesting(): void {
+  frozenScrubbing = null;
+}
+
 /** A rejection or exception reduced to `{ name, message }` before it reaches a log line (C.12 incident). */
 export function sanitizeErrorForLog(reason: unknown): { name: string; message: string } {
   if (reason instanceof Error) {
@@ -159,7 +177,7 @@ export const SCRUBBING_OFF_NOTICE =
 
 /** Scrubbing (PLAN B.10 "scrubbing"): the stdio subprocess config and the off warning. */
 export const setupScrubbing: FeatureSetup = (ctx) => {
-  ctx.kirieToolsEnv.KIRIE_SCRUB_CONFIG = JSON.stringify(daemonScrubbingConfig(ctx.config));
+  ctx.kirieToolsEnv.KIRIE_SCRUB_CONFIG = JSON.stringify(freezeScrubbingConfig(daemonScrubbingConfig(ctx.config)));
   const enabled = ctx.scrubber.isEnabled();
   return {
     name: "scrubbing",

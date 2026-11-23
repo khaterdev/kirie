@@ -15,7 +15,10 @@ import { FEATURES, runFeatureSetups, startFeatures, stopFeatures, type DaemonCon
 import { renderCommandsAddendum } from "./core-commands.js";
 import { createOwnerNotifier, OWNER_NOTIFY_KEY_INTERVAL_MS } from "./notify.js";
 import { registerCommandMenus } from "./menus.js";
-import { registerKnownSecrets, readSecretsDir, sanitizeErrorForLog, SCRUBBING_OFF_NOTICE, setupScrubbing } from "./scrubbing.js";
+import {
+  registerKnownSecrets, readSecretsDir, sanitizeErrorForLog, SCRUBBING_OFF_NOTICE, setupScrubbing,
+  freezeScrubbingConfig, resetFrozenScrubbingConfigForTesting,
+} from "./scrubbing.js";
 import { TaskHooks } from "../task-hooks.js";
 import { KirieConfigSchema, type BackgroundTask } from "@kirie/core";
 
@@ -262,7 +265,20 @@ describe("scrubbing wiring", () => {
     expect(sanitizeErrorForLog("plain")).toEqual({ name: "string", message: "plain" });
   });
 
+  it("a restart with a looser config keeps the first scrubbing config for the subprocess", async () => {
+    resetFrozenScrubbingConfigForTesting();
+    const first = fakeContext();
+    await setupScrubbing(first);
+    expect(JSON.parse(first.kirieToolsEnv.KIRIE_SCRUB_CONFIG!).enabled).toBe(true);
+    const restarted = fakeContext({ config: KirieConfigSchema.parse({ security: { scrubbing: { enabled: false } } }) });
+    await setupScrubbing(restarted);
+    expect(JSON.parse(restarted.kirieToolsEnv.KIRIE_SCRUB_CONFIG!).enabled).toBe(true);
+    expect(freezeScrubbingConfig(restarted.config.security.scrubbing).enabled).toBe(true);
+    resetFrozenScrubbingConfigForTesting();
+  });
+
   it("puts the scrub config in the kirie-tools env and tells the owner when scrubbing is off", async () => {
+    resetFrozenScrubbingConfigForTesting();
     const off = new SecretScrubber({ enabled: false });
     const ctx = fakeContext({ scrubber: off, config: KirieConfigSchema.parse({ security: { scrubbing: { enabled: false } } }) });
     const handle = await setupScrubbing(ctx);
@@ -272,6 +288,7 @@ describe("scrubbing wiring", () => {
   });
 
   it("maps logging.redactSensitive off to sinks.logs = false in the subprocess config", async () => {
+    resetFrozenScrubbingConfigForTesting();
     const ctx = fakeContext({ config: KirieConfigSchema.parse({ logging: { redactSensitive: "off" } }) });
     await setupScrubbing(ctx);
     expect(JSON.parse(ctx.kirieToolsEnv.KIRIE_SCRUB_CONFIG!).sinks.logs).toBe(false);

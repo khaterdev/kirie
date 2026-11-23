@@ -71,6 +71,7 @@ import { createOwnerNotifier } from "./features/notify.js";
 import { registerCommandMenus } from "./features/menus.js";
 import {
   daemonScrubbingConfig,
+  freezeScrubbingConfig,
   registerKnownSecrets,
   sanitizeErrorForLog,
 } from "./features/scrubbing.js";
@@ -182,7 +183,7 @@ export async function startDaemon(): Promise<void> {
   // 1a. Secret scrubber, first thing once the config is known (PLAN B.8).
   //     `enabled` is frozen at this first call: a reload or restart cannot turn
   //     it off. Known values are registered before any channel or engine runs.
-  const scrubbingConfig = daemonScrubbingConfig(config);
+  const scrubbingConfig = freezeScrubbingConfig(daemonScrubbingConfig(config));
   let scrubber: SecretScrubber;
   if (!scrubberConfigured) {
     scrubber = configureScrubber(scrubbingConfig);
