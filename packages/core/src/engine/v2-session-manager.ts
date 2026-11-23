@@ -8,7 +8,7 @@ import {
   type SDKResultMessage,
   type McpServerConfig,
 } from "@anthropic-ai/claude-agent-sdk";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { SessionStore } from "./session-store.js";
 import {
   wrapUserMessage,
@@ -40,7 +40,7 @@ import {
   type SdkTurnEndResult,
 } from "./sdk-options.js";
 
-const log = pino({ name: "v2-session-manager" });
+const log = createModuleLogger("v2-session-manager");
 
 /**
  * A deferred promise that can be resolved/rejected externally.

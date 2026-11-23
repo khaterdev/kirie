@@ -9,7 +9,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir, userInfo } from "node:os";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { Signal } from "./signals.js";
 import { isUsageLimit } from "./failure.js";
 import { OneShotError, runOneShot } from "./oneshot.js";
@@ -17,7 +17,7 @@ import type { SdkOptionsPipeline } from "./sdk-options.js";
 import type { ProactiveConfig } from "../config/schema.js";
 import type { HeartbeatLogStore } from "../mcp/tools/heartbeat-logs.js";
 
-const log = pino({ name: "triage" });
+const log = createModuleLogger("triage");
 
 // ---------------------------------------------------------------------------
 // Types

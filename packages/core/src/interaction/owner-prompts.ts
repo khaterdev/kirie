@@ -15,7 +15,7 @@
  */
 
 import { randomBytes, randomInt } from "node:crypto";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { ChannelAdapter, InlineButton } from "../channels/adapter.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { AuditTrail } from "../security/audit-trail.js";
@@ -29,7 +29,7 @@ import {
   type OwnerActionReply,
 } from "./router.js";
 
-const log = pino({ name: "owner-prompts" });
+const log = createModuleLogger("owner-prompts");
 
 export interface OwnerAskOption {
   /** /^[a-z0-9_]{1,16}$/ */

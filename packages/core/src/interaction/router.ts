@@ -12,14 +12,14 @@
  * Callback data format: "k1|<ns>|<action>", at most 64 bytes (Telegram limit).
  */
 
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { ChannelAdapter } from "../channels/adapter.js";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { ChannelName, UnifiedInteraction } from "../channels/normalizer.js";
 import type { AuditTrail } from "../security/audit-trail.js";
 import { interactionActor, type OwnerDirectory } from "./owners.js";
 
-const log = pino({ name: "interaction-router" });
+const log = createModuleLogger("interaction-router");
 
 export interface OwnerActionEvent {
   /** Namespace and action decoded from the callback data */

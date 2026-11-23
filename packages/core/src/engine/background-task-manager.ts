@@ -7,7 +7,7 @@ import {
   type SDKUserMessage,
   type McpServerConfig,
 } from "@anthropic-ai/claude-agent-sdk";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { BackgroundTaskStore, BackgroundTask } from "./background-task-store.js";
 import { parseSessionKey } from "../routing/session-key.js";
 import {
@@ -28,7 +28,7 @@ import {
   type SdkTurnEndResult,
 } from "./sdk-options.js";
 
-const log = pino({ name: "background-task-manager" });
+const log = createModuleLogger("background-task-manager");
 
 /** A result that arrives while a subagent is still running is intermediate; give up waiting after this. */
 export const SUBAGENT_RESULT_TIMEOUT_MS = 10 * 60 * 1000;

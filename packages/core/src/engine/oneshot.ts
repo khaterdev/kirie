@@ -12,11 +12,11 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { query, type CanUseTool, type Options } from "@anthropic-ai/claude-agent-sdk";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import { classifyFailure, feedTurnSignals, logSdkSignal, newTurnSignals, type FailureInfo } from "./failure.js";
 import type { SdkCallContext, SdkOptionsPipeline } from "./sdk-options.js";
 
-const log = pino({ name: "oneshot" });
+const log = createModuleLogger("oneshot");
 
 const DEFAULT_MAX_TURNS = 3;
 

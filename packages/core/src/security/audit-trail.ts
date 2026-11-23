@@ -23,9 +23,9 @@ import {
   statSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "audit-trail" });
+const log = createModuleLogger("audit-trail");
 
 export interface AuditRecord {
   /** ISO timestamp */

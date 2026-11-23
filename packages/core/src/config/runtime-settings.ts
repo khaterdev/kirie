@@ -13,11 +13,11 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { z } from "zod/v3";
 import type { AuditTrail } from "../security/audit-trail.js";
 
-const log = pino({ name: "runtime-settings" });
+const log = createModuleLogger("runtime-settings");
 
 export interface RuntimeSettingsOptions {
   /** Never write; re-read when the file changes (stdio MCP subprocess) */

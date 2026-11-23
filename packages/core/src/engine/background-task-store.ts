@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { scrubSecrets } from "../security/secret-scrubber.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "background-tasks.db");
 
@@ -278,6 +279,7 @@ export class BackgroundTaskStore {
    * Update task with completion result. A task already cancelled, completed
    * or failed keeps its outcome.
    */
+  /** The stored result is scrubbed for secrets (sink "task-result"); the prompt is not. */
   markCompleted(id: string, result: string, costUsd: number, numTurns: number): void {
     this.db
       .prepare(
@@ -285,7 +287,7 @@ export class BackgroundTaskStore {
          SET status = 'completed', result = ?, cost_usd = ?, num_turns = ?, updated_at = datetime('now')
          WHERE id = ? AND status IN ('pending', 'running')`,
       )
-      .run(result, costUsd, numTurns, id);
+      .run(scrubSecrets(result, { sink: "task-result" }), costUsd, numTurns, id);
   }
 
   /**
@@ -299,7 +301,7 @@ export class BackgroundTaskStore {
          SET status = 'failed', error = ?, updated_at = datetime('now')
          WHERE id = ? AND status IN ('pending', 'running')`,
       )
-      .run(error, id);
+      .run(scrubSecrets(error, { sink: "task-result" }), id);
   }
 
   /**

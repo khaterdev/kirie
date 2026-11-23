@@ -16,7 +16,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type {
   CanUseTool,
   HookCallback,
@@ -28,7 +28,7 @@ import type {
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
-const log = pino({ name: "sdk-options" });
+const log = createModuleLogger("sdk-options");
 
 // ---------------------------------------------------------------------------
 // Contract types (PLAN B.1)

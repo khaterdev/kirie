@@ -5,7 +5,7 @@ import {
   type SDKMessage,
   type McpServerConfig,
 } from "@anthropic-ai/claude-agent-sdk";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import {
   buildPrompt,
   type ChannelContext,
@@ -27,7 +27,7 @@ import {
 } from "./failure.js";
 import { chatCallContext, type SdkCallContext, type SdkOptionsPipeline } from "./sdk-options.js";
 
-const log = pino({ name: "agent-engine" });
+const log = createModuleLogger("agent-engine");
 
 /**
  * Minimal shape of a unified incoming message.

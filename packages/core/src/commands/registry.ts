@@ -16,7 +16,7 @@
  * forwarded to the agent. All replies are sent plain.
  */
 
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { ChannelName, UnifiedMessage } from "../channels/normalizer.js";
 import type { AuditTrail } from "../security/audit-trail.js";
 import { makeSessionKey } from "../routing/session-key.js";
@@ -39,7 +39,7 @@ import {
   type DispatchOutcome,
 } from "./types.js";
 
-const log = pino({ name: "commands" });
+const log = createModuleLogger("commands");
 
 export interface CommandRegistryDeps {
   owners: OwnerDirectory;
