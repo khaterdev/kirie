@@ -17,6 +17,8 @@ export interface ChatHistoryEntry {
   content: string;
   channel: string;
   created_at: string;
+  /** 1 when the user forwarded this text from someone else; null otherwise (and for rows stored before the flag existed) */
+  forwarded?: number | null;
 }
 
 interface ChatHistoryRow {
@@ -28,6 +30,7 @@ interface ChatHistoryRow {
   content: string;
   channel: string;
   created_at: string;
+  forwarded: number | null;
 }
 
 export interface EmbeddingProvider {
@@ -81,6 +84,18 @@ export class ChatHistoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_messages_session_key ON messages(session_key, created_at);
     `);
+
+    // Additive, nullable: databases from before the forwarded flag gain the column, old rows stay null.
+    // The MCP stdio process opens the same file, so another process may add it first.
+    const hasForwarded = (): boolean =>
+      (this.db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).some((c) => c.name === "forwarded");
+    if (!hasForwarded()) {
+      try {
+        this.db.exec("ALTER TABLE messages ADD COLUMN forwarded INTEGER");
+      } catch (err) {
+        if (!hasForwarded()) throw err;
+      }
+    }
 
     // FTS virtual table for full-text search
     this.db.exec(`
@@ -137,13 +152,15 @@ export class ChatHistoryStore {
       senderName?: string;
       senderId?: string;
       channel?: string;
+      /** The user forwarded this text from someone else */
+      forwarded?: boolean;
     },
   ): number {
     const content = scrubSecrets(rawContent, { sink: "chat-history" });
     const result = this.db
       .prepare(
-        `INSERT INTO messages (session_key, role, sender_name, sender_id, content, channel)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (session_key, role, sender_name, sender_id, content, channel, forwarded)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         sessionKey,
@@ -152,6 +169,7 @@ export class ChatHistoryStore {
         opts?.senderId ?? null,
         content,
         opts?.channel ?? "unknown",
+        opts?.forwarded ? 1 : null,
       );
 
     const msgId = Number(result.lastInsertRowid);
@@ -257,7 +275,7 @@ export class ChatHistoryStore {
     // Load all message vectors
     const rows = this.db.prepare(
       `SELECT mv.message_id, mv.embedding, m.session_key, m.role, m.sender_name,
-              m.sender_id, m.content, m.channel, m.created_at
+              m.sender_id, m.content, m.channel, m.created_at, m.forwarded
        FROM message_vectors mv
        JOIN messages m ON m.id = mv.message_id`
     ).all() as Array<{
@@ -270,6 +288,7 @@ export class ChatHistoryStore {
       content: string;
       channel: string;
       created_at: string;
+      forwarded: number | null;
     }>;
 
     // Score and rank
@@ -294,6 +313,7 @@ export class ChatHistoryStore {
       content: r.content,
       channel: r.channel,
       created_at: r.created_at,
+      forwarded: r.forwarded,
     }));
   }
 

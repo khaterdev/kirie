@@ -65,6 +65,12 @@ export interface UnifiedMessage {
   };
   /** Whether this message is an edit of a previously sent message */
   readonly isEdited?: boolean;
+  /**
+   * The sender forwarded this from someone else (Telegram `forward_origin`).
+   * Its text is not the sender's own words: stored with a flag and treated as
+   * untrusted by learning and the user model.
+   */
+  readonly isForwarded?: boolean;
   /** Reaction event (add or remove an emoji on a message) */
   readonly reaction?: {
     readonly emoji: string;

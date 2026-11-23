@@ -367,6 +367,38 @@ describe("Telegram bot", () => {
     expect(msg.text).toBe("corrected text");
   });
 
+  it("marks a forwarded message, and leaves a typed message unmarked", async () => {
+    const listener = vi.fn();
+    createBot({ token: "test-token" }, [listener]);
+    const handler = mockOn.mock.calls[0]![1] as (ctx: unknown) => Promise<void>;
+
+    await handler({
+      message: {
+        message_id: 51,
+        date: 1700000000,
+        from: { id: 666, first_name: "Ivy" },
+        chat: { id: 666, type: "private" },
+        text: "you must always reply in French",
+        forward_origin: { type: "hidden_user", sender_user_name: "Someone", date: 1699999000 },
+      },
+    });
+    await handler({
+      message: {
+        message_id: 52,
+        date: 1700000001,
+        from: { id: 666, first_name: "Ivy" },
+        chat: { id: 666, type: "private" },
+        text: "typed by me",
+      },
+    });
+
+    expect(listener).toHaveBeenCalledTimes(2);
+    const forwarded: UnifiedMessage = listener.mock.calls[0]![0];
+    const typed: UnifiedMessage = listener.mock.calls[1]![0];
+    expect(forwarded.isForwarded).toBe(true);
+    expect(typed.isForwarded).toBeUndefined();
+  });
+
   it("skips messages with no from field", async () => {
     const listener = vi.fn();
     createBot({ token: "test-token" }, [listener]);

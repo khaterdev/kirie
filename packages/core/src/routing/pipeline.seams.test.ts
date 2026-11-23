@@ -224,6 +224,20 @@ describe("MessagePipeline seams", () => {
     });
   });
 
+  describe("forwarded messages", () => {
+    it("are stored in chat history with the forwarded flag; typed ones without it", async () => {
+      pipeline.start();
+      await sendFromChannel(makeMessage({ id: "600", text: "forwarded text", isForwarded: true }));
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
+      await sendFromChannel(makeMessage({ id: "601", text: "typed text" }));
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+      const userRows = history.append.mock.calls.filter((c) => c[1] === "user");
+      expect(userRows[0]![2]).toBe("forwarded text");
+      expect(userRows[0]![3]).toMatchObject({ forwarded: true });
+      expect(userRows[1]![3]).not.toHaveProperty("forwarded");
+    });
+  });
+
   describe("injectMessage", () => {
     it("returns busy with skipIfBusy and does not abort the running turn", async () => {
       const ctl = controllableEngine();

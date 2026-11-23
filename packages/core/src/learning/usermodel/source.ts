@@ -7,6 +7,7 @@
  * - its session key is a DM (`<channel>:dm:<chatId>`) on the row's own channel, not the voice channel;
  * - its `sender_id` is a configured owner on that channel (for Telegram the DM chat id is the sender);
  * - it is not a command (`/...`), a reaction record (`[reacted ...]`, `[removed ...]`) or empty;
+ * - it was not forwarded: a forward (chat-history `forwarded = 1`) is someone else's words;
  * - it did not come from a schedule, loop, webhook or goal turn: when `turn_log` has a row for
  *   it, that turn's origin must be `owner_message`. A row stored after turn logging started
  *   with no turn row is of unknown provenance and refused; history from before the turn log
@@ -31,6 +32,8 @@ export interface UserModelHistoryRow {
   content: string;
   channel: string;
   created_at: string;
+  /** 1 when the owner forwarded it from someone else; null or absent otherwise (and on older databases) */
+  forwarded?: number | null;
 }
 
 /** Read-only view of chat history for the deriver and `/profile why`. */
@@ -60,20 +63,25 @@ export function openUserModelHistorySource(path: string): UserModelHistorySource
     db.pragma("busy_timeout = 3000");
     return db;
   };
-  const columns = "id, session_key, role, sender_name, sender_id, content, channel, created_at";
+  const base = "id, session_key, role, sender_name, sender_id, content, channel, created_at";
+  // The column is added by ChatHistoryStore on open; a database it has not opened yet has none.
+  const columns = (d: Database.Database): string => {
+    const names = (d.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    return names.includes("forwarded") ? `${base}, forwarded` : `${base}, NULL AS forwarded`;
+  };
   return {
     userRowsAfter(afterId, limit) {
       const d = handle();
       if (!d) return [];
       return d
-        .prepare(`SELECT ${columns} FROM messages WHERE id > ? AND role = 'user' AND session_key LIKE '%:dm:%' ORDER BY id ASC LIMIT ?`)
+        .prepare(`SELECT ${columns(d)} FROM messages WHERE id > ? AND role = 'user' AND session_key LIKE '%:dm:%' ORDER BY id ASC LIMIT ?`)
         .all(afterId, limit) as UserModelHistoryRow[];
     },
     byIds(ids) {
       const d = handle();
       if (!d || ids.length === 0) return [];
       const list = ids.filter(Number.isInteger).slice(0, 200);
-      return d.prepare(`SELECT ${columns} FROM messages WHERE id IN (${list.map(() => "?").join(",")})`).all(...list) as UserModelHistoryRow[];
+      return d.prepare(`SELECT ${columns(d)} FROM messages WHERE id IN (${list.map(() => "?").join(",")})`).all(...list) as UserModelHistoryRow[];
     },
     close() {
       db?.close();
@@ -102,10 +110,13 @@ export function userModelTurnOrigins(db: LearningDb, msgIds: readonly number[]):
 
 export type UserModelRowVerdict =
   | { ok: true; content: string }
-  | { ok: false; reason: "not_user" | "not_dm" | "voice" | "not_owner" | "synthetic" | "origin" | "no_turn" | "command" | "reaction" | "empty" };
+  | {
+      ok: false;
+      reason: "not_user" | "not_dm" | "voice" | "not_owner" | "forwarded" | "synthetic" | "origin" | "no_turn" | "command" | "reaction" | "empty";
+    };
 
 /** Rejections that do not depend on timing (a turn row that is not written yet): safe to skip for good. */
-export const USER_MODEL_PERMANENT_REJECTIONS: ReadonlySet<string> = new Set(["not_user", "not_dm", "voice", "not_owner"]);
+export const USER_MODEL_PERMANENT_REJECTIONS: ReadonlySet<string> = new Set(["not_user", "not_dm", "voice", "not_owner", "forwarded"]);
 
 /** Whether a history row is an owner-authored DM message the deriver may read. */
 export function classifyUserModelRow(
@@ -124,6 +135,7 @@ export function classifyUserModelRow(
   const sender = row.sender_id ?? "";
   if (!sender || !ctx.owners.isOwner(key.channel as ChannelName, sender)) return { ok: false, reason: "not_owner" };
   if (key.channel === "telegram" && key.chatId !== sender) return { ok: false, reason: "not_owner" };
+  if (row.forwarded === 1) return { ok: false, reason: "forwarded" };
   if (ctx.origin !== undefined) {
     if (ctx.origin !== "owner_message") return { ok: false, reason: "origin" };
   } else if (ctx.turnLogRequired) {

@@ -107,6 +107,19 @@ describe("UserModelDeriver input selection", () => {
     expect(h.deriver.watermark()).toBe(last);
   });
 
+  it("never reads a message the owner forwarded from someone else", async () => {
+    const h = harness();
+    const typed = h.env.addRow({ content: "I prefer short replies" });
+    const fwd = h.env.addRow({ content: "FORWARDED_FLAGGED the owner is vegan" });
+    h.env.history.prepare("UPDATE messages SET forwarded = 1 WHERE id = ?").run(fwd);
+    const r = await h.deriver.run("command");
+    expect(r.status).toBe("ok");
+    const p = h.prompts[0]!;
+    expect(p).toContain(`[c:${typed} `);
+    expect(p).not.toContain("FORWARDED_FLAGGED");
+    expect(r.counts.messages).toBe(1);
+  });
+
   it("scrubs secrets and cuts long messages before the model sees them", async () => {
     const h = harness();
     const fake = ["sk", "-ant-", "api03-", "Z".repeat(40)].join("");

@@ -67,6 +67,7 @@ function normalizeMessage(ctx: Context): UnifiedMessage | null {
     media: media.length > 0 ? media : undefined,
     timestamp: msg.date * 1000,
     isEdited,
+    ...(msg.forward_origin ? { isForwarded: true } : {}),
     raw: msg,
   };
 }

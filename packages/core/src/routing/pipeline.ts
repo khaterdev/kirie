@@ -718,6 +718,7 @@ export class MessagePipeline {
               senderName: message.senderName,
               senderId: message.senderId,
               channel: message.channel,
+              ...(message.isForwarded ? { forwarded: true } : {}),
             });
             if (typeof rowId === "number") userMsgId = rowId;
           } catch (historyErr) {
