@@ -160,12 +160,19 @@ const creds = program
   .description("Manage stored credentials");
 
 creds
-  .command("set <key> <value>")
-  .description("Store a credential (e.g. telegram.bot_token)")
-  .action(async (key: string, value: string) => {
+  .command("set <key> [value]")
+  .description("Store a credential (e.g. telegram.bot_token). Omit the value to type it hidden, out of shell history")
+  .action(async (key: string, value: string | undefined) => {
+    const { readCredentialValue } = await import("./credential-input.js");
+    const input = await readCredentialValue(key, value);
+    if ("error" in input) {
+      console.error(input.error);
+      process.exitCode = 1;
+      return;
+    }
     const { CredentialStore } = await import("@kirie/core");
     const store = new CredentialStore();
-    await store.set(key, value);
+    await store.set(key, input.value);
     console.log(`Credential "${key}" saved.`);
   });
 

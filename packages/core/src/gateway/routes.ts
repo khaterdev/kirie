@@ -25,10 +25,6 @@ export interface GatewayDeps {
   onShutdown: () => void;
   /** Callback to initiate graceful restart (stop + start without process exit) */
   onRestart: () => void;
-  /** Optional callback for Twilio voice status webhook events */
-  onVoiceStatusCallback?: (callSid: string, callStatus: string) => void;
-  /** Optional function to generate TwiML for a call stream */
-  generateTwiml?: (callId: string) => string | null;
   /** SSE clients connected to the canvas events endpoint */
   canvasSseClients?: Set<{ write: (data: string) => void; close: () => void }>;
   /** Broadcast a message to all connected canvas SSE clients */
@@ -285,49 +281,6 @@ export function createRoutes(deps: GatewayDeps): Hono {
     c.header("Content-Type", "text/csv");
     c.header("Content-Disposition", `attachment; filename="kirie-usage-${period}.csv"`);
     return c.body(csv);
-  });
-
-  // ── Voice webhook routes ──────────────────────────────────────────────
-
-  // POST /voice/twilio/webhook - handle Twilio call status callbacks
-  app.post("/voice/twilio/webhook", async (c) => {
-    try {
-      const formData = await c.req.parseBody();
-      const callSid = formData.CallSid as string | undefined;
-      const callStatus = formData.CallStatus as string | undefined;
-
-      if (!callSid || !callStatus) {
-        return c.json({ status: "error", message: "Missing CallSid or CallStatus" }, 400);
-      }
-
-      log.info({ callSid, callStatus }, "Twilio voice status callback");
-
-      if (deps.onVoiceStatusCallback) {
-        deps.onVoiceStatusCallback(callSid, callStatus);
-      }
-
-      return c.json({ status: "ok" });
-    } catch (err) {
-      log.error({ err }, "voice webhook error");
-      return c.json({ status: "error", message: "An internal error occurred" }, 500);
-    }
-  });
-
-  // POST /voice/twilio/twiml/:callId - serve TwiML for streaming
-  app.post("/voice/twilio/twiml/:callId", (c) => {
-    const callId = c.req.param("callId");
-
-    if (!deps.generateTwiml) {
-      return c.text("Voice not configured", 503);
-    }
-
-    const twiml = deps.generateTwiml(callId);
-    if (!twiml) {
-      return c.text("Call not found", 404);
-    }
-
-    c.header("Content-Type", "application/xml");
-    return c.body(twiml);
   });
 
   // ── Proactive intelligence API (used by stdio MCP subprocess) ────────

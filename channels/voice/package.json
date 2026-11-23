@@ -1,0 +1,17 @@
+{
+  "name": "@kirie/channel-voice",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsdown",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@kirie/core": "workspace:*",
+    "@kirie/voice": "workspace:*",
+    "hono": "^4.0.0"
+  }
+}

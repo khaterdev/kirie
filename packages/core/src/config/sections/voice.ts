@@ -79,3 +79,20 @@ export const VoiceConfigSchema = z.object({
 }).default({});
 
 export type VoiceConfig = z.infer<typeof VoiceConfigSchema>;
+
+/** Runtime override keys owned by voice (PLAN B.6, B.11). Only the /voice command writes them. */
+export const VOICE_SETTING_KEYS = {
+  /** Runtime on/off switch; absent means on whenever `voice.enabled` is true. */
+  switch: "voice.switch",
+  /** The active provider; absent means `voice.provider`. */
+  provider: "voice.provider",
+} as const;
+
+export const VoiceProviderSettingSchema = z.enum(["twilio", "plivo"]);
+export const VoiceSwitchSettingSchema = z.boolean();
+
+/** PIN format for inbound agent mode: 4 to 10 digits. */
+export const VOICE_PIN_RE = /^\d{4,10}$/;
+
+/** kirie-tools env flag the voice feature sets while voice is ready and switched on; the voice tools exist only then. */
+export const VOICE_TOOLS_ENV_FLAG = "KIRIE_VOICE_TOOLS";

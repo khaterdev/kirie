@@ -72,6 +72,9 @@ importers:
       '@kirie/channel-telegram':
         specifier: workspace:*
         version: link:../../channels/telegram
+      '@kirie/channel-voice':
+        specifier: workspace:*
+        version: link:../../channels/voice
       '@kirie/channel-whatsapp':
         specifier: workspace:*
         version: link:../../channels/whatsapp
@@ -87,6 +90,9 @@ importers:
       '@kirie/skills':
         specifier: workspace:*
         version: link:../../packages/skills
+      '@kirie/voice':
+        specifier: workspace:*
+        version: link:../../packages/voice
       pino:
         specifier: ^9.0.0
         version: 9.14.0
@@ -127,6 +133,18 @@ importers:
       grammy:
         specifier: ^1.35.0
         version: 1.39.3
+
+  channels/voice:
+    dependencies:
+      '@kirie/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@kirie/voice':
+        specifier: workspace:*
+        version: link:../../packages/voice
+      hono:
+        specifier: ^4.0.0
+        version: 4.11.8
 
   channels/whatsapp:
     dependencies:
