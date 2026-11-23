@@ -158,6 +158,10 @@ describe("curator feature", () => {
     expect((await say(b.ctx, `/proposals approve ${id}`, STRANGER)).kind).toBe("denied");
     expect(existsSync(join(skillsDir(), "weather"))).toBe(true);
 
+    // Approve only what was shown in full (LEARN-B3).
+    expect((await say(b.ctx, `/proposals approve ${id}`)).reply).toContain(`/proposals show ${id}`);
+    expect(existsSync(join(skillsDir(), "weather"))).toBe(true);
+    await say(b.ctx, `/proposals show ${id}`);
     const approved = await say(b.ctx, `/proposals approve ${id}`);
     expect(approved.reply).toContain(`Applied #${id}`);
     expect(existsSync(join(skillsDir(), "weather"))).toBe(false);

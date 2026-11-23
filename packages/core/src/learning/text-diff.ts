@@ -5,12 +5,16 @@
 
 const MAX_CELLS = 4_000_000;
 
-/** Unified-style diff (`-`, `+`, ` ` prefixes) with `context` lines around changes. */
+/**
+ * Unified-style diff (`-`, `+`, ` ` prefixes) with `context` lines around
+ * changes. When the diff is too large to compute, the complete new content is
+ * returned instead, so a review always shows what would be written (LEARN-B3).
+ */
 export function unifiedLineDiff(before: string, after: string, context = 2): string {
   const a = before.replace(/\r\n/g, "\n").split("\n");
   const b = after.replace(/\r\n/g, "\n").split("\n");
   if (a.length * b.length > MAX_CELLS) {
-    return `(file too large to diff: ${a.length} lines before, ${b.length} lines after)`;
+    return `(too large to diff: ${a.length} lines before, ${b.length} lines after; the complete new content follows)\n${after}`;
   }
   // LCS table, bottom-up.
   const n = a.length;
@@ -51,6 +55,9 @@ export function unifiedLineDiff(before: string, after: string, context = 2): str
 }
 
 export function diffStats(before: string, after: string): { added: number; removed: number } {
+  const a = before.replace(/\r\n/g, "\n").split("\n").length;
+  const b = after.replace(/\r\n/g, "\n").split("\n").length;
+  if (a * b > MAX_CELLS) return { added: b, removed: a };
   let added = 0;
   let removed = 0;
   for (const line of unifiedLineDiff(before, after, 0).split("\n")) {

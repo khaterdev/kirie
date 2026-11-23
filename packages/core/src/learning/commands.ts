@@ -15,7 +15,7 @@ import type { RuntimeSettings } from "../config/runtime-settings.js";
 import { mintOwnerApproval, type ProposalApplier } from "./applier.js";
 import type { ProposalRecord, ProposalStore } from "./proposal-store.js";
 import type { ReflectionEngine } from "./reflection.js";
-import { ProposalReviewLog, proposalAllowsBulk, proposalAllowsOneTap, renderProposalDetail } from "./notifier.js";
+import { ProposalReviewLog, notSeenInFullText, proposalAllowsBulk, proposalSeenInFull, renderProposalDetailPages } from "./notifier.js";
 
 export interface LearningCommandDeps {
   store: ProposalStore;
@@ -168,8 +168,8 @@ export function createLearningCommands(deps: LearningCommandDeps): CommandDefini
     args: "list [all] | show <id> | approve <id>[,<id>] [force] | reject <id>[,<id>] [reason] | undo <id>",
     usage:
       "/proposals or /proposals list [all]: pending (or recent) proposals\n" +
-      "/proposals show <id>: full content and diff\n" +
-      "/proposals approve <id>[,<id>] [force]: apply. Several ids only for owner-trust proposals without flags; force is needed for code-scanner flags\n" +
+      "/proposals show <id>: the complete content and diff, over several messages when it is long\n" +
+      "/proposals approve <id>[,<id>] [force]: apply. Only after you have seen the whole content (a card that showed all of it, or /proposals show). Several ids only for owner-trust proposals without flags, never for ones the assistant filed itself; force is needed for code-scanner flags\n" +
       "/proposals reject <id>[,<id>] [reason]\n" +
       "/proposals undo <id>: restore what an applied proposal changed",
     subcommands: {
@@ -194,8 +194,11 @@ export function createLearningCommands(deps: LearningCommandDeps): CommandDefini
           if (!ids || ids.length !== 1) return "Usage: /proposals show <id>";
           const rec = deps.store.get(ids[0]!);
           if (!rec) return `Proposal #${ids[0]} not found.`;
+          // The whole content, over as many messages as it takes; it counts as shown only once every part went out.
+          const pages = renderProposalDetailPages(rec, deps.applier.preview(rec));
+          for (const page of pages.slice(0, -1)) await ctx.reply(page);
           reviews.markShown(rec);
-          return renderProposalDetail(rec, deps.applier.preview(rec));
+          return pages.at(-1)!;
         }
         case "approve": {
           const ids = parseIds(ctx.argv[1]);
@@ -208,14 +211,17 @@ export function createLearningCommands(deps: LearningCommandDeps): CommandDefini
             const recs = ids.map((id) => deps.store.get(id));
             const blocked = ids.filter((_id, i) => { const r = recs[i]; return !r || !proposalAllowsBulk(r); });
             if (blocked.length > 0) {
-              return `Bulk approve is only for owner-trust proposals without flags. Approve these one at a time after /proposals show: ${blocked.map((id) => `#${id}`).join(", ")}`;
+              return `Bulk approve is only for owner-trust proposals without flags that the assistant did not file itself. Approve these one at a time after /proposals show: ${blocked.map((id) => `#${id}`).join(", ")}`;
+            }
+            const unseen = recs.filter((r) => r && !proposalSeenInFull(r, deps.applier.preview(r), reviews)).map((r) => r!.id);
+            if (unseen.length > 0) {
+              return `You have not seen all of these yet. Read each with /proposals show <id> first: ${unseen.map((id) => `#${id}`).join(", ")}`;
             }
           } else {
             const rec = deps.store.get(ids[0]!);
             if (!rec) return `Proposal #${ids[0]} not found.`;
-            if (!proposalAllowsOneTap(rec) && !reviews.wasShown(rec)) {
-              return `Proposal #${rec.id} is not from your own messages alone, or is flagged. Read it first with /proposals show ${rec.id}, then approve it.`;
-            }
+            const preview = deps.applier.preview(rec);
+            if (!proposalSeenInFull(rec, preview, reviews)) return notSeenInFullText(rec, preview);
           }
           const lines: string[] = [];
           for (const id of ids) {

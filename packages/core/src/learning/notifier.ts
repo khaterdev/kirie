@@ -8,13 +8,19 @@
  * - Cards use `OwnerPrompts.sendCard`, namespace `prop`, action
  *   `<a|r|s>:<id>:<h8>` (h8 = first 8 hex chars of payload_hash). A press is
  *   refused when h8 does not match the stored hash.
- * - One-tap Approve only for trust `owner` or `mixed` without `scanner_block`.
- *   `mixed` cards carry a warning line. `untrusted` and `unverified` cards have
- *   only Show and Reject; they are approved with the typed command after show.
+ * - The full-content rule (LEARN-B3): Approve is offered only for content the
+ *   owner has been shown in full. A card carries Approve only when it shows the
+ *   whole content, the trust is `owner`, no blocking flag is set and the
+ *   proposal was not filed by the agent (LEARN-N4). Everything else needs
+ *   `/proposals show <id>`, which sends the complete content over as many
+ *   messages as needed, then a typed `/proposals approve <id>`.
+ * - Every text shown for review is scrubbed and has hidden and bidi
+ *   characters replaced by visible `[U+XXXX]` markers.
  * - Other features add lines to the next digest with `queueLine(text)`.
  */
 
 import { createModuleLogger } from "../logging/logger.js";
+import { scrubSecrets } from "../security/secret-scrubber.js";
 import type { OwnerCard, OwnerPrompts } from "../interaction/owner-prompts.js";
 import type { OwnerActionEvent, OwnerActionHandler, OwnerActionReply } from "../interaction/router.js";
 import type { ChannelName } from "../channels/normalizer.js";
@@ -23,13 +29,17 @@ import type { LearningAuditSink } from "./intake.js";
 import type { LearningKv } from "./learning-db.js";
 import type { ProposalRecord, ProposalStore } from "./proposal-store.js";
 import { payloadHash8, type ProposalOrigin } from "./proposal-types.js";
+import { revealInvisibleChars } from "./invisible-chars.js";
 
 const log = createModuleLogger("learning-notifier");
 
 export const PROPOSAL_ACTION_NS = "prop";
 export const DIGEST_MAX_CARDS = 5;
-const CARD_PREVIEW_CHARS = 600;
-const SHOW_PREVIEW_CHARS = 3200;
+/** A card shows the whole content when it is at most this long; otherwise this much, marked truncated. */
+export const CARD_FULL_CONTENT_CHARS = 2500;
+const CARD_TRUNCATED_CHARS = 600;
+/** Content characters per /proposals show message (each message stays under Telegram's 4096). */
+export const SHOW_PAGE_CHARS = 3000;
 const MAX_QUEUED_LINES = 20;
 const DIGEST_ORIGINS: readonly ProposalOrigin[] = ["reflection", "curator", "user_model"];
 const LAST_DIGEST_KEY = "notify:last_digest_at";
@@ -41,27 +51,47 @@ const LAST_DIGEST_KEY = "notify:last_digest_at";
 /** Flags that rule out one-tap approval. */
 const ONE_TAP_BLOCKING_FLAGS = new Set(["scanner_block", "injection_pattern", "untrusted_source"]);
 
+type PolicyFields = Pick<ProposalRecord, "trust" | "riskFlags" | "origin">;
+
 /**
- * One-tap Approve (and typed approve without a prior show): owner trust and no
- * blocking flag. `mixed`, `untrusted` and `unverified` need /proposals show,
- * then a typed /proposals approve.
+ * Trust and flags that allow one-tap Approve (and bulk with no flags at all):
+ * `owner` trust, no blocking flag, and never a proposal the agent filed
+ * itself (LEARN-N4: a rule on the origin, not a flag that might be cleared).
+ * One-tap also needs a card that showed the whole content: see
+ * `proposalOffersOneTap`.
  */
-export function proposalAllowsOneTap(rec: Pick<ProposalRecord, "trust" | "riskFlags">): boolean {
-  return rec.trust === "owner" && !rec.riskFlags.some((f) => ONE_TAP_BLOCKING_FLAGS.has(f));
+export function proposalAllowsOneTap(rec: PolicyFields): boolean {
+  return rec.origin !== "agent_tool" && rec.trust === "owner" && !rec.riskFlags.some((f) => ONE_TAP_BLOCKING_FLAGS.has(f));
 }
 
-/** Bulk approve: owner trust and no risk flags at all. */
-export function proposalAllowsBulk(rec: Pick<ProposalRecord, "trust" | "riskFlags">): boolean {
-  return rec.trust === "owner" && rec.riskFlags.length === 0;
+/** Bulk approve: one-tap trust, no risk flags at all, never agent-filed. Each one must still have been seen in full. */
+export function proposalAllowsBulk(rec: PolicyFields): boolean {
+  return proposalAllowsOneTap(rec) && rec.riskFlags.length === 0;
+}
+
+/** The text shown to the owner for review: scrubbed, hidden and bidi characters made visible. */
+export function reviewText(preview: string): string {
+  return revealInvisibleChars(scrubSecrets(preview, { sink: "channel" }));
+}
+
+/** True when a card can carry the whole review text. */
+export function cardShowsFullContent(preview: string): boolean {
+  return reviewText(preview).length <= CARD_FULL_CONTENT_CHARS;
+}
+
+/** One-tap Approve is offered: allowed trust and flags, and the card shows the whole content. */
+export function proposalOffersOneTap(rec: PolicyFields, preview: string): boolean {
+  return proposalAllowsOneTap(rec) && cardShowsFullContent(preview);
 }
 
 /** How long a show counts for a later typed approve. */
 export const SHOW_BEFORE_APPROVE_MS = 30 * 60_000;
 
 /**
- * Which proposals the owner has looked at in full (/proposals show or the Show
- * button), keyed by id and payload hash, so a typed approve applies exactly
- * the content that was shown. In memory: a restart needs a new show.
+ * Which proposals the owner has been shown in full (/proposals show, or the
+ * Show button when the whole content fits in one message), keyed by id and
+ * payload hash, so a typed approve applies exactly the content that was
+ * shown. In memory: a restart needs a new show.
  */
 export class ProposalReviewLog {
   private readonly shown = new Map<string, number>();
@@ -86,66 +116,135 @@ export class ProposalReviewLog {
   }
 }
 
+/**
+ * The full-content rule for a typed approve: the owner ran a full show in
+ * this session, or the proposal went out as a card that showed all of it
+ * with one-tap Approve.
+ */
+export function proposalSeenInFull(
+  rec: PolicyFields & Pick<ProposalRecord, "id" | "payloadHash" | "notifiedAt">,
+  preview: string,
+  reviews: ProposalReviewLog,
+): boolean {
+  return reviews.wasShown(rec) || (rec.notifiedAt !== null && proposalOffersOneTap(rec, preview));
+}
+
+/** Why a typed approve is refused under the full-content rule. */
+export function notSeenInFullText(rec: Pick<ProposalRecord, "id">, preview: string): string {
+  const len = reviewText(preview).length;
+  if (len > CARD_FULL_CONTENT_CHARS) {
+    const parts = Math.ceil(len / SHOW_PAGE_CHARS);
+    return `Proposal #${rec.id} is ${len.toLocaleString("en-US")} characters long and you have not seen all of it. Read it with /proposals show ${rec.id} (${parts} message${parts === 1 ? "" : "s"}), then approve it.`;
+  }
+  return `Read proposal #${rec.id} first with /proposals show ${rec.id}, then approve it.`;
+}
+
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
+/** What the trust label means, without claiming more than the code checked (LEARN-N12). */
 function trustLine(rec: ProposalRecord): string {
-  if (rec.trust === "owner") return "Trust: owner (from your own messages)";
-  if (rec.trust === "mixed") return "Trust: mixed. Warning: the turn also read content not written by you (web, files, shell, tools). Read it in full before approving.";
+  if (rec.origin === "agent_tool") {
+    return `Trust: ${rec.trust}. Filed by the assistant itself during a conversation; read it in full before approving. It is never approved with one tap or in bulk.`;
+  }
+  if (rec.trust === "owner") {
+    if (rec.origin === "curator") return "Trust: owner. Built by code from your approved skill files and usage records.";
+    return "Trust: owner. The turn log shows only your own direct messages as input for it: no web, file or tool output, forwarded, replied-to or group text, and no background results.";
+  }
+  if (rec.trust === "mixed") return "Trust: mixed. Warning: content not written by you was in the context (web, files, tool output, replied-to or earlier messages, background results). Read it in full before approving.";
+  if (rec.origin === "curator") return `Trust: ${rec.trust}. It is about skill content you have not approved; it cannot be approved with one tap.`;
   return `Trust: ${rec.trust}. Derived from content not written by you; it cannot be approved with one tap.`;
 }
 
-function hintLine(rec: ProposalRecord): string {
-  return proposalAllowsOneTap(rec)
+function hintLine(rec: ProposalRecord, preview: string): string {
+  return proposalOffersOneTap(rec, preview)
     ? `Reply /proposals approve ${rec.id} or /proposals reject ${rec.id}.`
-    : `Review with Show or /proposals show ${rec.id}, then /proposals approve ${rec.id}${rec.riskFlags.includes("scanner_block") ? " force" : ""}, or /proposals reject ${rec.id}.`;
+    : `Read it all with Show or /proposals show ${rec.id}, then /proposals approve ${rec.id}${rec.riskFlags.includes("scanner_block") ? " force" : ""}, or /proposals reject ${rec.id}.`;
+}
+
+function headerLines(rec: ProposalRecord): string[] {
+  const lines = [`Proposal #${rec.id} · ${rec.kind}`, rec.title, `Source: ${rec.origin}`, trustLine(rec)];
+  if (rec.riskFlags.length > 0) lines.push(`Flags: ${rec.riskFlags.join(", ")}`);
+  return lines;
 }
 
 export function renderProposalCardText(rec: ProposalRecord, preview: string): string {
-  const lines = [
-    `Proposal #${rec.id} · ${rec.kind}`,
-    rec.title,
-    `Source: ${rec.origin}`,
-    trustLine(rec),
-  ];
-  if (rec.riskFlags.length > 0) lines.push(`Flags: ${rec.riskFlags.join(", ")}`);
-  lines.push("", truncate(preview, CARD_PREVIEW_CHARS), "", hintLine(rec));
+  const body = reviewText(preview);
+  const len = body.length.toLocaleString("en-US");
+  const lines = headerLines(rec);
+  if (body.length <= CARD_FULL_CONTENT_CHARS) {
+    lines.push(`Content: ${len} characters, shown in full.`, "", body);
+  } else {
+    lines.push(
+      `Content: ${len} characters. TRUNCATED: this card shows only the first ${CARD_TRUNCATED_CHARS.toLocaleString("en-US")}. Read all of it with /proposals show ${rec.id} before approving.`,
+      "",
+      truncate(body, CARD_TRUNCATED_CHARS),
+    );
+  }
+  lines.push("", hintLine(rec, preview));
   return lines.join("\n");
 }
 
-export function proposalCardButtons(rec: ProposalRecord): NonNullable<OwnerCard["buttons"]> {
+export function proposalCardButtons(rec: ProposalRecord, preview: string): NonNullable<OwnerCard["buttons"]> {
   const h8 = payloadHash8(rec.payloadHash);
   const show = { label: "Show", ns: PROPOSAL_ACTION_NS, action: `s:${rec.id}:${h8}` };
   const reject = { label: "Reject", ns: PROPOSAL_ACTION_NS, action: `r:${rec.id}:${h8}` };
-  if (!proposalAllowsOneTap(rec)) return [[show, reject]];
+  if (!proposalOffersOneTap(rec, preview)) return [[show, reject]];
   return [[{ label: "Approve", ns: PROPOSAL_ACTION_NS, action: `a:${rec.id}:${h8}` }, reject, show]];
 }
 
 export function renderProposalCard(rec: ProposalRecord, preview: string): OwnerCard {
-  return { text: renderProposalCardText(rec, preview), buttons: proposalCardButtons(rec), plain: true };
+  return { text: renderProposalCardText(rec, preview), buttons: proposalCardButtons(rec, preview), plain: true };
 }
 
-/** Full detail for /proposals show and the Show button. */
-export function renderProposalDetail(rec: ProposalRecord, preview: string, maxPreview = SHOW_PREVIEW_CHARS): string {
-  const lines = [
+/** Split text into chunks of at most `max` characters, at a line break when one is near. */
+function splitPages(text: string, max: number): string[] {
+  const out: string[] = [];
+  let rest = text;
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf("\n", max);
+    if (cut < max / 2) cut = max;
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  out.push(rest);
+  return out;
+}
+
+/**
+ * The complete detail for /proposals show: metadata, then the whole review
+ * text split over as many messages as needed. Nothing is cut.
+ */
+export function renderProposalDetailPages(rec: ProposalRecord, preview: string): string[] {
+  const meta = [
     `Proposal #${rec.id} · ${rec.kind} · ${rec.status}`,
     rec.title,
     `Source: ${rec.origin}${rec.sourceSessionKey ? ` (${rec.sourceSessionKey})` : ""}`,
     trustLine(rec),
   ];
-  if (rec.riskFlags.length > 0) lines.push(`Flags: ${rec.riskFlags.join(", ")}`);
-  if (rec.redactions > 0) lines.push(`Secrets redacted: ${rec.redactions}`);
-  if (rec.sourceMsgFrom !== null && rec.sourceMsgTo !== null) lines.push(`Evidence: chat messages m:${rec.sourceMsgFrom} to m:${rec.sourceMsgTo}`);
-  if (rec.sourceTurnIds.length > 0) lines.push(`Turns: ${rec.sourceTurnIds.slice(0, 20).join(", ")}`);
-  lines.push(`Created ${rec.createdAt.slice(0, 16).replace("T", " ")} UTC, expires ${rec.expiresAt.slice(0, 10)}`);
-  if (rec.decidedBy) lines.push(`Decided by ${rec.decidedBy}${rec.decidedVia ? ` via ${rec.decidedVia}` : ""}`);
-  if (rec.rejectReason) lines.push(`Reason: ${rec.rejectReason}`);
-  if (rec.error) lines.push(`Error: ${rec.error}`);
-  if (rec.rationale) lines.push("", `Why: ${truncate(rec.rationale, 600)}`);
-  lines.push("", truncate(preview, maxPreview));
-  if (rec.status === "pending" || rec.status === "failed") lines.push("", hintLine(rec));
-  return lines.join("\n");
+  if (rec.riskFlags.length > 0) meta.push(`Flags: ${rec.riskFlags.join(", ")}`);
+  if (rec.redactions > 0) meta.push(`Secrets redacted: ${rec.redactions}`);
+  if (rec.sourceMsgFrom !== null && rec.sourceMsgTo !== null) meta.push(`Evidence: chat messages m:${rec.sourceMsgFrom} to m:${rec.sourceMsgTo}`);
+  if (rec.sourceTurnIds.length > 0) meta.push(`Turns: ${rec.sourceTurnIds.slice(0, 20).join(", ")}`);
+  meta.push(`Created ${rec.createdAt.slice(0, 16).replace("T", " ")} UTC, expires ${rec.expiresAt.slice(0, 10)}`);
+  if (rec.decidedBy) meta.push(`Decided by ${rec.decidedBy}${rec.decidedVia ? ` via ${rec.decidedVia}` : ""}`);
+  if (rec.rejectReason) meta.push(`Reason: ${rec.rejectReason}`);
+  if (rec.error) meta.push(`Error: ${rec.error}`);
+  if (rec.rationale) meta.push("", `Why: ${truncate(reviewText(rec.rationale), 600)}`);
+
+  const body = reviewText(preview);
+  const chunks = splitPages(body, SHOW_PAGE_CHARS);
+  const n = chunks.length;
+  meta.push("", `Content: ${body.length.toLocaleString("en-US")} characters${n > 1 ? `, in ${n} messages` : ""}.`);
+  const tail = rec.status === "pending" || rec.status === "failed" ? ["", hintLine(rec, preview)] : [];
+  if (n === 1) return [[...meta, "", chunks[0]!, ...tail].join("\n")];
+  return chunks.map((chunk, i) => {
+    const head = `Proposal #${rec.id}, part ${i + 1} of ${n}`;
+    if (i === 0) return [head, ...meta, "", chunk].join("\n");
+    if (i === n - 1) return [head, "", chunk, "", `End of proposal #${rec.id}.`, ...tail].join("\n");
+    return [head, "", chunk].join("\n");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -265,8 +364,16 @@ export function createProposalActionHandler(deps: ProposalActionDeps): OwnerActi
     const now = deps.now?.() ?? new Date();
 
     if (op === "s") {
-      deps.reviews.markShown(rec);
-      return { replaceText: renderProposalDetail(rec, deps.applier.preview(rec)) };
+      const preview = deps.applier.preview(rec);
+      const pages = renderProposalDetailPages(rec, preview);
+      if (pages.length === 1) {
+        deps.reviews.markShown(rec);
+        return { replaceText: pages[0]! };
+      }
+      // Too long for one message: never count this as a full show.
+      return {
+        replaceText: `${pages[0]!}\n\n(Part 1 of ${pages.length} only. Send /proposals show ${id} to read all of it; it cannot be approved before that.)`,
+      };
     }
     if (op === "r") {
       const ok = deps.applier.reject(id, approval, "rejected from card");
@@ -274,7 +381,8 @@ export function createProposalActionHandler(deps: ProposalActionDeps): OwnerActi
         ? { replaceText: `Proposal #${id} · ${rec.title}\nRejected ${hhmm(now)}`, removeButtons: true, toast: "Rejected" }
         : { toast: `Proposal #${id} is already ${rec.status}.`, removeButtons: true };
     }
-    if (!proposalAllowsOneTap(rec)) {
+    // One tap only for a card that went out and showed the whole content (LEARN-B3).
+    if (rec.notifiedAt === null || !proposalOffersOneTap(rec, deps.applier.preview(rec))) {
       return { toast: `Proposal #${id} needs /proposals show ${id}, then /proposals approve ${id}.`, alert: true };
     }
     const outcome = await deps.applier.approve(id, approval);
