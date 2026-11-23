@@ -72,6 +72,54 @@ function splitPath(p: string): string[] {
   return p.split("/").filter((s) => s.length > 0);
 }
 
+/**
+ * Could some path match both globs? Used when a command names a path with a
+ * glob (`cat ~/.ssh/*`, `echo x >> ~/.zsh?c`) to decide whether it can reach a
+ * protected path. `*` and `?` in a segment do not match a leading dot (shell
+ * rule); `**` spans any number of segments; two globbed segments are assumed
+ * to overlap. Case-insensitive.
+ */
+export function approvalPathGlobsIntersect(a: string, b: string): boolean {
+  const as = a.toLowerCase().split("/").filter((x) => x.length > 0);
+  const bs = b.toLowerCase().split("/").filter((x) => x.length > 0);
+  const memo = new Map<number, boolean>();
+  const width = bs.length + 1;
+  const segOk = (x: string, y: string): boolean => {
+    const gx = hasGlobChars(x);
+    const gy = hasGlobChars(y);
+    if (!gx && !gy) return x === y;
+    if (gx && gy) {
+      // Both globbed: overlap unless their literal prefixes or suffixes already disagree.
+      const pre = (g: string): string => g.slice(0, g.search(/[*?[]/));
+      const suf = (g: string): string => {
+        let k = g.length;
+        while (k > 0 && !"*?]".includes(g[k - 1]!)) k--;
+        return g.slice(k);
+      };
+      const px = pre(x), py = pre(y), sx = suf(x), sy = suf(y);
+      if ((px.startsWith(".") && py === "") || (py.startsWith(".") && px === "")) return false;
+      return (px.startsWith(py) || py.startsWith(px)) && (sx.endsWith(sy) || sy.endsWith(sx));
+    }
+    const [glob, lit] = gx ? [x, y] : [y, x];
+    if (lit.startsWith(".") && !glob.startsWith(".")) return false;
+    return matchApprovalGlob(glob, lit);
+  };
+  const walk = (i: number, j: number): boolean => {
+    const key = i * width + j;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+    let r: boolean;
+    if (i === as.length && j === bs.length) r = true;
+    else if (i < as.length && as[i] === "**") r = walk(i + 1, j) || (j < bs.length && walk(i, j + 1));
+    else if (j < bs.length && bs[j] === "**") r = walk(i, j + 1) || (i < as.length && walk(i + 1, j));
+    else if (i === as.length || j === bs.length) r = false;
+    else r = segOk(as[i]!, bs[j]!) && walk(i + 1, j + 1);
+    memo.set(key, r);
+    return r;
+  };
+  return walk(0, 0);
+}
+
 /** True when `segment` contains an unescaped glob metacharacter. */
 export function hasGlobChars(segment: string): boolean {
   for (const ch of segment) {

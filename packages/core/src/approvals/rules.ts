@@ -137,7 +137,8 @@ function startsWithAny(a: string, prefixes: readonly string[]): boolean {
 function norm(seg: ShellSegment, p: string, env: ApprovalRuleEnv): NormalizedApprovalPath | null {
   if (!p) return null;
   const absoluteish = p.startsWith("/") || p.startsWith("~") || p.startsWith("$HOME") || p.startsWith("${HOME}");
-  if (!absoluteish && seg.cwd === null && seg.remote) return null;
+  // A null cwd means "unknown" (after `cd "$X"`, or on a remote host): relative paths cannot be placed.
+  if (!absoluteish && seg.cwd === null) return null;
   const cwd = seg.cwd ?? env.cwd;
   if (!absoluteish && !cwd) return null;
   return normalizeApprovalPath(p, cwd, env.path, env.cache);
@@ -212,10 +213,11 @@ export function segmentWriteTargets(seg: ShellSegment): string[] {
 const NON_READING = new Set([
   "ls", "stat", "test", "[", "[[", "touch", "mkdir", "chmod", "chown", "chgrp", "chflags", "du", "file", "realpath",
   "readlink", "dirname", "basename", "which", "type", "rm", "unlink", "rmdir", "cd", "pushd", "echo", "printf", "mv",
-  "ln", "true", "false", ":", "lsof", "mdls", "xattr", "open",
+  "true", "false", ":", "lsof", "mdls", "xattr", "open",
 ]);
 const IDENTITY_FILE_COMMANDS = new Set(["ssh", "scp", "sftp", "ssh-add", "ssh-keygen", "rsync", "git", "mosh", "autossh"]);
-const RECURSIVE_READERS = new Set(["rg", "ag", "ack", "tar", "zip", "rsync", "7z", "ditto", "find"]);
+/** Commands that read (or expose, like a symlink) everything under a folder. */
+const RECURSIVE_READERS = new Set(["rg", "ag", "ack", "tar", "zip", "rsync", "7z", "ditto", "find", "ln"]);
 
 /** Path-like values this segment reads (positionals, option values, `@file` arguments, input redirects). */
 function segmentReadCandidates(seg: ShellSegment): string[] {
@@ -262,15 +264,16 @@ function rmInfo(seg: ShellSegment): { recursive: boolean; noPreserveRoot: boolea
     const v = a.value;
     if (!endOpts && v === "--") { endOpts = true; continue; }
     if (!endOpts && v.startsWith("--")) {
-      if (v === "--recursive") recursive = true;
-      if (v === "--no-preserve-root") noPreserveRoot = true;
+      // GNU accepts any unambiguous prefix: --rec, --recur, --no-p ...
+      if (v.length >= 3 && "--recursive".startsWith(v)) recursive = true;
+      if (v.length >= 3 && "--no-preserve-root".startsWith(v)) noPreserveRoot = true;
       continue;
     }
     if (!endOpts && v.startsWith("-") && v.length > 1) {
       if (v.includes("r") || v.includes("R")) recursive = true;
       continue;
     }
-    targets.push({ value: v, expansion: a.expansion });
+    targets.push({ value: a.literalTilde ? `./${v}` : v, expansion: a.expansion });
   }
   return { recursive, noPreserveRoot, targets };
 }
@@ -288,14 +291,20 @@ function isRootishTarget(seg: ShellSegment, t: { value: string; expansion: boole
     v = v.replace(/^\$\{HOME:[-?][^}]*\}/, "$HOME").replace(/^\$\{HOME\}/, "$HOME");
   }
   const parts = v.split("/");
+  // `/*/` and `~/` : trailing slashes do not change the target.
+  while (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
   let globbed = false;
+  let matchAll = true;
+  const isMatchAll = (seg: string): boolean => seg.replace(/[*?]/g, "").replace(/^\./, "") === "" || seg === "{*,.*}" || seg === "{.*,*}";
   while (parts.length > 1 && hasGlobChars(parts[parts.length - 1]!)) {
+    if (!isMatchAll(parts[parts.length - 1]!)) matchAll = false;
     parts.pop();
     globbed = true;
   }
   const last = parts[parts.length - 1] ?? "";
   if (parts.length === 1 && hasGlobChars(last)) {
     // A bare glob (`*`, `.*`) is relative to the working directory.
+    if (!isMatchAll(last)) matchAll = false;
     parts[0] = ".";
     globbed = true;
   }
@@ -303,8 +312,10 @@ function isRootishTarget(seg: ShellSegment, t: { value: string; expansion: boole
   if (base === "" && v.startsWith("/")) base = "/";
   const n = norm(seg, base, env);
   if (!n) return false;
-  if (isApprovalRootTarget(n, env.path)) return true;
-  return globbed && n.lexical === "/";
+  // Any glob directly under / reaches system folders (/U* = /Users and /usr).
+  if (globbed && n.lexical === "/") return true;
+  // Under home or another root only a match-everything glob (*, .*, ?*) is a wipe; ~/*.log is not.
+  return isApprovalRootTarget(n, env.path) && (!globbed || matchAll);
 }
 
 function anyRootTarget(seg: ShellSegment, targets: Array<{ value: string; expansion: boolean }>, env: ApprovalRuleEnv): boolean {
@@ -454,9 +465,28 @@ function gitSub(argv: readonly string[]): { sub: string; rest: string[] } {
 
 const KUBE_GLOBAL_VALUE_OPTS = new Set(["-n", "--namespace", "--context", "--kubeconfig", "--cluster", "--user", "-s", "--server", "--token", "--as", "--as-group", "--request-timeout", "-v", "--certificate-authority", "--client-certificate", "--client-key"]);
 
+const KUBE_VERBS = new Set([
+  "get", "describe", "delete", "drain", "cordon", "uncordon", "replace", "scale", "rollout", "apply", "create", "edit",
+  "patch", "exec", "logs", "config", "label", "annotate", "taint", "expose", "run", "set", "port-forward", "proxy", "cp",
+  "auth", "debug", "top", "wait", "diff", "kustomize", "explain", "api-resources", "api-versions", "version", "cluster-info",
+  "certificate", "attach", "autoscale",
+]);
+
+/**
+ * The kubectl verb: the first positional that is a known verb. Unknown global
+ * options that take a value then cannot hide the verb (`--cache-dir /tmp delete`).
+ */
 function kubeSub(argv: readonly string[]): { sub: string; rest: string[] } {
-  const i = subcommandIndex(argv, KUBE_GLOBAL_VALUE_OPTS);
-  return i === -1 ? { sub: "", rest: [] } : { sub: argv[i]!, rest: argv.slice(i + 1) };
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--") break;
+    if (a.startsWith("-")) {
+      if (!a.includes("=") && KUBE_GLOBAL_VALUE_OPTS.has(a)) i++;
+      continue;
+    }
+    if (KUBE_VERBS.has(a)) return { sub: a, rest: argv.slice(i + 1) };
+  }
+  return { sub: "", rest: [] };
 }
 
 const SQL_DROP = /\b(DROP\s+(TABLE|DATABASE|SCHEMA|COLLECTION|INDEX|VIEW)|TRUNCATE(\s+TABLE)?\s|DROPDATABASE\s*\(|\.DROP\s*\()/i;
@@ -544,7 +574,7 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     commands: ["chmod", "chown", "chgrp"],
     check(seg, env) {
       const p = parseArgs(seg.argv, 1, new Set(["--reference"]));
-      if (!(p.short.has("R") || p.long.has("--recursive"))) return null;
+      if (!(p.short.has("R") || [...p.long].some((o) => o.length >= 5 && "--recursive".startsWith(o)))) return null;
       const targets = p.positionals.slice(1).map((value) => ({ value, expansion: false }));
       return anyRootTarget(seg, targets, env) ? `recursive ${seg.cmd} of a root folder` : null;
     },
@@ -618,7 +648,7 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     commands: ["chmod", "chown", "chgrp"],
     check(seg) {
       const p = parseArgs(seg.argv, 1, new Set(["--reference"]));
-      if (!(p.short.has("R") || p.long.has("--recursive"))) return null;
+      if (!(p.short.has("R") || [...p.long].some((o) => o.length >= 5 && "--recursive".startsWith(o)))) return null;
       if (seg.cmd !== "chmod") return `recursive ${seg.cmd}`;
       const mode = p.positionals[0] ?? "";
       if (/^[0-7]?[0-7][0-7][2367]$/.test(mode) || /(^|,)[ugo]*[ao][ugo]*\+[rwxXst]*w/.test(mode)) return `recursive chmod ${mode}`;
@@ -646,8 +676,17 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     check(seg) {
       const { sub, rest } = gitSub(seg.argv);
       if (sub !== "push") return null;
+      const globals = seg.argv.slice(1, seg.argv.length - rest.length - 1);
+      for (let k = 0; k < globals.length; k++) {
+        if (globals[k] === "-c" && /(mirror|\.push=|pushdefault|force)/i.test(globals[k + 1] ?? "")) return `git -c ${globals[k + 1]} push`;
+      }
       for (const a of rest) {
-        if (a === "--force" || a.startsWith("--force-with-lease") || a === "--force-if-includes" || a === "--mirror" || a === "--delete" || a === "--prune") return `git push ${a}`;
+        const name = a.split("=")[0]!;
+        // git accepts unambiguous prefixes of long options (--forc, --del, --mirr).
+        const longHit = name.startsWith("--") && name.length >= 4 &&
+          ["--force", "--force-with-lease", "--force-if-includes", "--mirror", "--delete"].some((o) => o.startsWith(name)) ||
+          (name.length >= 5 && "--prune".startsWith(name));
+        if (longHit) return `git push ${a}`;
         if (/^-[a-zA-Z]+$/.test(a) && (a.includes("f") || a.includes("d"))) return `git push ${a}`;
         if (!a.startsWith("-") && (a.startsWith("+") || a.startsWith(":"))) return `git push ${a} rewrites or deletes a remote branch`;
       }
@@ -767,8 +806,8 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     description: "helm uninstall, delete, rollback, upgrade --force",
     commands: ["helm"],
     check(seg) {
-      const i = subcommandIndex(seg.argv, new Set(["-n", "--namespace", "--kube-context", "--kubeconfig"]));
-      const sub = i === -1 ? "" : seg.argv[i]!;
+      const HELM_VERBS = new Set(["uninstall", "delete", "del", "un", "rollback", "upgrade", "install", "list", "ls", "status", "get", "history", "template", "repo", "pull", "push", "show", "search", "dependency", "lint", "package", "test", "version", "env", "plugin", "registry"]);
+      const sub = seg.argv.slice(1).find((x) => !x.startsWith("-") && HELM_VERBS.has(x)) ?? "";
       if (["uninstall", "delete", "del", "un", "rollback"].includes(sub)) return `helm ${sub}`;
       if (sub === "upgrade" && seg.argv.includes("--force")) return "helm upgrade --force";
       return null;
@@ -1099,9 +1138,16 @@ export const APPROVAL_COMMAND_RULES: readonly ApprovalCommandRule[] = [
     check(parsed) {
       const out: Array<{ reason: string; segment?: number }> = [];
       const segs = parsed.segments;
+      const firstFetcher = new Map<number, ShellSegment>();
+      for (const s of segs) {
+        if (!FETCHERS.has(s.cmd)) continue;
+        const prev = firstFetcher.get(s.group);
+        if (!prev || s.stage < prev.stage) firstFetcher.set(s.group, s);
+      }
       segs.forEach((seg, i) => {
         if (seg.stage > 0 && isStdinRunner(seg)) {
-          const upstream = segs.find((s) => s.group === seg.group && s.stage < seg.stage && FETCHERS.has(s.cmd));
+          const f = firstFetcher.get(seg.group);
+          const upstream = f && f.stage < seg.stage ? f : undefined;
           if (upstream) out.push({ reason: `${upstream.cmd} output is piped into ${seg.cmd}`, segment: i });
         }
         if (seg.parent !== undefined && FETCHERS.has(seg.cmd) && (seg.via === "$()" || seg.via === "`" || seg.via === "<()")) {

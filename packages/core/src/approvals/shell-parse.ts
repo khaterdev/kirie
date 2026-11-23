@@ -29,6 +29,8 @@ export interface ShellArg {
   glob: boolean;
   /** Any part was quoted. */
   quoted: boolean;
+  /** A leading `~` was quoted or escaped, so it is a literal directory name, not the home folder. */
+  literalTilde?: boolean;
 }
 
 export interface ShellRedirect {
@@ -123,7 +125,17 @@ const INTERPRETERS_READING_STDIN = new Set([
 ]);
 const RESERVED_PREFIX = new Set(["!", "{", "if", "then", "else", "elif", "do", "while", "until", "time", "coproc"]);
 const RESERVED_SKIP = new Set(["}", "fi", "done", "esac", "]]"]);
-const DANGEROUS_ENV = new Set(["PATH", "IFS", "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4", "ZDOTDIR", "NODE_OPTIONS", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT"]);
+const DANGEROUS_ENV = new Set([
+  "PATH", "IFS", "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4", "ZDOTDIR", "NODE_OPTIONS",
+  "PYTHONSTARTUP", "PYTHONPATH", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "NODE_PATH", "PAGER", "EDITOR", "VISUAL",
+  "LESSOPEN", "LESSCLOSE", "BROWSER", "GIT_PAGER", "GIT_EDITOR", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH",
+  "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF",
+]);
+
+function isDangerousEnvName(name: string): boolean {
+  return DANGEROUS_ENV.has(name) || name.startsWith("LD_") || name.startsWith("DYLD_") || name.startsWith("GIT_CONFIG") ||
+    name.toLowerCase().startsWith("npm_config_");
+}
 /** GNU coreutils installed with a `g` prefix on macOS (Homebrew). */
 const G_PREFIXED = new Set(["rm", "chmod", "chown", "chgrp", "dd", "shred", "truncate", "cp", "mv", "tee", "ln", "install", "sed", "find", "xargs", "timeout", "stdbuf", "nice", "env", "rmdir", "unlink", "touch", "cat", "tar", "awk"]);
 
@@ -228,6 +240,30 @@ class Scanner {
       if (c === "#") {
         while (this.i < s.length && s[this.i] !== "\n") this.i++;
         continue;
+      }
+      if (c === "(" && s[this.i + 1] === "(") {
+        // Arithmetic command (( .. )): a single word, never a here-doc or a command list.
+        const end = findArithEnd(s, this.i + 2);
+        if (end !== -1) {
+          const start = this.i;
+          const inner = s.slice(this.i + 2, end);
+          const subs = inner.includes("$(") || inner.includes("`") ? this.collectSubstitutions(inner) : [];
+          this.i = end + 2;
+          const value = s.slice(start, this.i);
+          this.tokens.push({ t: "word", w: { value, quotedMask: Array.from({ length: value.length }, () => true), raw: value, start, end: this.i, quoted: true, expansion: false, glob: false, subs } });
+          continue;
+        }
+      }
+      if (c === "{") {
+        // Named file descriptor redirect: {fd}>file, {fd}<&-
+        let j = this.i + 1;
+        while (j < s.length && isNameChar(s[j])) j++;
+        if (j > this.i + 1 && s[j] === "}" && (s[j + 1] === "<" || s[j + 1] === ">") && isNameStart(s[this.i + 1])) {
+          const fd = s.slice(this.i, j + 1);
+          this.i = j + 1;
+          this.readRedirect(fd);
+          continue;
+        }
       }
       if (c === ";" || c === "&" || c === "|" || c === "(" || c === ")") { this.readOperator(); continue; }
       if (c === "<" || c === ">") {
@@ -475,7 +511,7 @@ class Scanner {
         continue;
       }
       if (c === "$") {
-        const r = this.readDollar(subs);
+        const r = this.readDollar(subs, true);
         if (r) { expansion = true; value += r; continue; }
         value += "$";
         this.i++;
@@ -497,10 +533,28 @@ class Scanner {
   }
 
   /** Reads `$(..)`, `$((..))`, `${..}`, `$name`, `$1`, `$@`, ... Returns the source text, or null for a lone `$`. */
-  private readDollar(subs: Sub[]): string | null {
+  private readDollar(subs: Sub[], inDouble = false): string | null {
     const s = this.s;
     const start = this.i;
     const n = s[this.i + 1];
+    if (n === "[") {
+      // Old-style arithmetic $[ .. ]: never a here-doc or a command.
+      let depth = 0;
+      let end = -1;
+      for (let j = this.i + 2; j < s.length; j++) {
+        if (s[j] === "[") depth++;
+        else if (s[j] === "]") { if (depth === 0) { end = j; break; } depth--; }
+      }
+      if (end === -1) {
+        this.problems.push({ code: "unbalanced-paren", detail: "unterminated $[" });
+        this.i = s.length;
+        return s.slice(start);
+      }
+      const inner = s.slice(this.i + 2, end);
+      if (inner.includes("$(") || inner.includes("`")) subs.push(...this.collectSubstitutions(inner));
+      this.i = end + 1;
+      return s.slice(start, this.i);
+    }
     if (n === "(" && s[this.i + 2] === "(") {
       const end = findArithEnd(s, this.i + 3);
       if (end === -1) {
@@ -526,13 +580,16 @@ class Scanner {
       return s.slice(start, this.i);
     }
     if (n === "{") {
-      const end = findBraceEnd(s, this.i + 2);
+      const end = findBraceEnd(s, this.i + 2, inDouble);
       if (end === -1) {
         this.problems.push({ code: "unbalanced-quote", detail: "unterminated ${" });
         this.i = s.length;
         return s.slice(start);
       }
       const inner = s.slice(this.i + 2, end);
+      if (inner.includes("'") || inner.includes("\"")) {
+        this.problems.push({ code: "complex-parameter", detail: "quotes inside ${...} are read differently by bash and zsh" });
+      }
       if (inner.includes("$(") || inner.includes("`")) subs.push(...this.collectSubstitutions(inner));
       this.i = end + 1;
       return s.slice(start, this.i);
@@ -551,15 +608,31 @@ class Scanner {
   }
 }
 
+/** Nesting limit for the matching helpers below; deeper input is treated as unbalanced (uncertain). */
+const MAX_SCAN_NESTING = 200;
+
+/** End of a `$'..'` string whose body starts at `from`, or -1. */
+function ansiCEnd(s: string, from: number): number {
+  let i = from;
+  while (i < s.length) {
+    if (s[i] === "\\") { i += 2; continue; }
+    if (s[i] === "'") return i;
+    i++;
+  }
+  return -1;
+}
+
 /** Index of the `)` matching an already-consumed `(`, quote aware. -1 when unbalanced. */
-function findParenEnd(s: string, from: number): number {
+function findParenEnd(s: string, from: number, nesting = 0): number {
+  if (nesting > MAX_SCAN_NESTING) return -1;
   let depth = 1;
   let i = from;
   while (i < s.length) {
     const c = s[i];
     if (c === "\\") { i += 2; continue; }
+    if (c === "$" && s[i + 1] === "'") { const e = ansiCEnd(s, i + 2); if (e === -1) return -1; i = e + 1; continue; }
     if (c === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return -1; i = e + 1; continue; }
-    if (c === "\"") { const e = findDoubleQuoteEnd(s, i + 1); if (e === -1) return -1; i = e + 1; continue; }
+    if (c === "\"") { const e = findDoubleQuoteEnd(s, i + 1, nesting + 1); if (e === -1) return -1; i = e + 1; continue; }
     if (c === "`") { const r = readBacktick(s, i + 1); if (r.end === -1) return -1; i = r.end + 1; continue; }
     if (c === "(") depth++;
     else if (c === ")") { depth--; if (depth === 0) return i; }
@@ -568,13 +641,15 @@ function findParenEnd(s: string, from: number): number {
   return -1;
 }
 
-function findDoubleQuoteEnd(s: string, from: number): number {
+function findDoubleQuoteEnd(s: string, from: number, nesting = 0): number {
+  if (nesting > MAX_SCAN_NESTING) return -1;
   let i = from;
   while (i < s.length) {
     const c = s[i];
     if (c === "\\") { i += 2; continue; }
     if (c === "\"") return i;
-    if (c === "$" && s[i + 1] === "(") { const e = findParenEnd(s, i + 2); if (e === -1) return -1; i = e + 1; continue; }
+    if (c === "$" && s[i + 1] === "(") { const e = findParenEnd(s, i + 2, nesting + 1); if (e === -1) return -1; i = e + 1; continue; }
+    if (c === "$" && s[i + 1] === "{") { const e = findBraceEnd(s, i + 2, true, nesting + 1); if (e === -1) return -1; i = e + 1; continue; }
     if (c === "`") { const r = readBacktick(s, i + 1); if (r.end === -1) return -1; i = r.end + 1; continue; }
     i++;
   }
@@ -594,15 +669,21 @@ function findArithEnd(s: string, from: number): number {
   return -1;
 }
 
-function findBraceEnd(s: string, from: number): number {
+/**
+ * Index of the `}` closing a `${`. Inside double quotes a single quote is an
+ * ordinary character there (bash), so it must not be skipped as quoting.
+ */
+function findBraceEnd(s: string, from: number, inDouble = false, nesting = 0): number {
+  if (nesting > MAX_SCAN_NESTING) return -1;
   let depth = 1;
   let i = from;
   while (i < s.length) {
     const c = s[i];
     if (c === "\\") { i += 2; continue; }
-    if (c === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return -1; i = e + 1; continue; }
-    if (c === "\"") { const e = findDoubleQuoteEnd(s, i + 1); if (e === -1) return -1; i = e + 1; continue; }
-    if (c === "$" && s[i + 1] === "(") { const e = findParenEnd(s, i + 2); if (e === -1) return -1; i = e + 1; continue; }
+    if (!inDouble && c === "$" && s[i + 1] === "'") { const e = ansiCEnd(s, i + 2); if (e === -1) return -1; i = e + 1; continue; }
+    if (!inDouble && c === "'") { const e = s.indexOf("'", i + 1); if (e === -1) return -1; i = e + 1; continue; }
+    if (c === "\"") { const e = findDoubleQuoteEnd(s, i + 1, nesting + 1); if (e === -1) return -1; i = e + 1; continue; }
+    if (c === "$" && s[i + 1] === "(") { const e = findParenEnd(s, i + 2, nesting + 1); if (e === -1) return -1; i = e + 1; continue; }
     if (c === "{") depth++;
     else if (c === "}") { depth--; if (depth === 0) return i; }
     i++;
@@ -678,9 +759,10 @@ function readAnsiC(s: string, from: number): { value: string; end: number } {
 // ── Brace expansion ───────────────────────────────────────────────────────
 
 /** Expand unquoted `{a,b,c}` lists (one level, nested lists are reported). Returns null when there is none. */
-function braceExpand(w: Word): { values: string[]; nested: boolean } | null {
+function braceExpand(w: Word, groups = 0): { values: string[]; nested: boolean } | null {
   const v = w.value;
   const m = w.quotedMask;
+  if (groups > 8) return { values: [v], nested: true };
   let open = -1;
   for (let i = 0; i < v.length; i++) {
     if (v[i] === "{" && !m[i]) { open = i; break; }
@@ -708,7 +790,7 @@ function braceExpand(w: Word): { values: string[]; nested: boolean } | null {
   }
   const values: string[] = [];
   const suffixWord: Word = { ...w, value: suffix, quotedMask: m.slice(close + 1) };
-  const suffixExp = braceExpand(suffixWord);
+  const suffixExp = braceExpand(suffixWord, groups + 1);
   const suffixes = suffixExp && !suffixExp.nested ? suffixExp.values : [suffix];
   for (const p of parts) {
     for (const sfx of suffixes) {
@@ -723,8 +805,8 @@ function braceExpand(w: Word): { values: string[]; nested: boolean } | null {
 function xargsReplaceString(opts: string[]): string | null {
   for (let i = 0; i < opts.length; i++) {
     const o = opts[i]!;
-    if (o === "-I") return opts[i + 1] ?? null;
-    if (o.startsWith("-I")) return o.slice(2);
+    if (o === "-I" || o === "-J") return opts[i + 1] ?? null;
+    if (o.startsWith("-I") || o.startsWith("-J")) return o.slice(2);
     if (o === "-i" || o === "--replace") return "{}";
     if (o.startsWith("-i")) return o.slice(2);
     if (o.startsWith("--replace=")) return o.slice(10);
@@ -745,7 +827,7 @@ function substituteKnownVar(w: Word, vars: ReadonlyMap<string, string>): Word {
   const rest = w.value.slice(m[0].length);
   if (rest.includes("$") || rest.includes("`")) return w;
   const value = known + rest;
-  return { ...w, value, quotedMask: Array.from({ length: value.length }, () => true), expansion: false };
+  return { ...w, value, quotedMask: Array.from({ length: value.length }, () => false), expansion: false };
 }
 
 /** Record `NAME=literal` assignments (bare, or through export/declare/local/readonly). */
@@ -795,7 +877,15 @@ function literalOutputOf(seg: ShellSegment | undefined): string | null {
 
 // ── Segments ──────────────────────────────────────────────────────────────
 
+/** What earlier stages of one pipeline produced (kept so lookups stay O(1)). */
+interface GroupInfo {
+  decoder: boolean;
+  /** First segment seen at each stage. */
+  byStage: Map<number, ShellSegment>;
+}
+
 interface BuildState {
+  groups: Map<number, GroupInfo>;
   segments: ShellSegment[];
   uncertain: ShellUncertainty[];
   functions: Set<string>;
@@ -815,7 +905,8 @@ interface Meta {
 }
 
 function wordToArg(w: Word, value = w.value): ShellArg {
-  return { value, expansion: w.expansion, glob: w.glob, quoted: w.quoted };
+  const literalTilde = value.startsWith("~") && value === w.value && w.quotedMask[0] === true;
+  return { value, expansion: w.expansion, glob: w.glob, quoted: w.quoted, ...(literalTilde ? { literalTilde: true } : {}) };
 }
 
 function isAssignment(w: Word): boolean {
@@ -835,6 +926,8 @@ function isAssignment(w: Word): boolean {
 function normalizeCmd(word: string): string {
   let w = word;
   while (w.startsWith("\\")) w = w.slice(1);
+  // zsh: =cmd expands to the full path of cmd.
+  if (w.startsWith("=") && w.length > 1) w = w.slice(1);
   let b = basename(w).toLowerCase();
   if (b.length > 1 && b.startsWith("g") && G_PREFIXED.has(b.slice(1))) b = b.slice(1);
   if (/^python[0-9.]*$/.test(b)) return b.startsWith("python3") ? "python3" : b === "python2" || b.startsWith("python2.") ? "python2" : "python";
@@ -864,7 +957,7 @@ const WRAPPER_VALUE_OPTS: Readonly<Record<string, ReadonlySet<string>>> = {
   chrt: new Set([]),
   taskset: new Set([]),
   watch: new Set(["-n", "--interval", "-d", "-q"]),
-  xargs: new Set(["-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-lines", "--max-procs", "--max-chars", "--delimiter", "--eof", "--arg-file", "--process-slot-var"]),
+  xargs: new Set(["-I", "-J", "-R", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-lines", "--max-procs", "--max-chars", "--delimiter", "--eof", "--arg-file", "--process-slot-var"]),
   ssh: new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "-B"]),
   dockerExec: new Set(["-e", "--env", "-u", "--user", "-w", "--workdir", "--env-file", "--detach-keys"]),
   kubectl: new Set(["-n", "--namespace", "--context", "--kubeconfig", "--cluster", "--user", "-s", "--server", "--token", "--as", "--as-group", "-c", "--container", "-f", "--filename", "--pod-running-timeout"]),
@@ -1027,8 +1120,15 @@ class ShellParser {
     let words = inWords.map((w) => substituteKnownVar(w, vars));
 
     // Reserved words in command position.
-    while (words.length > 0 && !words[0]!.quoted && RESERVED_PREFIX.has(words[0]!.value)) words = words.slice(1);
-    while (words.length > 0 && !words[0]!.quoted && RESERVED_SKIP.has(words[0]!.value)) words = words.slice(1);
+    for (let guard = 0; guard < 64 && words.length > 0 && !words[0]!.quoted; guard++) {
+      const v = words[0]!.value;
+      if (RESERVED_PREFIX.has(v) || RESERVED_SKIP.has(v)) {
+        words = words.slice(1);
+        if (v === "time") while (words[0] && (words[0].value === "-p" || words[0].value === "--")) words = words.slice(1);
+        continue;
+      }
+      break;
+    }
     if (words[0] && !words[0].quoted && words[0].value === "function") {
       // `function NAME { body` : the body starts a command of its own.
       if (words[1]) st.functions.add(words[1].value);
@@ -1051,13 +1151,16 @@ class ShellParser {
     }
     words = words.slice(i);
 
-    const redirects: ShellRedirect[] = redirTokens.map((r) => ({
+    const redirects: ShellRedirect[] = redirTokens.map((r) => {
+      const t = r.target ? substituteKnownVar(r.target, vars) : undefined;
+      return {
       op: r.op,
       ...(r.fd !== undefined ? { fd: r.fd } : {}),
-      target: r.target?.value ?? "",
-      dynamic: r.target?.expansion ?? false,
+      target: t?.value ?? "",
+      dynamic: t?.expansion ?? false,
       ...(r.body !== undefined ? { body: r.body } : {}),
-    }));
+      };
+    });
     const stdinParts = redirects.filter((r) => r.body !== undefined).map((r) => r.body!);
 
     const index = st.segments.length;
@@ -1085,7 +1188,7 @@ class ShellParser {
 
     for (const a of assignments) {
       const name = a.slice(0, a.search(/[[+=]/));
-      if (DANGEROUS_ENV.has(name) || name.startsWith("LD_") || name.startsWith("DYLD_")) {
+      if (isDangerousEnvName(name)) {
         st.uncertain.push({ code: "env-override", detail: `${name} is set for the command`, segment: index });
       }
     }
@@ -1105,6 +1208,13 @@ class ShellParser {
 
     this.recurseSubs(wordsWithAssignments, redirTokens, meta, cwd, index);
     this.unwrap(segment, expanded, meta, cwd, index);
+    let info = st.groups.get(segment.group);
+    if (!info) {
+      info = { decoder: false, byStage: new Map() };
+      st.groups.set(segment.group, info);
+    }
+    if (!info.byStage.has(segment.stage)) info.byStage.set(segment.stage, segment);
+    if (isDecoderSegment(segment)) info.decoder = true;
     return index;
   }
 
@@ -1149,6 +1259,14 @@ class ShellParser {
       }
       this.unwrap(child, ws, { ...meta, depth: child.depth, via, remote: child.remote, sudo: child.sudo, parent: index }, cwd, childIndex);
     };
+    const chdir = (dir: string | undefined, dynamic: boolean): void => {
+      if (dir === undefined) return;
+      if (dynamic) { segment.cwd = null; cwd = null; return; }
+      const expanded = expandApprovalHome(dir, st.home);
+      const next = isAbsolute(expanded) ? normalize(expanded) : segment.cwd === null ? null : resolve(segment.cwd, expanded);
+      segment.cwd = next;
+      cwd = next;
+    };
     const uncertain = (code: string, detail: string, extra: Partial<ShellUncertainty> = {}): void => {
       st.uncertain.push({ code, detail, segment: index, ...extra });
     };
@@ -1169,6 +1287,12 @@ class ShellParser {
         const vo = WRAPPER_VALUE_OPTS[cmd === "run0" ? "sudo" : cmd] ?? new Set<string>();
         let j = skipOptions(ws, 1, vo);
         const optWords = ws.slice(1, j).map((w) => w.value);
+        for (let k = 0; k < optWords.length; k++) {
+          const o = optWords[k]!;
+          if (o === "-D" || o === "--chdir") chdir(optWords[k + 1], ws[k + 2]?.expansion ?? false);
+          else if (o.startsWith("--chdir=")) chdir(o.slice(8), ws[k + 1]?.expansion ?? false);
+          else if (/^-D./.test(o)) chdir(o.slice(2), ws[k + 1]?.expansion ?? false);
+        }
         if (optWords.some((o) => o === "-e" || o === "--edit")) {
           items = [{ w: { ...head.w, value: "sudoedit" }, value: "sudoedit" }, ...items.slice(j)];
           break;
@@ -1199,14 +1323,21 @@ class ShellParser {
           if (v === "--") { j++; break; }
           if (v === "-S" || v === "--split-string") { split = ws[j + 1]?.value ?? ""; j += 2; break; }
           if (v.startsWith("--split-string=")) { split = v.slice(15); j++; break; }
-          if (v.startsWith("-S") && v.length > 2) { split = v.slice(2); j++; break; }
+          if (/^-[A-Za-z0-9]*S/.test(v)) {
+            const rest = v.slice(v.indexOf("S") + 1);
+            if (rest) { split = rest; j++; } else { split = ws[j + 1]?.value ?? ""; j += 2; }
+            break;
+          }
+          if (v === "-C" || v === "--chdir") { chdir(ws[j + 1]?.value, ws[j + 1]?.expansion ?? false); j += 2; continue; }
+          if (v.startsWith("--chdir=")) { chdir(v.slice(8), ws[j]!.expansion); j++; continue; }
+          if (/^-C./.test(v)) { chdir(v.slice(2), ws[j]!.expansion); j++; continue; }
           if (isAssignment(ws[j]!)) { segment.assignments.push(v); j++; continue; }
           if (v.startsWith("-")) { j += WRAPPER_VALUE_OPTS.env!.has(v) ? 2 : 1; continue; }
           break;
         }
         for (const a of segment.assignments) {
           const name = a.slice(0, a.search(/[[+=]/));
-          if (DANGEROUS_ENV.has(name) || name.startsWith("LD_") || name.startsWith("DYLD_")) uncertain("env-override", `${name} is set for the command`);
+          if (isDangerousEnvName(name)) uncertain("env-override", `${name} is set for the command`);
         }
         if (split !== null) {
           const rest = ws.slice(j).map((w) => w.value).join(" ");
@@ -1219,6 +1350,36 @@ class ShellParser {
           items = [head];
           break;
         }
+        items = items.slice(j);
+        continue;
+      }
+      if (cmd === "repeat" && items.length > 2) {
+        segment.wrappers.push("repeat");
+        items = items.slice(2);
+        continue;
+      }
+      if ((cmd === "pnpm" || cmd === "yarn" || cmd === "npm" || cmd === "bun") && items[1]?.value === "exec") {
+        segment.wrappers.push(`${cmd} exec`);
+        let j = 2;
+        while (j < items.length && items[j]!.value.startsWith("-")) { const dd = items[j]!.value === "--"; j++; if (dd) break; }
+        if (j >= items.length) break;
+        items = items.slice(j);
+        continue;
+      }
+      if (cmd === "script") {
+        const cIdx = ws.findIndex((w, k) => k > 0 && (w.value === "-c" || w.value === "--command"));
+        if (cIdx !== -1 && ws[cIdx + 1]) { nested(ws[cIdx + 1]!.value, "script -c"); items = [head]; break; }
+        let j = skipOptions(ws, 1, new Set(["-F", "-t", "-T", "-I", "-O", "-B", "-E", "-m"]));
+        if (j < ws.length) j++;                                   // the typescript file
+        if (j >= ws.length) break;
+        segment.wrappers.push("script");
+        items = items.slice(j);
+        continue;
+      }
+      if (cmd === "ssh-agent") {
+        const j = skipOptions(ws, 1, new Set(["-a", "-t", "-E", "-P", "-O"]));
+        if (j >= ws.length) break;
+        segment.wrappers.push("ssh-agent");
         items = items.slice(j);
         continue;
       }
@@ -1269,10 +1430,10 @@ class ShellParser {
             uncertain("heredoc-to-shell", `a here-document is run by ${cmd}`);
             nested(segment.stdinText, `${cmd} <<`);
           } else if (segment.stage > 0) {
-            const upstream = st.segments.filter((x) => x.group === segment.group && x.stage < segment.stage && x.depth === segment.depth);
-            if (upstream.some(isDecoderSegment)) uncertain("decode-to-shell", `decoded input is run by ${cmd}`);
+            const info = st.groups.get(segment.group);
+            if (info?.decoder) uncertain("decode-to-shell", `decoded input is run by ${cmd}`);
             else uncertain("pipe-to-shell", `input piped into ${cmd} is run as commands`);
-            const literal = literalOutputOf(upstream[upstream.length - 1]);
+            const literal = literalOutputOf(info?.byStage.get(segment.stage - 1));
             if (literal) nested(literal, `${cmd} <|`);
           } else if (!scriptArg && segment.redirects.some((r) => r.op === "<")) {
             uncertain("source-file", `${cmd} runs commands from a file`);
@@ -1300,7 +1461,7 @@ class ShellParser {
       if (cmd === "export" || cmd === "declare" || cmd === "typeset" || cmd === "readonly" || cmd === "local") {
         for (const x of items.slice(1)) {
           const name = x.value.split("=")[0] ?? "";
-          if (x.value.includes("=") && (DANGEROUS_ENV.has(name) || name.startsWith("LD_") || name.startsWith("DYLD_"))) {
+          if (x.value.includes("=") && isDangerousEnvName(name)) {
             uncertain("env-override", `${name} is changed for later commands`);
           }
         }
@@ -1309,8 +1470,7 @@ class ShellParser {
       if (cmd === "xargs") {
         const j = skipOptions(ws, 1, WRAPPER_VALUE_OPTS.xargs!);
         const sub = items.slice(j);
-        const upstream = st.segments.filter((x) => x.group === segment.group && x.stage === segment.stage - 1 && x.depth === segment.depth);
-        const literal = segment.stage > 0 ? literalOutputOf(upstream[upstream.length - 1]) : null;
+        const literal = segment.stage > 0 ? literalOutputOf(st.groups.get(segment.group)?.byStage.get(segment.stage - 1)) : null;
         if (literal && sub.length > 0) {
           const repl = xargsReplaceString(ws.slice(1, j).map((w) => w.value));
           const literalWord = (value: string): { w: Word; value: string } => ({ w: { ...head.w, value, quotedMask: [], raw: value, quoted: true, expansion: false, glob: false, subs: [] }, value });
@@ -1342,6 +1502,33 @@ class ShellParser {
         const rest = items.slice(j);
         if (rest.length > 0) nested(rest.map((x) => x.value).join(" "), "watch");
         break;
+      }
+      if (cmd === "ssh" || cmd === "scp" || cmd === "sftp" || cmd === "rsync") {
+        for (let k = 1; k < ws.length; k++) {
+          const v = ws[k]!.value;
+          if (cmd === "rsync" && (v === "-e" || v === "--rsh") && ws[k + 1]) nested(ws[k + 1]!.value, "rsync -e");
+          if (cmd === "rsync" && v.startsWith("--rsh=")) nested(v.slice(6), "rsync -e");
+          const opt = v === "-o" ? (ws[k + 1]?.value ?? "") : v.startsWith("-o") ? v.slice(2) : "";
+          const m = /^\s*(ProxyCommand|LocalCommand|KnownHostsCommand|RemoteCommand)\s*[= ]\s*(.*)$/i.exec(opt);
+          if (m) {
+            uncertain("ssh-local-command", `${cmd} -o ${m[1]} runs a command`);
+            nested(m[2] ?? "", `${cmd} -o ${m[1]}`);
+          }
+        }
+      }
+      if (cmd === "git") {
+        for (let k = 1; k < ws.length; k++) {
+          const v = ws[k]!.value;
+          if (!v.startsWith("-")) break;
+          const kv = v === "-c" ? (ws[k + 1]?.value ?? "") : v.startsWith("--config-env") ? v : "";
+          if (!kv) continue;
+          const key = kv.split("=")[0]!.toLowerCase();
+          const value = kv.slice(kv.indexOf("=") + 1);
+          if (/^(alias\..*|core\.(sshcommand|pager|editor|fsmonitor|hookspath|askpass|gitproxy)|pager\..*|diff\..*\.(textconv|command)|diff\.external|filter\..*|credential\..*|sequence\.editor|gpg\..*program|ssh\.variant|uploadpack\..*|receivepack\..*|protocol\..*\.allow|init\.templatedir|include\.path|includeif\..*)$/.test(key) || v.startsWith("--config-env")) {
+            uncertain("git-config-exec", `git -c ${key} can run a command`);
+            if (key.startsWith("alias.") && value.startsWith("!")) nested(value.slice(1), "git alias");
+          }
+        }
       }
       if (cmd === "ssh") {
         const j = skipOptions(ws, 1, WRAPPER_VALUE_OPTS.ssh!);
@@ -1427,9 +1614,11 @@ class ShellParser {
 function detectForkBomb(raw: string, functions: ReadonlySet<string>): boolean {
   let stripped = "";
   for (const ch of raw) if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") stripped += ch;
+  let checked = 0;
   for (const name of functions) {
     if (!name) continue;
-    if (stripped.includes(`${name}|${name}&`)) return true;
+    if (++checked > 50) break;
+    if (stripped.includes(`${name}|${name}&`) || stripped.includes(`${name}&${name}`)) return true;
   }
   return false;
 }
@@ -1450,6 +1639,7 @@ export function parseShell(command: string, opts: ParseShellOptions = {}): Parse
     group: 0,
     home: opts.home ?? "",
     nextGroup: () => groups++,
+    groups: new Map(),
   };
   try {
     if (typeof command !== "string") {

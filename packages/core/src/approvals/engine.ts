@@ -128,7 +128,9 @@ function stableJson(value: unknown, depth = 0): string {
 
 export function approvalCallHash(tool: string, input: Record<string, unknown>): string {
   try {
-    return createHash("sha256").update(`${tool}\n${stableJson(input)}`).digest("hex");
+    // For a shell call only the command matters (a new description or timeout is the same request).
+    const body = SHELL_TOOLS.has(tool) && typeof input.command === "string" ? input.command : stableJson(input);
+    return createHash("sha256").update(`${tool}\n${body}`).digest("hex");
   } catch {
     return createHash("sha256").update(tool).digest("hex");
   }
@@ -250,6 +252,24 @@ function runShellRules(parsed: ParsedShell, ruleEnv: ApprovalRuleEnv, opts: { di
   return { hardline, dangerous };
 }
 
+/**
+ * Cross-check against a naive reading of the command with every quote, escape
+ * and substitution marker removed. When that reading finds a rule the real
+ * parse did not, the parser and the shell may disagree about where commands
+ * start (a desync), so the call is marked uncertain: it asks in ask mode. Not
+ * used for hardline (quoted text such as commit messages would block in yolo).
+ */
+function addParseMismatch(parsed: ParsedShell, command: string, real: { hardline: ApprovalFinding[]; dangerous: ApprovalFinding[] }, ruleEnv: ApprovalRuleEnv, disabled: ReadonlySet<string>): void {
+  if (command.length > 8000 || parsed.uncertain.length > 0) return;
+  const naiveText = command.replace(/[\\'"`]/g, " ").replace(/\$[({[]/g, " ").replace(/[)}\]]/g, " ; ");
+  if (naiveText === command) return;
+  const naive = parseShell(naiveText, { cwd: ruleEnv.cwd, home: ruleEnv.path.home });
+  const r = runShellRules(naive, ruleEnv, { disabled, skipDangerous: false });
+  const seen = new Set([...real.hardline, ...real.dangerous].map((f) => f.ruleId));
+  const extra = [...r.hardline, ...r.dangerous].find((f) => !seen.has(f.ruleId));
+  if (extra) parsed.uncertain.push({ code: "parse-mismatch", detail: `read without quoting, the command looks like ${extra.ruleId} (${extra.reason})` });
+}
+
 function makeRuleEnv(lists: CompiledLists, pathEnv: ApprovalPathEnv, cwd: string, gatewayPort: number): ApprovalRuleEnv {
   return {
     path: pathEnv,
@@ -330,7 +350,9 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
       parsed = parseShell(command, { cwd, home: env.home });
       const r = runShellRules(parsed, ruleEnv, { disabled, skipDangerous: sandboxed });
       hardline = policy.hardline ? r.hardline : [];
-      dangerous = r.dangerous;
+      // With the hardline list off these still ask in ask mode (they run in yolo, as before the gate).
+      dangerous = policy.hardline ? r.dangerous : [...r.hardline.map((f) => ({ ...f, severity: "dangerous" as const })), ...r.dangerous];
+      if (!sandboxed) addParseMismatch(parsed, command, r, ruleEnv, disabled);
     }
     if (hardline.length > 0) {
       return { ...base, decision: "deny", findings: hardline, uncertain: parsed?.uncertain ?? [], allowlisted: false, summary: `hardline: ${hardline[0]!.ruleId}`, messageForAgent: agentMessage("hardline", hardline[0]!) };

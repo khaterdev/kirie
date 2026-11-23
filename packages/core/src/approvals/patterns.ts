@@ -130,6 +130,14 @@ export function shellPatternMatchesSegment(pattern: ApprovalPattern, seg: ShellS
   if (pattern.kind !== "shell") return false;
   const { normalized, full } = approvalSegmentForms(seg);
   if (mode === "deny") return matchApprovalGlob(pattern.glob, normalized) || matchApprovalGlob(pattern.glob, full);
+  // Allow never covers a command that sets variables for itself (PATH=..., GIT_CONFIG_*=...).
+  if (seg.assignments.length > 0) return false;
+  // A command run from an explicit path (/tmp/evil/git, ./git) must be allowed by that path.
+  const argv0 = seg.argv[0] ?? "";
+  if (argv0.includes("/")) {
+    const asWritten = [argv0.replace(/^\\+/, ""), ...seg.argv.slice(1)].join(" ");
+    return matchApprovalGlob(pattern.glob, asWritten);
+  }
   // Allow: the form with wrappers must match, or the normalized form when nothing elevated it.
   return matchApprovalGlob(pattern.glob, full) || (!seg.sudo && matchApprovalGlob(pattern.glob, normalized));
 }

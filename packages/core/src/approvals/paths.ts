@@ -10,7 +10,7 @@
 
 import { realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { hasGlobChars, matchApprovalPathGlob } from "./glob.js";
+import { approvalPathGlobsIntersect, hasGlobChars, matchApprovalPathGlob } from "./glob.js";
 
 /** Writes (file tools, redirects, tee, cp, mv, ln, sed -i, rm, ...) to these ask in `ask` mode. */
 export const APPROVALS_PROTECTED_WRITE_PATHS: readonly string[] = [
@@ -44,6 +44,7 @@ export const APPROVALS_PROTECTED_WRITE_PATHS: readonly string[] = [
   "~/.claude*/.credentials.json",
   "**/.claude/settings*.json",
   "**/.git/hooks/**",
+  "**/.git/config",
   "**/.env",
   "**/.env.*",
   "{kirie}/secrets/**",
@@ -81,6 +82,10 @@ export const APPROVALS_PROTECTED_READ_PATHS: readonly string[] = [
   "~/Library/Keychains/**",
   "**/.env",
   "**/.env.*",
+  "!**/.env.example",
+  "!**/.env.sample",
+  "!**/.env.template",
+  "!**/.env.dist",
   "**/*.kubeconfig",
 ];
 
@@ -231,6 +236,13 @@ export function compileApprovalPathList(patterns: readonly string[], env: Approv
 }
 
 function matchesList(path: string, list: ApprovalPathList): boolean {
+  // A globbed path (`~/.ssh/*`) matches when it could reach a protected path; exclusions are ignored (fail closed).
+  if (hasGlobChars(path)) {
+    // A last segment that is nothing but wildcards (`src/*`) does not count against "anywhere" patterns (`**/*.kubeconfig`).
+    const last = path.slice(path.lastIndexOf("/") + 1);
+    const bare = last.replace(/\[[^\]]*\]|[*?]/g, "") === "";
+    return list.include.some((pat) => !(bare && pat.startsWith("**")) && approvalPathGlobsIntersect(pat, path));
+  }
   if (!list.include.some((pat) => matchApprovalPathGlob(pat, path))) return false;
   return !list.exclude.some((pat) => matchApprovalPathGlob(pat, path));
 }
