@@ -78,12 +78,21 @@ export interface InjectMessageOptions {
   quietSentinels?: readonly string[];
   /** Stored in chat history instead of the raw prompt */
   historyLabel?: string;
+  /**
+   * Called with a successful, non-quiet reply before it is stored or sent.
+   * "suppress" treats it like a quiet reply (neither sent nor stored; the
+   * result has `silent` and `suppressed`). A throwing hook means "send".
+   */
+  beforeDeliver?: (response: string) => "send" | "suppress";
 }
 
 export interface InjectMessageResult {
   status: "ok" | "busy" | "channel-down" | "aborted" | "error";
   response?: string;
+  /** The reply was neither sent nor stored (a quiet sentinel, or suppressed by beforeDeliver) */
   silent?: boolean;
+  /** beforeDeliver suppressed the reply (it was not a quiet sentinel) */
+  suppressed?: boolean;
   costUsd?: number;
 }
 
@@ -119,6 +128,7 @@ interface InjectState {
   skipIfBusy: boolean;
   quietSentinels?: readonly string[];
   historyLabel?: string;
+  beforeDeliver?: (response: string) => "send" | "suppress";
 }
 
 const SENDER_NAMES: Record<InjectOrigin, string> = {
@@ -369,6 +379,7 @@ export class MessagePipeline {
       skipIfBusy: opts.skipIfBusy === true,
       quietSentinels: opts.quietSentinels,
       historyLabel: opts.historyLabel,
+      ...(opts.beforeDeliver ? { beforeDeliver: opts.beforeDeliver } : {}),
     });
     const tracked = p.then(() => undefined, () => undefined);
     this.inflight.add(tracked);
@@ -658,6 +669,7 @@ export class MessagePipeline {
     let userMsgId: number | undefined;
     let assistantMsgId: number | undefined;
     let silent = false;
+    let suppressed = false;
     let startedAt = Date.now();
 
     // Step 5: Enqueue in LaneQueue for per-session serialization
@@ -853,6 +865,15 @@ export class MessagePipeline {
 
         // A quiet reply to an injected message (loops) is neither stored nor sent.
         silent = !executionResult.isError && isQuietReply(executionResult.response, inject?.quietSentinels);
+        // The injector may hold back a reply that is not quiet (for example one unchanged since last run).
+        if (!silent && inject?.beforeDeliver && !executionResult.isError && !executionResult.wasAborted && executionResult.response) {
+          try {
+            suppressed = inject.beforeDeliver(executionResult.response) === "suppress";
+          } catch (hookErr) {
+            log.warn({ hookErr, sessionKey: route.sessionKey }, "beforeDeliver hook failed (reply is sent)");
+          }
+          if (suppressed) silent = true;
+        }
 
         // Store assistant response in chat history (user message was saved before execution).
         // If the execution was aborted (interrupted by a new message), save the partial
@@ -965,6 +986,7 @@ export class MessagePipeline {
         status: result.isError ? "error" : "ok",
         response: result.response,
         ...(silent ? { silent: true } : {}),
+        ...(suppressed ? { suppressed: true } : {}),
         costUsd: result.costUsd,
       };
     } catch (err) {

@@ -10,7 +10,9 @@
  * Quiet unless changed: the tick wrapper tells the agent to answer NO_REPLY
  * when nothing changed (the pipeline neither sends nor stores that). A digest
  * of the normalised reply decides "unchanged": unchanged multiplies the
- * interval up to base * backoffMaxMultiplier; a change resets it to base.
+ * interval up to base * backoffMaxMultiplier; a change resets it to base. An
+ * unchanged reply to a scheduled tick is not sent (the pipeline's beforeDeliver
+ * hook); `/loop now` always shows the reply.
  * A reply ending with LOOP_COMPLETE ends the loop; that reply is held back by
  * the pipeline (it is one of the quiet sentinels) and sent here without the
  * marker.
@@ -116,6 +118,11 @@ export function normalizeLoopReply(text: string): string {
 
 export function loopReplyDigest(text: string): string {
   return createHash("sha256").update(normalizeLoopReply(text)).digest("hex");
+}
+
+/** True when a reply's digest equals the last reported one (never for a loop's first report). */
+export function isUnchangedLoopReply(loop: Pick<LoopRecord, "lastDigest">, response: string): boolean {
+  return !!loop.lastDigest && loopReplyDigest(response) === loop.lastDigest;
 }
 
 /** The reply without a trailing LOOP_COMPLETE, when it ends with one. Null otherwise. */
@@ -306,6 +313,9 @@ export class LoopService {
         skipIfBusy: true,
         quietSentinels: [cfg.quietSentinel, LOOP_SILENT_SENTINEL, LOOP_COMPLETE_SENTINEL],
         historyLabel: loopHistoryLabel(loop),
+        // A scheduled tick whose reply is unchanged since the last reported one is not sent.
+        // `/loop now` (manual) always shows the reply.
+        ...(manual ? {} : { beforeDeliver: (response: string) => (isUnchangedLoopReply(loop, response) ? "suppress" : "send") }),
       })
       .then(
         (res) => this.handle(loop.id, res, manual),
@@ -419,9 +429,11 @@ export class LoopService {
     const runs = loop.runs + 1;
     const quietSentinels = [cfg.quietSentinel, LOOP_SILENT_SENTINEL];
 
-    const silent = res.silent === true || isQuietReply(response, quietSentinels);
+    // A reply the pipeline suppressed as unchanged is "unchanged", not "quiet".
+    const suppressed = res.suppressed === true;
+    const silent = (res.silent === true && !suppressed) || isQuietReply(response, quietSentinels);
     const digest = silent ? null : loopReplyDigest(response);
-    const unchanged = silent || digest === loop.lastDigest;
+    const unchanged = silent || suppressed || digest === loop.lastDigest;
 
     let current = loop.currentIntervalSec;
     let quietStreak = loop.quietStreak;

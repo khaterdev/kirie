@@ -282,6 +282,42 @@ describe("MessagePipeline seams", () => {
       expect(history.append.mock.calls[0]![2]).toBe("[loop l-abc12] check the build");
     });
 
+    it("beforeDeliver can suppress a non-quiet reply: not sent, not stored, reported silent and suppressed", async () => {
+      execute.mockResolvedValueOnce(okResult("same as before"));
+      pipeline.start();
+      const hook = vi.fn(() => "suppress" as const);
+      const res = await pipeline.injectMessage({
+        channel: "telegram", chatId: OWNER, text: "tick", senderId: OWNER, origin: "loop", quietSentinels: ["NO_REPLY"], beforeDeliver: hook,
+      });
+      expect(hook).toHaveBeenCalledWith("same as before");
+      expect(res).toMatchObject({ status: "ok", response: "same as before", silent: true, suppressed: true });
+      expect(adapter.sendText).not.toHaveBeenCalled();
+      expect(history.append.mock.calls.filter((c) => c[1] === "assistant")).toHaveLength(0);
+    });
+
+    it("beforeDeliver is not asked about a quiet reply; \"send\" or a throwing hook sends the reply", async () => {
+      pipeline.start();
+      execute.mockResolvedValueOnce(okResult("NO_REPLY"));
+      const hook = vi.fn(() => "suppress" as const);
+      const quiet = await pipeline.injectMessage({
+        channel: "telegram", chatId: OWNER, text: "tick", senderId: OWNER, origin: "loop", quietSentinels: ["NO_REPLY"], beforeDeliver: hook,
+      });
+      expect(hook).not.toHaveBeenCalled();
+      expect(quiet).toMatchObject({ silent: true });
+      expect(quiet.suppressed).toBeUndefined();
+
+      execute.mockResolvedValueOnce(okResult("news"));
+      const sent = await pipeline.injectMessage({
+        channel: "telegram", chatId: OWNER, text: "tick", senderId: OWNER, origin: "loop", beforeDeliver: () => "send",
+      });
+      expect(sent.silent).toBeUndefined();
+      execute.mockResolvedValueOnce(okResult("more news"));
+      await pipeline.injectMessage({
+        channel: "telegram", chatId: OWNER, text: "tick", senderId: OWNER, origin: "loop", beforeDeliver: () => { throw new Error("boom"); },
+      });
+      expect(sentTexts(adapter)).toEqual(["news", "more news"]);
+    });
+
     it("a non-quiet reply is sent without a replyToId (synthetic id)", async () => {
       pipeline.start();
       const res = await pipeline.injectMessage({

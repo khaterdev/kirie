@@ -174,6 +174,36 @@ describe("loops through the real pipeline", () => {
     expect(store.get(loop.id)).toMatchObject({ lastStatus: "changed", currentIntervalSec: 300 });
   });
 
+  it("an unchanged reply to a scheduled tick is neither sent nor stored; a changed one is; /loop now always shows it", async () => {
+    const assistantRows = () => history.append.mock.calls.filter((c) => c[1] === "assistant").map((c) => c[2]);
+    const due = (id: string) => { store.update(id, { nextRunAt: Date.now() }, Date.now()); service.reload(); };
+    execute.mockResolvedValue(okResult("Deploy is at step 3."));
+    const loop = createLoop("check the deploy");
+    service.onTick(Date.now());
+    await service.whenIdle();
+    expect(adapter.sendText.mock.calls.map((c) => c[0].text)).toEqual(["Deploy is at step 3."]);
+    expect(store.get(loop.id)).toMatchObject({ lastStatus: "changed" });
+
+    due(loop.id);
+    service.onTick(Date.now());
+    await service.whenIdle();
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(adapter.sendText).toHaveBeenCalledTimes(1);
+    expect(assistantRows()).toEqual(["Deploy is at step 3."]);
+    expect(store.get(loop.id)).toMatchObject({ lastStatus: "unchanged", runs: 2, currentIntervalSec: 600 });
+
+    await service.runNow(loop.id);
+    await service.whenIdle();
+    expect(adapter.sendText.mock.calls.map((c) => c[0].text)).toEqual(["Deploy is at step 3.", "Deploy is at step 3."]);
+
+    execute.mockResolvedValue(okResult("Deploy finished."));
+    due(loop.id);
+    service.onTick(Date.now());
+    await service.whenIdle();
+    expect(adapter.sendText.mock.calls.at(-1)![0].text).toBe("Deploy finished.");
+    expect(store.get(loop.id)).toMatchObject({ lastStatus: "changed", currentIntervalSec: 300 });
+  });
+
   it("never interrupts a running user turn: the tick is deferred 30 s and not counted", async () => {
     let finishUser!: (r: ExecutionResult) => void;
     execute.mockImplementationOnce(() => new Promise<ExecutionResult>((r) => { finishUser = r; }));
