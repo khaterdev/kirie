@@ -68,7 +68,11 @@ export interface ModuleLoggerOptions {
 let sharedStdout: LogLineDestination | null = null;
 
 function stdoutDestination(): LogLineDestination {
-  sharedStdout ??= pino.destination({ dest: 1, sync: true });
+  // Tests that mock "pino" often provide only the logger factory; fall back to
+  // a plain stdout writer so importing a module never throws.
+  sharedStdout ??= typeof pino.destination === "function"
+    ? pino.destination({ dest: 1, sync: true })
+    : { write: (line: string) => process.stdout.write(line) };
   return sharedStdout;
 }
 

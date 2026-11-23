@@ -8,7 +8,7 @@ import { CommandRegistry } from "../commands/registry.js";
 import { OwnerDirectory } from "../interaction/owners.js";
 import { TurnContextRegistry, type TurnInfo } from "../engine/turn-context.js";
 import type { UnifiedMessage, ChannelName } from "../channels/normalizer.js";
-import type { ChannelAdapter, ChannelStatus, SentMessage } from "../channels/adapter.js";
+import type { ChannelStatus, SendTextParams, SentMessage } from "../channels/adapter.js";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { SecurityGate, GateResult } from "../security/gate.js";
 import type { SessionStore } from "../engine/session-store.js";
@@ -46,7 +46,7 @@ function createMockAdapter() {
     async stop() {},
     getStatus(): ChannelStatus { return { state: "connected", failureCount: 0 }; },
     onMessage(listener: (msg: UnifiedMessage) => void) { listeners.push(listener); },
-    sendText: vi.fn(async (): Promise<SentMessage[]> => [{ id: "sent-1", timestamp: Date.now() }]),
+    sendText: vi.fn(async (_params: SendTextParams): Promise<SentMessage[]> => [{ id: "sent-1", timestamp: Date.now() }]),
     sendTyping: vi.fn(async () => {}),
     listeners,
   };
@@ -66,7 +66,7 @@ function controllableEngine() {
 }
 
 function sentTexts(adapter: ReturnType<typeof createMockAdapter>): string[] {
-  return adapter.sendText.mock.calls.map((c) => (c[0] as { text: string }).text);
+  return adapter.sendText.mock.calls.map((c) => c[0].text);
 }
 
 describe("MessagePipeline seams", () => {
@@ -147,7 +147,7 @@ describe("MessagePipeline seams", () => {
       expect(restart).toHaveBeenCalledTimes(1);
       expect(execute).not.toHaveBeenCalled();
       expect(adapter.sendText).toHaveBeenCalledTimes(1);
-      const params = adapter.sendText.mock.calls[0]![0] as { text: string; plain?: boolean; ctx: { replyToId?: string } };
+      const params = adapter.sendText.mock.calls[0]![0];
       expect(params.text).toBe("Restarting");
       expect(params.plain).toBe(true);
       expect(params.ctx.replyToId).toBe("555");
@@ -274,7 +274,7 @@ describe("MessagePipeline seams", () => {
         channel: "telegram", chatId: OWNER, text: "check", senderId: OWNER, origin: "loop", quietSentinels: ["NO_REPLY"],
       });
       expect(res).toMatchObject({ status: "ok", response: "agent reply" });
-      const params = adapter.sendText.mock.calls[0]![0] as { ctx: { replyToId?: string } };
+      const params = adapter.sendText.mock.calls[0]![0];
       expect(params.ctx.replyToId).toBeUndefined();
     });
   });
