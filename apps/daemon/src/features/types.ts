@@ -99,6 +99,8 @@ export interface DaemonContext {
 
 export interface FeatureHandle {
   name: string;
+  /** Set by the runner from `FeatureEntry.security`. */
+  security?: string;
   /** Phase 2: timers, listeners, network. Runs after channels, heartbeat and the task manager have started. */
   start?(): void | Promise<void>;
   stop?(): void | Promise<void>;
@@ -111,4 +113,10 @@ export type FeatureSetup = (ctx: DaemonContext) => FeatureHandle | Promise<Featu
 export interface FeatureEntry {
   readonly name: string;
   readonly setup: FeatureSetup;
+  /**
+   * For a security feature: the protection Kirie runs without when this
+   * feature fails (CONF-N14). Its failure is logged as an error and named in
+   * the owner notice first.
+   */
+  readonly security?: string;
 }

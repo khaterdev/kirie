@@ -75,7 +75,7 @@ import {
   registerKnownSecrets,
   sanitizeErrorForLog,
 } from "./features/scrubbing.js";
-import type { FeatureFailure } from "./features/runner.js";
+import { featureFailureNotice, type FeatureFailure } from "./features/runner.js";
 import { createTranscriptionProvider } from "@kirie/media";
 import type { McpServerOptions } from "@kirie/core";
 import { AgentRegistry } from "@kirie/core";
@@ -1240,10 +1240,8 @@ export async function startDaemon(): Promise<void> {
   const startedFeatures = await startFeatures(featureHandles, {
     onFailure: (f) => featureFailures.push(f),
   });
-  if (featureFailures.length > 0) {
-    const names = [...new Set(featureFailures.map((f) => f.name))].join(", ");
-    void notifyOwner(`Kirie started without these features because they failed to start: ${names}. See the daemon log.`);
-  }
+  const failureNotice = featureFailureNotice(featureFailures);
+  if (failureNotice) void notifyOwner(failureNotice);
 
   // ── Phase 5: command menus for the channels already running (the "started"
   //    listener covers channels that connect later).

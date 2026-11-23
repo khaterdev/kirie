@@ -27,12 +27,12 @@ export { runFeatureSetups, startFeatures, stopFeatures } from "./runner.js";
 
 export const FEATURES: readonly FeatureEntry[] = [
   { name: "core-commands", setup: setupCoreCommands },
-  { name: "scrubbing", setup: setupScrubbing },
+  { name: "scrubbing", setup: setupScrubbing, security: "secret scrubbing (secrets are not masked in messages, logs and cards)" },
   { name: "accounts", setup: setupAccounts },
-  { name: "approvals", setup: setupApprovals },
+  { name: "approvals", setup: setupApprovals, security: "the approval gate (no hardline list, deny list or ask rules)" },
   { name: "sandbox", setup: setupSandbox },
   { name: "undo", setup: setupUndo },
-  { name: "learning", setup: setupLearning },
+  { name: "learning", setup: setupLearning, security: "the skill write guard (skill files are not protected from agent writes)" },
   { name: "curator", setup: setupCurator },
   { name: "usermodel", setup: setupUserModel },
   { name: "goals", setup: setupGoals },

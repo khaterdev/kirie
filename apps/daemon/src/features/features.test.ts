@@ -12,6 +12,7 @@ import {
   type ChannelRegistry,
 } from "@kirie/core";
 import { FEATURES, runFeatureSetups, startFeatures, stopFeatures, type DaemonContext, type FeatureEntry } from "./index.js";
+import { featureFailureNotice, type FeatureFailure } from "./runner.js";
 import { renderCommandsAddendum } from "./core-commands.js";
 import { createOwnerNotifier, OWNER_NOTIFY_KEY_INTERVAL_MS } from "./notify.js";
 import { registerCommandMenus } from "./menus.js";
@@ -124,6 +125,38 @@ describe("feature runner", () => {
     expect(started.map((h) => h.name)).toEqual(["ok"]);
     expect(stop).toHaveBeenCalledTimes(1);
     expect(failures).toEqual([{ name: "flaky", phase: "start", message: "port in use" }]);
+  });
+
+  it("CONF-N14: a security feature that fails to set up or start is reported as one, and the daemon keeps running", async () => {
+    const failures: FeatureFailure[] = [];
+    const stop = vi.fn();
+    const handles = await runFeatureSetups([
+      { name: "approvals", security: "the approval gate", setup: () => { throw new Error("bad rule"); } },
+      { name: "learning", security: "the skill write guard", setup: () => ({ name: "learning", start: () => { throw new Error("db locked"); }, stop }) },
+      { name: "goals", setup: () => { throw new Error("nope"); } },
+      { name: "ok", setup: () => ({ name: "ok" }) },
+    ], fakeContext(), { onFailure: (f) => failures.push(f) });
+    const started = await startFeatures(handles, { onFailure: (f) => failures.push(f) });
+    expect(started.map((h) => h.name)).toEqual(["ok"]);
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(failures).toEqual([
+      { name: "approvals", phase: "setup", message: "bad rule", security: "the approval gate" },
+      { name: "goals", phase: "setup", message: "nope" },
+      { name: "learning", phase: "start", message: "db locked", security: "the skill write guard" },
+    ]);
+    const notice = featureFailureNotice(failures)!;
+    expect(notice).toMatch(/^Security warning/);
+    expect(notice).toContain("WITHOUT the approval gate (approvals)");
+    expect(notice).toContain("WITHOUT the skill write guard (learning)");
+    expect(notice).toContain("goals");
+    expect(notice).not.toContain("bad rule");
+  });
+
+  it("CONF-N14: approvals, scrubbing and the skill write guard (learning) are marked as security features", () => {
+    const security = Object.fromEntries(FEATURES.filter((f) => f.security).map((f) => [f.name, f.security]));
+    expect(Object.keys(security).sort()).toEqual(["approvals", "learning", "scrubbing"]);
+    expect(featureFailureNotice([])).toBeNull();
+    expect(featureFailureNotice([{ name: "goals", phase: "setup", message: "x" }])).toBe("Kirie started without these features because they failed to start: goals. See the daemon log.");
   });
 
   it("stopFeatures never throws", async () => {
