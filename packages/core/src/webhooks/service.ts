@@ -39,7 +39,7 @@ import {
   type WebhookTestBinding,
 } from "./ingress-app.js";
 import { WebhookRateLimiter, WebhookWorkQueue } from "./limits.js";
-import { webhookDedupeKey } from "./replay.js";
+import { webhookReplayKeys } from "./replay.js";
 import {
   isWebhookPing,
   sampleWebhookPayload,
@@ -609,9 +609,14 @@ export class WebhookService implements WebhookDeliveryHandler {
     }
 
     if (!hook.verifiedAt) this.store.markVerified(hook.id, new Date(nowMs));
+    const replay = webhookReplayKeys(hook.source, hook.id, req.rawBody, verified, {
+      nowMs,
+      windowSeconds: this.deps.config().timestampToleranceSeconds,
+    });
     const claim = this.store.claimDelivery({
       hookId: hook.id,
-      dedupeKey: webhookDedupeKey(hook.source, hook.id, req.rawBody, verified),
+      dedupeKey: replay.key,
+      priorKeys: replay.priorKeys,
       providerId: webhookProviderId(hook.source, req.headers),
       event,
       bodyBytes: req.rawBody.byteLength,

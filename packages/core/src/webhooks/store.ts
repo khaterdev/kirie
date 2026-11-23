@@ -85,6 +85,8 @@ export type WebhookPatch = Partial<Pick<WebhookDefinition,
 export interface WebhookClaimInput {
   hookId: string;
   dedupeKey: string;
+  /** Earlier keys of the same delivery (windowed sources): a claimed one makes this a duplicate too. */
+  priorKeys?: readonly string[];
   providerId?: string | null;
   event?: string | null;
   bodyBytes?: number;
@@ -268,12 +270,18 @@ export class WebhookStore {
 
   /**
    * The replay check: insert the dedupe row before any action. Returns
-   * `claimed: false` when the same (hook, dedupe key) was already seen. A row
-   * left `throttled` by a post-auth limit can be claimed again by a retry.
+   * `claimed: false` when the same (hook, dedupe key), or one of
+   * `priorKeys`, was already seen. A row left `throttled` by a post-auth
+   * limit can be claimed again by a retry.
    */
   claimDelivery(input: WebhookClaimInput): { claimed: boolean; id: number } {
     const old = this.db.prepare("SELECT 1 FROM replay_keys WHERE hook_id = ? AND dedupe_key = ?").get(input.hookId, input.dedupeKey);
     if (old) return { claimed: false, id: 0 };
+    for (const prior of input.priorKeys ?? []) {
+      const seen = this.db.prepare("SELECT 1 FROM deliveries WHERE hook_id = ? AND dedupe_key = ? AND status <> 'throttled'").get(input.hookId, prior)
+        ?? this.db.prepare("SELECT 1 FROM replay_keys WHERE hook_id = ? AND dedupe_key = ?").get(input.hookId, prior);
+      if (seen) return { claimed: false, id: 0 };
+    }
     const res = this.db.prepare(`
       INSERT INTO deliveries (hook_id, dedupe_key, provider_id, event, status, body_bytes, remote_ip, received_at)
       VALUES (?, ?, ?, ?, 'accepted', ?, ?, ?)

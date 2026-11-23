@@ -254,6 +254,58 @@ describe("accepted deliveries", () => {
   });
 });
 
+describe("replay window for schemes with no delivery id or signed timestamp (HOOK-N1)", () => {
+  const bodies: Record<"bearer" | "alertmanager", unknown> = {
+    bearer: { event: "backup.finished", status: "ok" },
+    alertmanager: { status: "firing", groupKey: "{}:{alertname=\"Disk\"}", alerts: [{ status: "firing", labels: { alertname: "Disk" }, endsAt: "0001-01-01T00:00:00Z" }] },
+  };
+  const DUP = '{"status":"duplicate"}';
+
+  it.each(["bearer", "alertmanager"] as const)("%s: an identical body is a duplicate within the window and a new delivery after it", async (source) => {
+    const h = await addEnabled("nightly", source);
+    const d = signed(source, h.secret, bodies[source]);
+    expect((await ingress.handle(request(h.id, d.raw, d.headers))).status).toBe(202);
+    await flush();
+    expect(sent).toHaveLength(1);
+    // Immediate retries and anything up to the timestamp tolerance are duplicates.
+    now += 1000;
+    expect(await (await ingress.handle(request(h.id, d.raw, d.headers))).text()).toBe(DUP);
+    now += cfg.timestampToleranceSeconds * 1000 - 2000;
+    expect(await (await ingress.handle(request(h.id, d.raw, d.headers))).text()).toBe(DUP);
+    // Reviewer proof: the same body 24 h later is a new delivery, and the owner hears of it.
+    now += 24 * 3600_000;
+    expect((await ingress.handle(request(h.id, d.raw, d.headers))).status).toBe(202);
+    await flush();
+    expect(sent).toHaveLength(2);
+    // ...and 40 days later, after the retention prune moved old keys to replay_keys.
+    now += 40 * 86_400_000;
+    service.store.pruneDeliveries(cfg.deliveryRetentionDays, new Date(now));
+    expect((await ingress.handle(request(h.id, d.raw, d.headers))).status).toBe(202);
+    await flush();
+    expect(sent).toHaveLength(3);
+  });
+
+  it("an immediate duplicate across a window boundary is still refused", async () => {
+    const h = await addEnabled("nightly", "bearer");
+    const windowMs = cfg.timestampToleranceSeconds * 1000;
+    now = Math.ceil(now / windowMs) * windowMs - 500;
+    const d = signed("bearer", h.secret, bodies.bearer);
+    expect((await ingress.handle(request(h.id, d.raw, d.headers))).status).toBe(202);
+    now += 1000;
+    expect(await (await ingress.handle(request(h.id, d.raw, d.headers))).text()).toBe(DUP);
+    now += windowMs - 1000;
+    expect(await (await ingress.handle(request(h.id, d.raw, d.headers))).text()).toBe(DUP);
+  });
+
+  it("body-signed sources keep the long replay key: the same GitHub body a day later is a duplicate", async () => {
+    const gh = await addEnabled("deploys", "github");
+    const d = signed("github", gh.secret, ghBody());
+    expect((await ingress.handle(request(gh.id, d.raw, d.headers))).status).toBe(202);
+    now += 24 * 3600_000;
+    expect(await (await ingress.handle(request(gh.id, d.raw, d.headers))).text()).toBe(DUP);
+  });
+});
+
 describe("limits", () => {
   it("requires Content-Length (411) and caps the body (413), also when the length lies", async () => {
     const gh = await addEnabled("deploys", "github");
