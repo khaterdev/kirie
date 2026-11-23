@@ -331,6 +331,34 @@ describe("computer-use gate through the SDK options pipeline", () => {
     expect(verdict(await call(on, "Bash", { command: "cua-driver permissions grant" }))).toBe("deny");
   });
 
+  it("CONF-B1: with computer use disabled the tripwire denies nothing, in Bash, Monitor or PowerShell", async () => {
+    build({ enabled: false });
+    begin("owner_message");
+    const options = spawn(ownerCtx());
+    for (const command of [
+      "grep -rn \"cua-driver\" packages/core/src",
+      "git commit -m \"docs: mention cua-driver setup\"",
+      "ls /Applications/CuaDriver.app",
+      "which cua-driver",
+      "brew info cua-driver",
+      "cua-driver call click --pid 10",
+      "cua-driver permissions grant",
+    ]) {
+      expect(verdict(await call(options, "Bash", { command })), command).toBe("allow");
+    }
+    expect(verdict(await call(options, "Monitor", { description: "x", timeout_ms: 1000, command: "cua-driver call click" }))).toBe("allow");
+  });
+
+  it("CONF-B1: enabled but not armed, running the driver is denied from Bash, Monitor and PowerShell", async () => {
+    begin("owner_message");
+    const options = spawn(ownerCtx());
+    expect(verdict(await call(options, "Bash", { command: "grep -rn cua-driver packages/core/src" }))).toBe("allow");
+    expect(verdict(await call(options, "Bash", { command: "cua-driver call click --pid 10" }))).toBe("deny");
+    expect(verdict(await call(options, "Monitor", { description: "x", timeout_ms: 1000, command: "cua-driver call click" }))).toBe("deny");
+    expect(verdict(await call(options, "PowerShell", { command: "cua-driver call click" }))).toBe("deny");
+    expect(verdict(await call(options, "Monitor", { description: "x", timeout_ms: 1000, command: "tail -f /tmp/x" }))).toBe("allow");
+  });
+
   it("the probe and the driver stop never pass grant, connect, update or serve", async () => {
     await armNow();
     await service.disarm("owner");
@@ -354,9 +382,32 @@ describe("checkComputerUseBash", () => {
     }
   });
 
-  it("disarmed: denies any mention of the driver or its app", () => {
-    for (const cmd of ["cua-driver status", "npx cua-driver mcp", "open -a /Applications/CuaDriver.app", "pgrep -f com.trycua.driver", "echo x; cua-driver call click", "c'u'a-driver call click", "cua\\-driver call click", '"cua-driver" mcp']) {
+  it("disarmed: denies running the driver or opening its app", () => {
+    for (const cmd of [
+      "cua-driver status", "npx cua-driver mcp", "open -a /Applications/CuaDriver.app", "echo x; cua-driver call click", "c'u'a-driver call click",
+      "cua\\-driver call click", '"cua-driver" mcp', "open -a CuaDriver", "open /Applications/CuaDriver.app", "open -b com.trycua.driver",
+      "~/.local/bin/cua-driver call click", "env cua-driver call click", "sudo -u me cua-driver call click", "bash -c 'cua-driver call click'",
+      "echo 1 | xargs cua-driver call click", "c=cua; \"$c-driver\" call click", "~/.local/bin/cua-* call click", "d=driver; cua-$d call click",
+      "pnpm dlx cua-driver mcp", "bunx cua-driver@latest mcp", "osascript -e 'tell application \"CuaDriver\" to activate'",
+    ]) {
       expect(checkComputerUseBash(cmd, false), cmd).not.toBeNull();
+    }
+  });
+
+  it("disarmed: a mention that does not run the driver passes (CONF-B1)", () => {
+    for (const cmd of [
+      "grep -rn \"cua-driver\" packages/core/src", "git commit -m \"docs: mention cua-driver setup\"", "ls /Applications/CuaDriver.app", "which cua-driver",
+      "brew info cua-driver", "echo \"cua-driver is not installed\"", "pgrep -f com.trycua.driver", "cat docs/computer-use-setup.md | grep CuaDriver.app",
+      "rg -n 'checkComputerUseBash|cua-driver' packages", "\"$PYTHON\" tool.py", "$EDITOR notes.md",
+    ]) {
+      expect(checkComputerUseBash(cmd, false), cmd).toBeNull();
+    }
+  });
+
+  it("computer use disabled: nothing is denied, not even the state-changing subcommands (CONF-B1)", () => {
+    for (const cmd of ["cua-driver call click", "cua-driver permissions grant", "/Applications/CuaDriver.app/Contents/MacOS/CuaDriver serve", "open -a CuaDriver"]) {
+      expect(checkComputerUseBash(cmd, false, false), cmd).toBeNull();
+      expect(checkComputerUseBash(cmd, true, false), cmd).toBeNull();
     }
   });
 

@@ -173,6 +173,14 @@ export class ComputerUseService {
     return ctx.kind === "chat" && ctx.interactive && ctx.ownerDm && ctx.chatType === "dm" && ctx.channel !== "voice";
   }
 
+  /**
+   * `computerUse.enabled` as in effect now. There is no runtime override for it
+   * (it is read at start), so this is the config value.
+   */
+  isEnabled(): boolean {
+    return this.config.enabled;
+  }
+
   /** The `mcp__cua-driver` prefix claim: enabled, armed, owner DM chat. */
   claimAllows(ctx: SdkCallContext): boolean {
     return this.config.enabled && this.arming.isArmed() && this.isOwnerChatContext(ctx);

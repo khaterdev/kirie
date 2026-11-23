@@ -6,71 +6,122 @@
  * `OwnerPrompts.requestApproval({ kind: "computer" })`, independent of the
  * global approval mode.
  *
- * Bash: a tripwire, not a boundary. With unrestricted Bash the agent could
- * drive the driver from the shell once CuaDriver.app has its macOS grants; the
- * tripwire denies the obvious forms (see docs/computer-use-setup.md).
+ * Shell tools (Bash, Monitor, PowerShell): a tripwire, not a boundary, and
+ * only while `computerUse.enabled` is true. With unrestricted Bash the agent
+ * could drive the driver from the shell once CuaDriver.app has its macOS
+ * grants; the tripwire denies commands that run the driver or open its app
+ * (see docs/computer-use-setup.md). A command that only mentions it (grep, a
+ * commit message, ls of the app) passes (CONF-B1).
  */
 
 import type { ToolGate, ToolGateCall, ToolGateVerdict } from "../engine/sdk-options.js";
+import { matchApprovalGlob } from "../approvals/glob.js";
+import { parseShell, type ShellSegment } from "../approvals/shell-parse.js";
 import { computerUseInputPids, computerUseTypedChars, decideComputerUse, type ComputerUseAppInfo } from "./policy.js";
 import type { ComputerUseService } from "./service.js";
 import { computerUseBareToolName, COMPUTER_USE_SERVER_NAME } from "./tools.js";
 
 export const COMPUTER_USE_GATE_NAME = "computer-use";
 export const COMPUTER_USE_GATE_ORDER = 300;
-export const COMPUTER_USE_GATE_MATCHER = /^(Bash|mcp__(cua-driver|cua-computer-use)__.+)$/;
+export const COMPUTER_USE_GATE_MATCHER = /^(Bash|Monitor|PowerShell|mcp__(cua-driver|cua-computer-use)__.+)$/;
 
-/** Driver subcommands that are never allowed from Bash, armed or not. */
+/** Built-in tools whose `command` runs in a shell. */
+const SHELL_TOOLS: ReadonlySet<string> = new Set(["Bash", "Monitor", "PowerShell"]);
+
+/** Driver subcommands that are never allowed from a shell, armed or not. */
 const ALWAYS_DENIED = /\b(permissions\s+grant|connect|update|upgrade|serve|install|uninstall|config\s+set|telemetry\s+enable)\b/i;
-/** Read-only driver subcommands allowed from Bash while armed. */
+/** Read-only driver subcommands allowed from a shell while armed. */
 const READ_ONLY_SUBCOMMANDS: ReadonlySet<string> = new Set(["--version", "-v", "version", "status", "doctor", "list-tools", "help", "--help", "-h", "stop"]);
 
-const DRIVER_TOKEN = /(?:^|[^\w.-])((?:[^\s'"`;&|()<>]*\/)?cua-driver)(?![\w.-])/gi;
-const DRIVER_APP = /CuaDriver\.app|com\.trycua\.driver/i;
-/** The app bundle's own executables: never run from Bash, armed or not. */
+const DRIVER_CLI = "cua-driver";
+/** The app bundle's own executables (`.../CuaDriver.app/Contents/MacOS/CuaDriver`). */
 const DRIVER_APP_BINARY = /CuaDriver\.app\/Contents\/(MacOS|Resources)\//i;
+/** An app name, path or bundle id that opens the driver app. */
+const DRIVER_APP_REF = /(^|\/)CuaDriver(\.app)?\/?$|^com\.trycua\.driver$/i;
+/** Package runners that execute their first argument (`npx cua-driver`). */
+const RUNNERS: ReadonlySet<string> = new Set(["npx", "pnpx", "bunx", "uvx"]);
+const RUNNER_SUBCOMMANDS: Readonly<Record<string, readonly string[]>> = { pnpm: ["dlx"], yarn: ["dlx"], npm: ["exec", "x"], pipx: ["run"], uv: ["tool"] };
 
-/** Up to the next shell separator. */
-function invocationAfter(command: string, index: number): string {
-  const rest = command.slice(index);
-  const end = rest.search(/[;&|\n()`]/);
-  return end === -1 ? rest : rest.slice(0, end);
+type DriverInvocation =
+  | { kind: "cli"; args: string[] }
+  | { kind: "app-binary" }
+  | { kind: "app" }
+  | { kind: "computed"; name: string };
+
+function isDriverName(word: string | undefined): boolean {
+  if (!word) return false;
+  const base = (word.split("/").pop() ?? "").toLowerCase();
+  return base === DRIVER_CLI || base.startsWith(`${DRIVER_CLI}@`);
 }
 
-/**
- * Decide a Bash command for the tripwire. Returns a deny reason, or null to pass.
- * - always: cua-driver permissions grant, connect, update, serve, install, config set, telemetry enable
- * - not armed: any mention of cua-driver, CuaDriver.app or com.trycua.driver
- * - armed or not: running an executable inside CuaDriver.app
- * - armed: only read-only subcommands (status, permissions status, doctor, list-tools, --version, help, stop)
- */
-export function checkComputerUseBash(rawCommand: string, armed: boolean): string | null {
-  if (typeof rawCommand !== "string" || rawCommand.length === 0) return null;
-  // Quotes and backslashes do not split a word in the shell (c'u'a-driver, cua\-driver): drop them before matching.
-  const command = rawCommand.replace(/['"\\]/g, "");
-  const invocations: string[] = [];
-  DRIVER_TOKEN.lastIndex = 0;
-  for (let m = DRIVER_TOKEN.exec(command); m !== null; m = DRIVER_TOKEN.exec(command)) {
-    const start = m.index + m[0].length - (m[1]?.length ?? 0);
-    invocations.push(invocationAfter(command, start));
-  }
+/** A computed command name (`"$c-driver"`, `cua-$d`, `~/.local/bin/cua-*`) that could be the driver. */
+function maybeDriverName(cmd: string): boolean {
+  const base = cmd.split("/").pop() ?? cmd;
+  if (/[*?[]/.test(base) && !base.includes("$")) return matchApprovalGlob(base, DRIVER_CLI) || matchApprovalGlob(base, "cuadriver");
+  const literal = base.replace(/\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*|`[^`]*`/g, "");
+  return literal !== base && (literal.includes("cua") || literal.includes("driver"));
+}
 
-  for (const inv of invocations) {
-    if (ALWAYS_DENIED.test(inv)) {
-      return "Kirie never grants permissions to, connects, updates, serves or reconfigures cua-driver. The owner does that from Terminal (docs/computer-use-setup.md).";
-    }
+/** How one parsed simple command runs the driver, or null when it does not. */
+function driverInvocation(seg: ShellSegment): DriverInvocation | null {
+  const argv = seg.argv;
+  const head = argv[0] ?? "";
+  if (DRIVER_APP_BINARY.test(head) || seg.cmd === "cuadriver") return { kind: "app-binary" };
+  if (isDriverName(head) && seg.cmd !== "") return { kind: "cli", args: argv.slice(1) };
+  if (seg.args[0] && (seg.args[0].expansion || seg.args[0].glob) && maybeDriverName(seg.cmd)) return { kind: "computed", name: head };
+  const runner = RUNNERS.has(seg.cmd) ? 1 : (RUNNER_SUBCOMMANDS[seg.cmd] ?? []).includes(argv[1] ?? "") ? 2 : -1;
+  if (runner !== -1) {
+    let i = runner;
+    while (i < argv.length && argv[i]!.startsWith("-")) i++;
+    if (isDriverName(argv[i])) return { kind: "cli", args: argv.slice(i + 1) };
+    return null;
   }
-  if (DRIVER_APP_BINARY.test(command)) {
-    return "Do not run CuaDriver.app's executables from the shell; desktop control goes through the cua-driver MCP tools while armed.";
-  }
-  if (!armed) {
-    if (invocations.length > 0 || DRIVER_APP.test(command)) {
-      return "Desktop control is off. Do not drive cua-driver from the shell; the owner can arm computer use with /computer on.";
+  if (seg.cmd === "open") {
+    for (let i = 1; i < argv.length; i++) {
+      const a = argv[i]!;
+      if ((a === "-a" || a === "-b") && DRIVER_APP_REF.test(argv[i + 1] ?? "")) return { kind: "app" };
+      if (!a.startsWith("-") && DRIVER_APP_REF.test(a)) return { kind: "app" };
     }
     return null;
   }
+  if (seg.cmd === "osascript" && argv.slice(1).some((a) => /CuaDriver|com\.trycua\.driver/i.test(a))) return { kind: "app" };
+  return null;
+}
+
+/**
+ * Decide a shell command for the tripwire. Returns a deny reason, or null to pass.
+ * Only while computer use is enabled; disabled, it denies nothing (CONF-B1).
+ * It looks at what the command runs (each parsed simple command, wrappers and
+ * nested `bash -c`, `xargs` and the like included), never at mentions:
+ * - always: cua-driver permissions grant, connect, update, serve, install, config set, telemetry enable
+ * - armed or not: running an executable inside CuaDriver.app
+ * - not armed: running cua-driver (directly, through a package runner, or under a computed name) or opening its app
+ * - armed: only read-only subcommands (status, permissions status, doctor, list-tools, --version, help, stop)
+ */
+export function checkComputerUseBash(rawCommand: string, armed: boolean, enabled = true): string | null {
+  if (!enabled || typeof rawCommand !== "string" || rawCommand.length === 0) return null;
+  const invocations: DriverInvocation[] = [];
+  for (const seg of parseShell(rawCommand).segments) {
+    const inv = driverInvocation(seg);
+    if (inv) invocations.push(inv);
+  }
+  if (invocations.length === 0) return null;
+
   for (const inv of invocations) {
-    const words = inv.trim().split(/\s+/).slice(1).filter((w) => !/^--?(json|quiet|q|verbose)$/i.test(w));
+    if (inv.kind === "cli" && ALWAYS_DENIED.test(inv.args.join(" "))) {
+      return "Kirie never grants permissions to, connects, updates, serves or reconfigures cua-driver. The owner does that from Terminal (docs/computer-use-setup.md).";
+    }
+  }
+  if (invocations.some((inv) => inv.kind === "app-binary")) {
+    return "Do not run CuaDriver.app's executables from the shell; desktop control goes through the cua-driver MCP tools while armed.";
+  }
+  if (!armed) {
+    return "Desktop control is off. Do not drive cua-driver from the shell; the owner can arm computer use with /computer on.";
+  }
+  for (const inv of invocations) {
+    if (inv.kind === "computed") return "Use the cua-driver MCP tools for desktop control, not the shell: only read-only cua-driver commands may run from a shell, by their plain name.";
+    if (inv.kind !== "cli") continue;
+    const words = inv.args.filter((w) => !/^--?(json|quiet|q|verbose)$/i.test(w));
     const sub = (words[0] ?? "").toLowerCase();
     if (sub === "permissions" && (words[1] ?? "").toLowerCase() === "status") continue;
     if (READ_ONLY_SUBCOMMANDS.has(sub)) continue;
@@ -108,8 +159,8 @@ export function createComputerUseGate(service: ComputerUseService): ToolGate {
     order: COMPUTER_USE_GATE_ORDER,
     matcher: COMPUTER_USE_GATE_MATCHER,
     async check(call: ToolGateCall): Promise<ToolGateVerdict> {
-      if (call.tool === "Bash") {
-        const reason = checkComputerUseBash(bashCommand(call.input), service.arming.isArmed());
+      if (SHELL_TOOLS.has(call.tool)) {
+        const reason = checkComputerUseBash(bashCommand(call.input), service.arming.isArmed(), service.isEnabled());
         if (!reason) return { decision: "pass" };
         service.audit("bash.denied", `agent:${call.ctx.sessionKey ?? call.ctx.label}`, { label: call.ctx.label });
         return { decision: "deny", reason };
