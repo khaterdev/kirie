@@ -41,6 +41,9 @@ import { createProactiveToolHandlers } from "./tools/proactive-tools.js";
 import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
 import { createTTSToolHandlers } from "./tools/tts-tool.js";
 import type { ProactiveEngine } from "../engine/proactive.js";
+import { registerFeatureTools, type FeatureToolContext } from "./feature-tools.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export interface McpToolDefinition {
   description: string;
@@ -88,6 +91,8 @@ export interface McpServerOptions {
   heartbeatLogRetention?: { tier1?: number; tier2?: number; tier3?: number; heartbeat?: number };
   /** Optional pre-created HeartbeatLogStore (avoids creating a duplicate) */
   heartbeatLogStore?: HeartbeatLogStore;
+  /** Context for the feature tool factories (PLAN B.10 seam 4). Default: ~/.kirie and process.env */
+  featureTools?: FeatureToolContext;
 }
 
 /**
@@ -273,6 +278,13 @@ export function createMcpToolRegistry(options: McpServerOptions): {
   for (const [name, def] of Object.entries(ttsHandlers)) {
     tools.set(name, def as unknown as McpToolDefinition);
   }
+
+  // Feature tools (PLAN B.13). The stdio server registers the same set.
+  registerFeatureTools((handlers) => {
+    for (const [name, def] of Object.entries(handlers)) {
+      if (!tools.has(name)) tools.set(name, def);
+    }
+  }, options.featureTools ?? { dbDir: join(homedir(), ".kirie"), env: process.env });
 
   // Auto-reindex: backfill vector embeddings for any records missing them
   if (options.memoryManager) {

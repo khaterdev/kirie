@@ -44,6 +44,7 @@ import { AgentRegistry } from "../engine/agent-registry.js";
 import { MemoryManager, VectorStore, OpenAIEmbeddings, LocalEmbeddings, ensureModelDownloaded, isModelDownloaded } from "@kirie/memory";
 import { HeartbeatLogStore, createHeartbeatLogToolHandlers } from "./tools/heartbeat-logs.js";
 import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
+import { registerFeatureTools } from "./feature-tools.js";
 
 // ── Database paths ──────────────────────────────────────────────────────────
 
@@ -274,6 +275,14 @@ if (gatewayUrl) {
   registerHandlers(createGatewayProxyToolHandlers(gatewayUrl));
   registerHandlers(createGatewayProactiveToolHandlers(gatewayUrl));
 }
+
+// Feature tools (PLAN B.13): every feature fills its own mcp/tools/<name>-tools.ts.
+// Built-in names win over a feature tool with the same name.
+registerFeatureTools((handlers) => {
+  for (const [name, def] of Object.entries(handlers)) {
+    if (!allTools.has(name)) allTools.set(name, def as ToolDefinition);
+  }
+}, { dbDir, ...(gatewayUrl ? { gatewayUrl } : {}), env: process.env });
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 

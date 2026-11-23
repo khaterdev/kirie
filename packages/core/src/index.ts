@@ -73,6 +73,7 @@ export * from "./gateway/routes.js";
 export * from "./gateway/internal-api.js";
 export * from "./ingress/index.js";
 export * from "./mcp/server.js";
+export * from "./mcp/feature-tools.js";
 export { MemoryStore, type MemoryManagerLike } from "./mcp/tools/memory.js";
 export * from "./auto-reply/auto-reply.js";
 export { registerBuiltinCommands } from "./auto-reply/commands.js";
