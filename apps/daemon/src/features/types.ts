@@ -91,8 +91,11 @@ export interface DaemonContext {
   /** The kirie-tools MCP server env (KIRIE_* flags read by feature tool factories) */
   readonly kirieToolsEnv: Record<string, string>;
 
-  /** One plain line to the owner's DM on the primary channel. Scrubbed. With `key`, at most one per key per 10 minutes. */
-  notifyOwner(text: string, opts?: { key?: string }): Promise<void>;
+  /**
+   * One plain line to the owner's DM on the primary channel. Scrubbed. With `key`, at most one per key per 10 minutes;
+   * with `always` (a real state change) it is sent anyway and the key recorded.
+   */
+  notifyOwner(text: string, opts?: { key?: string; always?: boolean }): Promise<void>;
   /** Restart the daemon (stop then start, same process). */
   restart(): void;
 }

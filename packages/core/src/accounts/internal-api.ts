@@ -33,7 +33,8 @@ export interface AccountsInternalApiDeps {
   primaryModel: () => string;
   requestApproval: OwnerPrompts["requestApproval"];
   approvalTimeoutMs: number;
-  notifyOwner: (text: string, opts?: { key?: string }) => Promise<void>;
+  /** `always`: send even when `key` was used recently (a real state change); the key is still recorded. */
+  notifyOwner: (text: string, opts?: { key?: string; always?: boolean }) => Promise<void>;
   home?: string;
 }
 
@@ -63,8 +64,15 @@ export function createAccountsInternalApi(deps: AccountsInternalApiDeps): Hono {
     return c.json({ error: `accounts.agentTools is "${mode}"` }, 403);
   };
 
-  const tell = (text: string, key: string): void => {
-    void deps.notifyOwner(text, { key }).catch(() => undefined);
+  /**
+   * One notice per agent action (E.4, RUNTIME-B4). The key names the action
+   * and the resulting state. A notice for a real state change is always sent;
+   * only a repeat that changed nothing is coalesced with an identical notice
+   * sent in the last 10 minutes. So the owner's latest notice always matches
+   * the state the agent left.
+   */
+  const tell = (text: string, key: string, changed: boolean): void => {
+    void deps.notifyOwner(text, { key, always: changed }).catch(() => undefined);
   };
 
   app.get("/", (c) => {
@@ -164,8 +172,13 @@ export function createAccountsInternalApi(deps: AccountsInternalApiDeps): Hono {
     const b = await body(c);
     if (!id || typeof b.enabled !== "boolean") return c.json({ error: "id and a boolean enabled are required" }, 400);
     try {
+      const before = m.get(id)?.enabled;
       const acc = m.setEnabled(id, b.enabled, agentActor(b));
-      tell(`The agent ${b.enabled ? "enabled" : "disabled"} Claude account ${id}. Undo with /accounts ${b.enabled ? "disable" : "enable"} ${id}.`, `accounts:agent:enabled:${id}`);
+      tell(
+        `The agent ${b.enabled ? "enabled" : "disabled"} Claude account ${id}. Undo with /accounts ${b.enabled ? "disable" : "enable"} ${id}.`,
+        `accounts:agent:enabled:${id}:${b.enabled ? "on" : "off"}`,
+        before !== acc.enabled,
+      );
       return c.json({ id: acc.id, enabled: acc.enabled });
     } catch (err) {
       return c.json({ error: err instanceof AccountImportError ? err.message : "failed" }, 400);
@@ -179,8 +192,9 @@ export function createAccountsInternalApi(deps: AccountsInternalApiDeps): Hono {
     const b = await body(c);
     if (!id) return c.json({ error: "invalid id" }, 400);
     try {
+      const before = m.activeAccountId();
       const out = m.use(id, agentActor(b));
-      tell(`The agent switched the active Claude account to ${id}. ${ACCOUNTS_MCP_NOTE}`, `accounts:agent:use:${id}`);
+      tell(`The agent switched the active Claude account to ${id}. ${ACCOUNTS_MCP_NOTE}`, `accounts:agent:use:${id}`, before !== out.account.id || out.clearedLimit);
       return c.json({ activeId: out.account.id, clearedLimit: out.clearedLimit, appliesFrom: "next turn" });
     } catch (err) {
       return c.json({ error: err instanceof AccountImportError ? err.message : "failed" }, 400);
@@ -195,8 +209,12 @@ export function createAccountsInternalApi(deps: AccountsInternalApiDeps): Hono {
     // One named account only: the agent cannot reset every account at once.
     if (!id || id === "all" || !m.get(id)) return c.json({ error: "invalid id" }, 400);
     try {
+      const before = m.get(id)!;
+      const hadState =
+        before.status !== "ok" || before.limitedUntil !== null || before.lastError !== null ||
+        deps.fallback.benched().some((x) => x.accountId === id);
       m.reset(id, agentActor(b));
-      tell(`The agent cleared the limit or login error of Claude account ${id}.`, `accounts:agent:reset:${id}`);
+      tell(`The agent cleared the limit or login error of Claude account ${id}.`, `accounts:agent:reset:${id}`, hadState);
       return c.json({ id, reset: true });
     } catch (err) {
       return c.json({ error: err instanceof AccountImportError ? err.message : "failed" }, 400);
@@ -208,8 +226,13 @@ export function createAccountsInternalApi(deps: AccountsInternalApiDeps): Hono {
     if (denied) return denied;
     const b = await body(c);
     if (typeof b.enabled !== "boolean") return c.json({ error: "a boolean enabled is required" }, 400);
+    const before = deps.rotationEnabled();
     deps.settings.set(ACCOUNTS_ROTATION_SETTING, b.enabled, agentActor(b));
-    tell(`The agent turned account rotation ${b.enabled ? "on" : "off"}. Undo with /rotation ${b.enabled ? "off" : "on"}.`, "accounts:agent:rotation");
+    tell(
+      `The agent turned account rotation ${b.enabled ? "on" : "off"}. Undo with /rotation ${b.enabled ? "off" : "on"}.`,
+      `accounts:agent:rotation:${b.enabled ? "on" : "off"}`,
+      before !== deps.rotationEnabled(),
+    );
     return c.json({ rotation: { enabled: deps.rotationEnabled() } });
   });
 

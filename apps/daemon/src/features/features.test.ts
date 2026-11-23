@@ -207,6 +207,15 @@ describe("owner notifier", () => {
     expect(sendText).toHaveBeenCalledTimes(3);
   });
 
+  it("always sends a notice marked as a state change, and still coalesces an identical repeat (RUNTIME-B4)", async () => {
+    const { notify, sendText } = setup();
+    await notify("off", { key: "k:off", always: true });
+    await notify("off again", { key: "k:off" });
+    await notify("on", { key: "k:on", always: true });
+    await notify("off", { key: "k:off", always: true });
+    expect(sendText.mock.calls.map((c) => (c as unknown as [{ text: string }])[0].text)).toEqual(["off", "on", "off"]);
+  });
+
   it("does nothing when the channel is down or no owner exists", async () => {
     const { notify, sendText } = setup(false);
     await notify("x");
