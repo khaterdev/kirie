@@ -18,6 +18,9 @@ const ctx: FeatureToolContext = {
   env: {},
 };
 
+/** Factories whose stub has been replaced; each is covered by its own test file. */
+const FILLED_FACTORIES = new Set(["createGoalsTools", "createPluginsTools", "createSecretsTools"]);
+
 function tool(description: string): McpToolDefinition {
   return { description, parameters: { type: "object", properties: {} }, handler: () => ({ ok: true }) };
 }
@@ -32,16 +35,18 @@ describe("feature tool seam", () => {
     ]);
   });
 
-  it("the stubs register nothing, filled factories only their own tools, and none do I/O when called", () => {
-    // Factories already filled in by their workstreams, and the tools they define.
-    const filled: Record<string, string[]> = { createPluginsTools: ["plugins_list"] };
-    for (const factory of FEATURE_TOOL_FACTORIES) {
-      expect(Object.keys(factory(ctx)), factory.name).toEqual(filled[factory.name] ?? []);
+  it("the stubs register nothing and do no I/O when called", () => {
+    const stubs = FEATURE_TOOL_FACTORIES.filter((f) => !FILLED_FACTORIES.has(f.name));
+    for (const factory of stubs) {
+      expect(factory(ctx), factory.name).toEqual({});
     }
-    expect(featureToolNames(ctx)).toEqual(Object.values(filled).flat());
-    const registered: string[] = [];
-    registerFeatureTools((h) => { registered.push(...Object.keys(h)); }, ctx);
-    expect(registered).toEqual(Object.values(filled).flat());
+    // Filled factories are tested in their own files; here: they too do no I/O when called.
+    for (const factory of FEATURE_TOOL_FACTORIES) factory(ctx);
+    const filled = FEATURE_TOOL_FACTORIES.filter((f) => FILLED_FACTORIES.has(f.name)).flatMap((f) => Object.keys(f(ctx)));
+    expect(featureToolNames(ctx)).toEqual(filled);
+    let registered = 0;
+    registerFeatureTools((h) => { registered += Object.keys(h).length; }, ctx);
+    expect(registered).toBe(filled.length);
     expect(existsSync(ctx.dbDir)).toBe(false);
   });
 
