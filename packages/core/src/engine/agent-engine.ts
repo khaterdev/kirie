@@ -26,6 +26,7 @@ import {
   type FailureInfo,
 } from "./failure.js";
 import { chatCallContext, type SdkCallContext, type SdkOptionsPipeline } from "./sdk-options.js";
+import type { TurnAdvance, TurnCandidate, TurnResilience } from "./resilience.js";
 
 const log = createModuleLogger("agent-engine");
 
@@ -198,9 +199,16 @@ export interface AgentExecutor {
  */
 export class AgentEngine implements AgentExecutor {
   private readonly config: AgentEngineConfig;
+  /** Account rotation and model fallback (PLAN C.1, C.2). Null: today's behaviour */
+  private resilience: TurnResilience | null = null;
 
   constructor(config: AgentEngineConfig) {
     this.config = config;
+  }
+
+  /** Install (or remove) account rotation and model fallback. */
+  setResilience(resilience: TurnResilience | null): void {
+    this.resilience = resilience;
   }
 
   /**
@@ -257,6 +265,64 @@ export class AgentEngine implements AgentExecutor {
       cwd: this.config.cwd ?? process.cwd(),
     });
 
+    const userPrompt = wrapUserMessage(message, chatHistory, sessionKey, this.config.prompt?.timezone);
+
+    const resilience = this.resilience;
+    if (!resilience) return this.executeOnce(userPrompt, builtPrompt, ctx, sessionId, onQuery);
+
+    // One attempt per candidate (account, model). Between attempts the same
+    // SDK session is resumed under the next account when it can be carried.
+    const plan = resilience.begin({ kind: "chat", primaryModel: builtPrompt.model ?? "" });
+    const tz = this.config.prompt?.timezone;
+    let prompt = userPrompt;
+    let resume = sessionId;
+    const carried = (advance: TurnAdvance, sid: string | undefined): string | undefined => {
+      if (!sid) return undefined;
+      return resilience.resumableAcross(advance.previous.accountId, advance.accountId, sid) ? sid : undefined;
+    };
+    for (;;) {
+      const candidate = plan.current;
+      let result: ExecutionResult;
+      try {
+        result = await this.executeOnce(prompt, builtPrompt, ctx, resume, onQuery, candidate);
+      } catch (err) {
+        const failure = failureOf(err);
+        const advance = isHardFailure(failure) ? plan.next(failure) : null;
+        if (!advance) {
+          if (failure) attachFailure(err, plan.finalFailure(failure, tz));
+          throw err;
+        }
+        log.warn({ failureClass: advance.reason, toAccount: advance.accountId, toModel: advance.model }, "retrying the turn on the next account or model");
+        resume = carried(advance, resume);
+        prompt = `${advance.note}\n${userPrompt}`;
+        continue;
+      }
+      if (result.isError && !result.wasAborted && isHardFailure(result.failure)) {
+        const advance = plan.next(result.failure);
+        if (!advance) return { ...result, failure: plan.finalFailure(result.failure, tz) };
+        log.warn({ failureClass: advance.reason, toAccount: advance.accountId, toModel: advance.model }, "retrying the turn on the next account or model");
+        resume = carried(advance, result.sessionId || resume);
+        prompt = `${advance.note}\n${userPrompt}`;
+        continue;
+      }
+      if (!result.isError && !result.wasAborted) {
+        const notices = plan.succeeded();
+        if (notices.length > 0) return { ...result, notices };
+      }
+      return result;
+    }
+  }
+
+  /** One attempt on one candidate: today's resume-then-fresh sequence. */
+  private async executeOnce(
+    userPrompt: string,
+    builtPrompt: ReturnType<typeof buildPrompt>,
+    ctx: SdkCallContext,
+    sessionId: string | undefined,
+    onQuery: ((q: Query) => void) | undefined,
+    candidate?: TurnCandidate,
+  ): Promise<ExecutionResult> {
+    const accountId = candidate?.accountId ?? null;
     // Options are rebuilt for every attempt: apply() appends hooks, so one
     // object must never pass through it twice.
     const buildOptions = (resume?: string): Options => {
@@ -266,7 +332,7 @@ export class AgentEngine implements AgentExecutor {
         // V1 query() supports this mode fully (unlike V2 which hardcodes it off).
         permissionMode: "bypassPermissions",
         maxTurns: builtPrompt.maxTurns,
-        model: builtPrompt.model,
+        model: candidate?.model || builtPrompt.model,
         allowedTools: this.config.allowedTools,
         mcpServers: this.config.mcpServers,
         cwd: this.config.cwd,
@@ -274,12 +340,11 @@ export class AgentEngine implements AgentExecutor {
         // Without this, the SDK does NOT discover any filesystem-based skills.
         settingSources: ["user", "project"],
       };
+      if (candidate?.env) options.env = candidate.env;
       if (resume) options.resume = resume;
       this.config.sdkOptions?.apply(options, ctx);
       return options;
     };
-
-    const userPrompt = wrapUserMessage(message, chatHistory, sessionKey, this.config.prompt?.timezone);
 
     // Attempt to resume an existing session. If the session is stale or from
     // a different process (e.g., CLI resuming a daemon session), the SDK will
@@ -290,7 +355,7 @@ export class AgentEngine implements AgentExecutor {
     // conversation. Those return or throw as they are.
     if (sessionId) {
       try {
-        const result = await this.runQuery(userPrompt, buildOptions(sessionId), ctx, onQuery);
+        const result = await this.runQuery(userPrompt, buildOptions(sessionId), ctx, onQuery, accountId);
         if (!result.isError) {
           return result;
         }
@@ -329,7 +394,7 @@ export class AgentEngine implements AgentExecutor {
           log.info({ attempt, delayMs }, "retrying fresh session after delay");
           await new Promise((r) => setTimeout(r, delayMs));
         }
-        return await this.runQuery(userPrompt, buildOptions(), ctx, onQuery);
+        return await this.runQuery(userPrompt, buildOptions(), ctx, onQuery, accountId);
       } catch (err) {
         lastErr = err;
         log.error({ attempt, err }, "fresh session attempt failed");
@@ -343,11 +408,12 @@ export class AgentEngine implements AgentExecutor {
     prompt: string,
     options: Options,
     ctx: SdkCallContext,
-    onQuery?: (q: Query) => void,
+    onQuery: ((q: Query) => void) | undefined,
+    accountId: string | null,
   ): Promise<ExecutionResult> {
     const stream = query({ prompt, options });
     onQuery?.(stream);
-    return this.consumeStream(stream, ctx);
+    return this.consumeStream(stream, ctx, accountId);
   }
 
   /**
@@ -360,6 +426,7 @@ export class AgentEngine implements AgentExecutor {
   private async consumeStream(
     stream: AsyncGenerator<SDKMessage, void>,
     ctx: SdkCallContext,
+    accountId: string | null,
   ): Promise<ExecutionResult> {
     const sdkOptions = this.config.sdkOptions;
     const signals = newTurnSignals();
@@ -375,13 +442,13 @@ export class AgentEngine implements AgentExecutor {
     let errorText = "";
 
     // The v1 path sends a string prompt, so there is no user message uuid.
-    sdkOptions?.observe({ type: "turn_start", ctx, accountId: null });
+    sdkOptions?.observe({ type: "turn_start", ctx, accountId });
     const endTurn = (failed: boolean, aborted: boolean): void => {
       sdkOptions?.observe({
         type: "turn_end",
         ctx,
         ...(resultSessionId ? { sdkSessionId: resultSessionId } : {}),
-        accountId: null,
+        accountId,
         result: {
           isError: failed,
           wasAborted: aborted,
@@ -483,7 +550,7 @@ export class AgentEngine implements AgentExecutor {
       wasAborted,
       ...(failure ? { failure } : {}),
       ...(signals.model ? { model: signals.model } : {}),
-      accountId: null,
+      accountId,
     };
   }
 }

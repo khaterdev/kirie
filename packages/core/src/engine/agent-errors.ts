@@ -14,6 +14,7 @@
  */
 
 import type { FailureInfo } from "./failure.js";
+import type { AccountsExhaustedFields } from "./resilience.js";
 
 /** What kind of failure the agent executor reported. */
 export type AgentErrorKind =
@@ -123,6 +124,13 @@ function usageLimitMessage(resetHint: string | undefined): string {
     : USAGE_LIMIT_NO_RESET;
 }
 
+/** Every imported account is limited (PLAN C.1): name the earliest reset across them. */
+function allAccountsLimitedMessage(count: number, resetHint: string | undefined): string {
+  return resetHint
+    ? `All ${count} Claude accounts have reached their usage limits. The earliest one resets ${resetHint}; message me after that.`
+    : `All ${count} Claude accounts have reached their usage limits. Retrying won't help until one of them resets.`;
+}
+
 function isFailureInfo(info: AgentErrorInfo | FailureInfo): info is FailureInfo {
   return "class" in info;
 }
@@ -138,9 +146,11 @@ function isFailureInfo(info: AgentErrorInfo | FailureInfo): info is FailureInfo 
  */
 export function agentErrorUserMessage(info: AgentErrorInfo | FailureInfo): string {
   if (isFailureInfo(info)) {
+    const exhausted = (info as FailureInfo & AccountsExhaustedFields).accountsExhausted;
     switch (info.class) {
       case "usage_limit_account":
       case "usage_limit_model":
+        if (typeof exhausted === "number" && exhausted >= 2) return allAccountsLimitedMessage(exhausted, info.resetHint);
         return usageLimitMessage(info.resetHint);
       case "auth":
         return "The AI account is signed out or blocked, so I can't answer right now. The owner needs to log in to Claude again; retrying won't help until then.";

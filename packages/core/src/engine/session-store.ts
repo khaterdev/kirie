@@ -11,6 +11,8 @@ export interface SessionRow {
   sdk_session_id: string;
   created_at: string;
   updated_at: string;
+  /** Claude account the SDK session last ran on; null = ambient or pre-feature (PLAN C.1) */
+  account_id?: string | null;
 }
 
 /**
@@ -78,8 +80,9 @@ export class SessionStore {
    *
    * @param key - Session key
    * @param sessionId - Agent SDK session ID
+   * @param accountId - Claude account the session runs on. Undefined leaves the stored value unchanged
    */
-  set(key: string, sessionId: string): void {
+  set(key: string, sessionId: string, accountId?: string | null): void {
     // The connection can be closed during shutdown while a late agent task is
     // still finishing. Persisting a session ID at that point is moot — the
     // process is going away — so skip rather than throw a confusing
@@ -87,16 +90,38 @@ export class SessionStore {
     if (!this.db.open) return;
 
     const upsert = this.db.transaction(() => {
-      const stmt = this.db.prepare(`
-        INSERT INTO sessions (session_key, sdk_session_id, created_at, updated_at)
-        VALUES (?, ?, datetime('now'), datetime('now'))
+      if (accountId === undefined) {
+        this.db.prepare(`
+          INSERT INTO sessions (session_key, sdk_session_id, created_at, updated_at)
+          VALUES (?, ?, datetime('now'), datetime('now'))
+          ON CONFLICT(session_key) DO UPDATE SET
+            sdk_session_id = excluded.sdk_session_id,
+            updated_at = datetime('now')
+        `).run(key, sessionId);
+        return;
+      }
+      this.db.prepare(`
+        INSERT INTO sessions (session_key, sdk_session_id, account_id, created_at, updated_at)
+        VALUES (?, ?, ?, datetime('now'), datetime('now'))
         ON CONFLICT(session_key) DO UPDATE SET
           sdk_session_id = excluded.sdk_session_id,
+          account_id = excluded.account_id,
           updated_at = datetime('now')
-      `);
-      stmt.run(key, sessionId);
+      `).run(key, sessionId, accountId);
     });
     upsert();
+  }
+
+  /**
+   * The Claude account a session's SDK session last ran on: a string, null
+   * (ambient or recorded before accounts existed), or undefined when there is
+   * no row.
+   */
+  getAccountId(key: string): string | null | undefined {
+    const row = this.db
+      .prepare<[string], { account_id: string | null }>("SELECT account_id FROM sessions WHERE session_key = ?")
+      .get(key);
+    return row ? row.account_id : undefined;
   }
 
   /**
@@ -248,6 +273,12 @@ export class SessionStore {
    * Called once during construction.
    */
   private migrate(): void {
+    // Claude account binding (PLAN C.1). NULL means ambient / recorded before accounts existed.
+    const columns = this.db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === "account_id")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN account_id TEXT");
+    }
+
     // Add session_labels table for human-readable labels
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_labels (

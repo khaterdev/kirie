@@ -27,12 +27,15 @@ import { makeSessionKey } from "../routing/session-key.js";
 import {
   attachFailure,
   classifyFailure,
+  failureOf,
   feedTurnSignals,
   isHardFailure,
   logSdkSignal,
   newTurnSignals,
   type TurnSignals,
 } from "./failure.js";
+import type { TurnAdvance, TurnCandidate, TurnResilience } from "./resilience.js";
+import { mergeStaticEnv } from "../accounts/account-env.js";
 import {
   chatCallContext,
   type SdkCallContext,
@@ -148,6 +151,10 @@ interface ManagedSession {
   signals: TurnSignals;
   /** uuid of the user message whose turn is in flight. */
   currentUuid: string | undefined;
+  /** Claude account the subprocess was spawned with (null = ambient). Fixed for its lifetime */
+  accountId: string | null;
+  /** Model the session currently runs (changed with setModel by the fallback chain) */
+  model: string;
 }
 
 /**
@@ -228,6 +235,8 @@ export class V2SessionManager implements AgentExecutor {
   private readonly maxSessions: number;
   private idleCheckInterval: ReturnType<typeof setInterval> | null = null;
   private unsolicitedHandler: UnsolicitedResultHandler | null;
+  /** Account rotation and model fallback (PLAN C.1, C.2). Null: today's behaviour */
+  private resilience: TurnResilience | null = null;
 
   constructor(sessionStore: SessionStore, config: V2SessionManagerConfig) {
     this.sessionStore = sessionStore;
@@ -241,6 +250,14 @@ export class V2SessionManager implements AgentExecutor {
   }
 
   /**
+   * Install (or remove) account rotation and model fallback. Without it every
+   * session spawns with the daemon's env and the configured model, as before.
+   */
+  setResilience(resilience: TurnResilience | null): void {
+    this.resilience = resilience;
+  }
+
+  /**
    * Execute a user message through a persistent session.
    *
    * Gets or creates a session for the given session key, sends the
@@ -248,6 +265,12 @@ export class V2SessionManager implements AgentExecutor {
    *
    * If the result is an error (e.g. from a stale session ID that can't be
    * resumed), automatically retries once with a fresh session.
+   *
+   * With resilience installed, a limit or account failure moves to the next
+   * account or model (PLAN C.1, C.2) between attempts: the idle session is
+   * closed and fully gone before it is resumed under the next account, or its
+   * model is changed in place with setModel. A session with a turn in flight
+   * is never closed for a rotation.
    */
   async execute(
     message: IncomingMessage,
@@ -270,7 +293,101 @@ export class V2SessionManager implements AgentExecutor {
       this.config.prompt?.timezone,
     );
 
-    const result = await this.sendAndWait(sessionKey, userPrompt, bootstrap, sessionId, onQuery);
+    const resilience = this.resilience;
+    if (!resilience) return this.attempt(sessionKey, userPrompt, bootstrap, sessionId, onQuery);
+
+    const plan = resilience.begin({ kind: "chat", primaryModel: bootstrap.model ?? this.config.model });
+    const tz = this.config.prompt?.timezone;
+    let prompt = userPrompt;
+    let resumeId = sessionId;
+    for (;;) {
+      const candidate = plan.current;
+      let result: ExecutionResult;
+      try {
+        await this.prepareSession(sessionKey, candidate);
+        result = await this.attempt(sessionKey, prompt, bootstrap, resumeId, onQuery, candidate);
+      } catch (err) {
+        const failure = failureOf(err);
+        const advance = isHardFailure(failure) ? plan.next(failure) : null;
+        if (!advance) {
+          if (failure) attachFailure(err, plan.finalFailure(failure, tz));
+          throw err;
+        }
+        this.logAdvance(sessionKey, advance);
+        prompt = `${advance.note}\n${userPrompt}`;
+        resumeId = undefined;
+        continue;
+      }
+
+      if (result.isError && !result.wasAborted && isHardFailure(result.failure)) {
+        const advance = plan.next(result.failure);
+        if (!advance) return { ...result, failure: plan.finalFailure(result.failure, tz) };
+        this.logAdvance(sessionKey, advance);
+        prompt = `${advance.note}\n${userPrompt}`;
+        resumeId = undefined;
+        continue;
+      }
+      if (!result.isError && !result.wasAborted) {
+        const notices = plan.succeeded();
+        if (notices.length > 0) return { ...result, notices };
+      }
+      return result;
+    }
+  }
+
+  private logAdvance(sessionKey: string, advance: TurnAdvance): void {
+    log.warn(
+      {
+        sessionKey,
+        failureClass: advance.reason,
+        fromAccount: advance.previous.accountId,
+        toAccount: advance.accountId,
+        fromModel: advance.previous.model,
+        toModel: advance.model,
+      },
+      advance.changedAccount ? "retrying the turn on the next Claude account" : "retrying the turn on the next model",
+    );
+  }
+
+  /**
+   * Before an attempt: a live idle session bound to another account is closed
+   * and waited for, so the resume on the new account never shares a
+   * transcript with a live process; a model change on the same account is
+   * applied in place with setModel. A busy session is left alone.
+   */
+  private async prepareSession(sessionKey: string, candidate: TurnCandidate): Promise<void> {
+    const managed = this.sessions.get(sessionKey);
+    if (!managed || managed.pendingResult || managed.aborted) return;
+    if (managed.accountId !== candidate.accountId) {
+      log.info(
+        { sessionKey, fromAccount: managed.accountId, toAccount: candidate.accountId },
+        "closing the idle session to resume it on another account",
+      );
+      await this.closeAndWait(sessionKey, 5_000);
+      return;
+    }
+    if (managed.model !== candidate.model) {
+      try {
+        await managed.stream.setModel(candidate.model);
+        managed.model = candidate.model;
+        log.info({ sessionKey, model: candidate.model }, "session model changed");
+      } catch (err) {
+        log.warn({ sessionKey, err: err instanceof Error ? err.message : String(err) }, "setModel failed; restarting the session on the new model");
+        await this.closeAndWait(sessionKey, 5_000);
+      }
+    }
+  }
+
+  /** One attempt: today's execute, including the fresh-session retry for an unclassified error. */
+  private async attempt(
+    sessionKey: string,
+    userPrompt: string,
+    bootstrap: SessionBootstrap,
+    sessionId: string | undefined,
+    onQuery: ((q: Query) => void) | undefined,
+    candidate?: TurnCandidate,
+  ): Promise<ExecutionResult> {
+    const result = await this.sendAndWait(sessionKey, userPrompt, bootstrap, sessionId, onQuery, candidate);
 
     if (result.isError) {
       // A usage limit, auth failure, unavailable model or overload is not a
@@ -290,7 +407,7 @@ export class V2SessionManager implements AgentExecutor {
       this.cleanupSession(sessionKey);
       this.sessionStore.delete(sessionKey);
 
-      return this.sendAndWait(sessionKey, userPrompt, bootstrap, undefined, onQuery);
+      return this.sendAndWait(sessionKey, userPrompt, bootstrap, undefined, onQuery, candidate);
     }
 
     return result;
@@ -338,8 +455,9 @@ export class V2SessionManager implements AgentExecutor {
     bootstrap: SessionBootstrap,
     resumeSessionId?: string,
     onQuery?: (q: Query) => void,
+    candidate?: TurnCandidate,
   ): Promise<ExecutionResult> {
-    const managed = this.getOrCreate(sessionKey, bootstrap, resumeSessionId);
+    const managed = this.getOrCreate(sessionKey, bootstrap, resumeSessionId, candidate);
     managed.lastActivity = Date.now();
     this.resetIdleTimer(managed);
 
@@ -360,7 +478,7 @@ export class V2SessionManager implements AgentExecutor {
       this.cleanupSession(sessionKey);
       this.sessionStore.delete(sessionKey);
 
-      const fresh = this.createNewSession(sessionKey, bootstrap);
+      const fresh = this.createNewSession(sessionKey, bootstrap, candidate);
       onQuery?.(this.abortHandle(fresh));
       const freshDeferred = createDeferred<ExecutionResult>();
       fresh.pendingResult = freshDeferred;
@@ -412,7 +530,7 @@ export class V2SessionManager implements AgentExecutor {
           numTurns: 0,
           isError: false,
           wasAborted: true,
-          accountId: null,
+          accountId: managed.accountId,
           ...(uuid ? { userMessageUuid: uuid } : {}),
         });
         managed.pendingResult = null;
@@ -438,6 +556,7 @@ export class V2SessionManager implements AgentExecutor {
     sessionKey: string,
     bootstrap: SessionBootstrap,
     resumeSessionId?: string,
+    candidate?: TurnCandidate,
   ): ManagedSession {
     const existing = this.sessions.get(sessionKey);
     if (existing) {
@@ -445,10 +564,21 @@ export class V2SessionManager implements AgentExecutor {
     }
 
     // Resume the caller's session ID if given, else whatever we persisted
-    const savedSessionId = resumeSessionId ?? this.sessionStore.get(sessionKey);
+    let savedSessionId = resumeSessionId ?? this.sessionStore.get(sessionKey);
+    if (savedSessionId && candidate && this.resilience) {
+      // The session row records the account the transcript was written under.
+      const from = this.sessionStore.getAccountId(sessionKey) ?? null;
+      if (!this.resilience.resumableAcross(from, candidate.accountId, savedSessionId)) {
+        log.warn(
+          { sessionKey, fromAccount: from, toAccount: candidate.accountId },
+          "session cannot be carried to the new account; starting fresh (recent history is in the prompt)",
+        );
+        savedSessionId = null;
+      }
+    }
     if (savedSessionId) {
       try {
-        return this.startSession(sessionKey, savedSessionId, bootstrap);
+        return this.startSession(sessionKey, savedSessionId, bootstrap, candidate);
       } catch (err) {
         log.warn({ sessionKey, savedSessionId, err }, "failed to resume session, creating new");
       }
@@ -459,15 +589,15 @@ export class V2SessionManager implements AgentExecutor {
       this.evictOldestSession();
     }
 
-    return this.createNewSession(sessionKey, bootstrap);
+    return this.createNewSession(sessionKey, bootstrap, candidate);
   }
 
   /**
    * Create a brand new session.
    */
-  private createNewSession(sessionKey: string, bootstrap: SessionBootstrap): ManagedSession {
+  private createNewSession(sessionKey: string, bootstrap: SessionBootstrap, candidate?: TurnCandidate): ManagedSession {
     log.info({ sessionKey }, "creating new session");
-    return this.startSession(sessionKey, null, bootstrap);
+    return this.startSession(sessionKey, null, bootstrap, candidate);
   }
 
   /**
@@ -477,13 +607,14 @@ export class V2SessionManager implements AgentExecutor {
     sessionKey: string,
     resumeSessionId: string | null,
     bootstrap: SessionBootstrap,
+    candidate?: TurnCandidate,
   ): ManagedSession {
     if (resumeSessionId) {
-      log.info({ sessionKey, sdkSessionId: resumeSessionId }, "resuming session");
+      log.info({ sessionKey, sdkSessionId: resumeSessionId, accountId: candidate?.accountId ?? null }, "resuming session");
     }
 
     const input = new UserMessageQueue();
-    const options = this.createOptions(resumeSessionId, bootstrap);
+    const options = this.createOptions(resumeSessionId, bootstrap, candidate);
     this.config.sdkOptions?.apply(options, bootstrap.ctx);
     const stream = query({ prompt: input, options });
 
@@ -501,6 +632,8 @@ export class V2SessionManager implements AgentExecutor {
       ctx: bootstrap.ctx,
       signals: newTurnSignals(),
       currentUuid: undefined,
+      accountId: candidate?.accountId ?? null,
+      model: options.model ?? this.config.model,
     };
 
     managed.streamConsumer = this.startStreamConsumer(managed);
@@ -516,9 +649,9 @@ export class V2SessionManager implements AgentExecutor {
    * and systemPrompt directly, so there is no need to stage them through
    * .claude/settings.json or CLAUDE.md in the workspace.
    */
-  private createOptions(resumeSessionId: string | null, bootstrap: SessionBootstrap): Options {
+  private createOptions(resumeSessionId: string | null, bootstrap: SessionBootstrap, candidate?: TurnCandidate): Options {
     const options: Options = {
-      model: bootstrap.model ?? this.config.model,
+      model: candidate?.model ?? bootstrap.model ?? this.config.model,
       permissionMode: this.config.permissionMode ?? "bypassPermissions",
       cwd: this.config.workspacePath,
       // Matches the one-shot path: without this the SDK discovers no
@@ -531,7 +664,8 @@ export class V2SessionManager implements AgentExecutor {
     if (this.config.mcpServers) options.mcpServers = this.config.mcpServers;
     if (bootstrap.systemPrompt) options.systemPrompt = bootstrap.systemPrompt;
     if (bootstrap.maxTurns != null) options.maxTurns = bootstrap.maxTurns;
-    if (this.config.env) options.env = { ...process.env, ...this.config.env } as Record<string, string>;
+    if (candidate?.env) options.env = mergeStaticEnv(candidate.env, this.config.env);
+    else if (this.config.env) options.env = { ...process.env, ...this.config.env } as Record<string, string>;
     if (resumeSessionId) options.resume = resumeSessionId;
 
     return options;
@@ -562,7 +696,7 @@ export class V2SessionManager implements AgentExecutor {
 
             if (msg.session_id) {
               managed.sdkSessionId = msg.session_id;
-              this.sessionStore.set(managed.sessionKey, msg.session_id);
+              this.sessionStore.set(managed.sessionKey, msg.session_id, this.accountBinding(managed));
             }
             break;
           }
@@ -580,7 +714,7 @@ export class V2SessionManager implements AgentExecutor {
 
             if (sessionId) {
               managed.sdkSessionId = sessionId;
-              this.sessionStore.set(managed.sessionKey, sessionId);
+              this.sessionStore.set(managed.sessionKey, sessionId, this.accountBinding(managed));
             }
 
             // Classify the error text only, never the model's own words.
@@ -598,7 +732,7 @@ export class V2SessionManager implements AgentExecutor {
               isError: resultMsg.is_error,
               ...(failure ? { failure } : {}),
               ...(model ? { model } : {}),
-              accountId: null,
+              accountId: managed.accountId,
               ...(uuid ? { userMessageUuid: uuid } : {}),
             };
 
@@ -680,8 +814,13 @@ export class V2SessionManager implements AgentExecutor {
       ctx: managed.ctx,
       userMessageUuid: uuid,
       ...(managed.sdkSessionId ? { sdkSessionId: managed.sdkSessionId } : {}),
-      accountId: null,
+      accountId: managed.accountId,
     });
+  }
+
+  /** The account to record on the session row: only once accounts are in play. */
+  private accountBinding(managed: ManagedSession): string | null | undefined {
+    return this.resilience ? managed.accountId : undefined;
   }
 
   /**
@@ -695,7 +834,7 @@ export class V2SessionManager implements AgentExecutor {
       ctx: managed.ctx,
       ...(uuid ? { userMessageUuid: uuid } : {}),
       ...(managed.sdkSessionId ? { sdkSessionId: managed.sdkSessionId } : {}),
-      accountId: null,
+      accountId: managed.accountId,
       result,
     });
     if (managed.pendingResult) managed.currentUuid = undefined;

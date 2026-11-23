@@ -57,6 +57,10 @@ export interface BackgroundTask {
   sdk_session_id: string | null;
   /** Parsed `meta` column. Absent or null for tasks created without metadata. */
   meta?: BackgroundTaskMeta | null;
+  /** Claude account the task last ran on; null = ambient (PLAN C.1) */
+  account_id?: string | null;
+  /** How often the task was re-queued after a limit or account failure */
+  rotation_attempts?: number;
 }
 
 interface BackgroundTaskRow {
@@ -73,6 +77,8 @@ interface BackgroundTaskRow {
   updated_at: string;
   sdk_session_id: string | null;
   meta?: string | null;
+  account_id?: string | null;
+  rotation_attempts?: number;
 }
 
 function parseMeta(raw: string | null | undefined): BackgroundTaskMeta | null {
@@ -148,6 +154,13 @@ export class BackgroundTaskStore {
     if (!columns.some((c) => c.name === "meta")) {
       this.db.exec("ALTER TABLE background_tasks ADD COLUMN meta TEXT");
     }
+    // Account binding and rotation count (PLAN C.1).
+    if (!columns.some((c) => c.name === "account_id")) {
+      this.db.exec("ALTER TABLE background_tasks ADD COLUMN account_id TEXT");
+    }
+    if (!columns.some((c) => c.name === "rotation_attempts")) {
+      this.db.exec("ALTER TABLE background_tasks ADD COLUMN rotation_attempts INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   private rowToTask(row: BackgroundTaskRow): BackgroundTask {
@@ -187,6 +200,8 @@ export class BackgroundTaskStore {
       updated_at: now,
       sdk_session_id: null,
       meta: metaJson ? parseMeta(metaJson) : null,
+      account_id: null,
+      rotation_attempts: 0,
     };
   }
 
@@ -273,6 +288,30 @@ export class BackgroundTaskStore {
          WHERE id = ?`,
       )
       .run(sdkSessionId ?? null, id);
+  }
+
+  /** Record the Claude account a running task was spawned with. */
+  setAccount(id: string, accountId: string | null): void {
+    this.db
+      .prepare("UPDATE background_tasks SET account_id = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(accountId, id);
+  }
+
+  /**
+   * Put a running task back to pending after a limit or account failure, so
+   * the poller restarts it on the next account or model. The SDK session id is
+   * kept, so the restart resumes the same conversation. Returns false when the
+   * task was not running (cancelled or finished meanwhile).
+   */
+  requeueForRotation(id: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE background_tasks
+         SET status = 'pending', rotation_attempts = rotation_attempts + 1, updated_at = datetime('now')
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(id);
+    return info.changes > 0;
   }
 
   /**

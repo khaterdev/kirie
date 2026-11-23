@@ -27,11 +27,16 @@ import {
   type SdkOptionsPipeline,
   type SdkTurnEndResult,
 } from "./sdk-options.js";
+import type { TurnPlan, TurnResilience } from "./resilience.js";
 
 const log = createModuleLogger("background-task-manager");
 
 /** A result that arrives while a subagent is still running is intermediate; give up waiting after this. */
 export const SUBAGENT_RESULT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** First-message prefix for a task restarted on another account or model (PLAN C.1). */
+export const TASK_ROTATION_NOTE =
+  "<system_note>The previous attempt at this task stopped because the Claude account or model reached a limit. Kirie restarted it on another account or model. If work on this task already appears above, continue from where it stopped instead of starting over.</system_note>";
 
 /**
  * Callback invoked when a background task completes.
@@ -186,6 +191,12 @@ interface RunningTask {
   finished: boolean;
   /** Serialises final-turn handling between the read loop and the subagent safety timer. */
   finalChain: Promise<unknown>;
+  /** Account and model plan for this run (null without resilience) */
+  plan: TurnPlan | null;
+  /** Account the subprocess was spawned with (null = ambient) */
+  accountId: string | null;
+  /** Set when the task goes back to pending for the next account or model once its process is closed */
+  requeue: boolean;
 }
 
 /** A result that ended a turn, with the user-message uuids it answered. */
@@ -216,11 +227,22 @@ export class BackgroundTaskManager {
   private readonly runningTasks = new Map<string, RunningTask>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pollIntervalMs: number;
+  /** Account rotation and model fallback (PLAN C.1, C.2). Null: today's behaviour */
+  private resilience: TurnResilience | null = null;
 
   constructor(store: BackgroundTaskStore, config: BackgroundTaskManagerConfig) {
     this.store = store;
     this.config = config;
     this.pollIntervalMs = config.pollIntervalMs ?? 2000;
+  }
+
+  /**
+   * Install (or remove) account rotation and model fallback. A task that ends
+   * on a limit or account failure then goes back to pending with its SDK
+   * session id kept, and restarts on the next account or model.
+   */
+  setResilience(resilience: TurnResilience | null): void {
+    this.resilience = resilience;
   }
 
   /**
@@ -390,18 +412,27 @@ export class BackgroundTaskManager {
     const controller = this.safeHook("controllerFor", task, this.config.controllerFor && (() => this.config.controllerFor!(task)));
     const profile = this.safeHook("profileFor", task, this.config.profileFor && (() => this.config.profileFor!(task)));
 
+    // A task restarted after a limit is a resumption of the same conversation.
+    const rotated = (task.rotation_attempts ?? 0) > 0;
     let firstMessage = this.buildTaskPrompt(task);
     if (controller?.initialMessage) {
-      const custom = this.safeHook("initialMessage", task, () => controller.initialMessage!(task, resumed));
+      const custom = this.safeHook("initialMessage", task, () => controller.initialMessage!(task, resumed || rotated));
       if (custom !== undefined) firstMessage = custom;
     }
+    if (rotated && this.resilience) firstMessage = `${TASK_ROTATION_NOTE}\n${firstMessage}`;
+
+    const ctx = this.buildContext(task, profile);
+    const primaryModel = typeof profile?.options?.model === "string" ? profile.options.model : this.config.model;
+    const plan = this.resilience?.begin({ kind: ctx.kind, primaryModel }) ?? null;
+    const accountId = plan?.current.accountId ?? null;
+    if (plan) this.store.setAccount(task.id, accountId);
 
     const running: RunningTask = {
       taskId: task.id,
       query: null,
       messageQueue: new AsyncQueue<SDKUserMessage>(),
       execution: Promise.resolve(),
-      ctx: this.buildContext(task, profile),
+      ctx,
       controller,
       profile,
       pendingTurns: new Set<string>(),
@@ -409,6 +440,9 @@ export class BackgroundTaskManager {
       activeSubagents: 0,
       finished: false,
       finalChain: Promise.resolve(),
+      plan,
+      accountId,
+      requeue: false,
     };
 
     // Registered before executeTask runs so its finally block always finds it.
@@ -430,7 +464,7 @@ export class BackgroundTaskManager {
       type: "turn_start",
       ctx: running.ctx,
       ...(message.uuid ? { userMessageUuid: message.uuid } : {}),
-      accountId: null,
+      accountId: running.accountId,
     });
   }
 
@@ -464,7 +498,7 @@ export class BackgroundTaskManager {
       ctx: running.ctx,
       ...(uuid ? { userMessageUuid: uuid } : {}),
       ...(sdkSessionId ? { sdkSessionId } : {}),
-      accountId: null,
+      accountId: running.accountId,
       result,
     });
     return running.pendingTurns.size === 0 && running.reservedTurns === 0;
@@ -487,9 +521,15 @@ export class BackgroundTaskManager {
       maxTurns: this.config.maxTurns,
     };
 
-    // If the task has a saved SDK session ID, try to resume it
+    // If the task has a saved SDK session ID, try to resume it. Under another
+    // account only when the transcript can be carried there.
     if (task.sdk_session_id) {
-      options.resume = task.sdk_session_id;
+      const from = task.account_id ?? null;
+      if (!running.plan || !this.resilience || this.resilience.resumableAcross(from, running.accountId, task.sdk_session_id)) {
+        options.resume = task.sdk_session_id;
+      } else {
+        log.warn({ taskId: task.id, fromAccount: from, toAccount: running.accountId }, "task session cannot be carried to the new account; starting fresh");
+      }
     }
 
     const systemPrompt = running.profile?.systemPrompt ?? this.config.systemPrompt;
@@ -499,6 +539,12 @@ export class BackgroundTaskManager {
 
     if (running.profile?.options) {
       Object.assign(options, running.profile.options);
+    }
+
+    if (running.plan) {
+      const candidate = running.plan.current;
+      if (candidate.model) options.model = candidate.model;
+      if (candidate.env) options.env = candidate.env;
     }
 
     // Count live subagents. A result that arrives while one runs is the
@@ -654,10 +700,11 @@ export class BackgroundTaskManager {
 
       const failure = classifyFailure({ error: err, signals });
       log.error({ taskId: task.id, err, failureClass: failure?.class }, "background task execution error");
+      if (isHardFailure(failure) && this.tryRequeue(task, running, failure)) return;
       this.store.markFailed(
         task.id,
         isHardFailure(failure)
-          ? formatTaskFailure(failure)
+          ? formatTaskFailure(this.finalFailure(running, failure))
           : `Execution error: ${err instanceof Error ? err.message : String(err)}`,
       );
       await this.notifyFailed(task.id);
@@ -681,7 +728,41 @@ export class BackgroundTaskManager {
       if (this.runningTasks.get(task.id) === running) {
         this.runningTasks.delete(task.id);
       }
+
+      // Back to pending only after this process is closed, so the restart on
+      // the next account never shares the transcript with a live process.
+      if (running.requeue) {
+        if (this.store.requeueForRotation(task.id)) {
+          log.info({ taskId: task.id }, "task re-queued for the next account or model");
+        }
+      }
     }
+  }
+
+  /**
+   * A run ended on a limit or account failure. When another account or model
+   * may be tried and the task has re-queues left, mark it for re-queue and
+   * return true; the caller must not record a failure then.
+   */
+  private tryRequeue(task: BackgroundTask, running: RunningTask, failure: FailureInfo): boolean {
+    const plan = running.plan;
+    if (!plan || !this.resilience) return false;
+    // next() records the failure (benches the account or model) even when nothing else is tried.
+    const advance = plan.next(failure);
+    const attempts = this.store.get(task.id)?.rotation_attempts ?? task.rotation_attempts ?? 0;
+    if (!advance || attempts >= this.resilience.maxAttemptsPerTurn() - 1) return false;
+    running.finished = true;
+    running.requeue = true;
+    log.warn(
+      { taskId: task.id, failureClass: failure.class, toAccount: advance.accountId, toModel: advance.model, attempts: attempts + 1 },
+      "background task hit a limit; restarting it on the next account or model",
+    );
+    return true;
+  }
+
+  /** The failure to store when a task gives up: with the earliest reset when every account is limited. */
+  private finalFailure(running: RunningTask, failure: FailureInfo): FailureInfo {
+    return running.plan ? running.plan.finalFailure(failure) : failure;
   }
 
   private toTurnResult(msg: Extract<SDKMessage, { type: "result" }>, textParts: string[], signals: TurnSignals): TaskTurnResult {
@@ -711,6 +792,9 @@ export class BackgroundTaskManager {
    */
   private async handleFinalTurn(task: BackgroundTask, running: RunningTask, turn: TaskTurnResult): Promise<boolean> {
     if (running.finished) return true;
+
+    // A limit is not the controller's business: restart on the next account or model first.
+    if (turn.isError && isHardFailure(turn.failure) && this.tryRequeue(task, running, turn.failure)) return true;
 
     const controller = running.controller;
     if (!controller) {
@@ -755,10 +839,12 @@ export class BackgroundTaskManager {
         { taskId: task.id, failureClass: turn.failure.class, limitType: turn.failure.limitType },
         "background task ended on a limit or account failure",
       );
-      this.store.markFailed(task.id, formatTaskFailure(turn.failure));
+      this.store.markFailed(task.id, formatTaskFailure(this.finalFailure(running, turn.failure)));
       await this.notifyFailed(task.id);
       return;
     }
+
+    if (!turn.isError) running.plan?.succeeded();
 
     this.store.markCompleted(task.id, turn.response, turn.costUsd, turn.numTurns);
 

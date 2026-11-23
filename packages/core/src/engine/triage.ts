@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { createModuleLogger } from "../logging/logger.js";
 import type { Signal } from "./signals.js";
-import { isUsageLimit } from "./failure.js";
+import { isUsageLimit, type FailureInfo } from "./failure.js";
 import { OneShotError, runOneShot } from "./oneshot.js";
 import type { SdkOptionsPipeline } from "./sdk-options.js";
 import type { ProactiveConfig } from "../config/schema.js";
@@ -54,6 +54,29 @@ export interface TriageRunnerOptions {
   cwd?: string;
 }
 
+/**
+ * Claude account hooks for triage (PLAN C.1). Set once by the accounts
+ * feature; the ProactiveEngine builds its TriageRunner itself, so this is a
+ * process-wide hook rather than a constructor option. Without it triage
+ * behaves as before.
+ */
+export interface TriageAccountGate {
+  /** Before a call. `skip` when every account is limited (no spawn then). */
+  beforeCall(): { skip: boolean; accountId: string | null; untilMs?: number };
+  /**
+   * A call ended on a limit or auth failure on `accountId`. Records it and
+   * returns true when another account can serve the next cycle.
+   */
+  reportFailure(accountId: string | null, failure: FailureInfo): boolean;
+}
+
+let triageAccountGate: TriageAccountGate | null = null;
+
+/** Install (or remove with null) the account hooks used by every TriageRunner. */
+export function setTriageAccountGate(gate: TriageAccountGate | null): void {
+  triageAccountGate = gate;
+}
+
 /** How long triage pauses after a usage limit whose reset time is unknown. */
 const LIMIT_PAUSE_UNKNOWN_MS = 15 * 60 * 1000;
 /** Never resume before this much time has passed after a limit. */
@@ -80,6 +103,8 @@ export class TriageRunner {
   private readonly options: TriageRunnerOptions;
   /** Epoch ms until which triage is skipped because the account is out of usage. 0 = not limited. */
   private limitedUntil = 0;
+  /** Logged once per stretch of "every account is limited". */
+  private exhaustedLogged = false;
 
   constructor(config: ProactiveConfig, heartbeatLogStore?: HeartbeatLogStore, options: TriageRunnerOptions = {}) {
     this.config = config;
@@ -114,6 +139,28 @@ export class TriageRunner {
     if (this.limitedUntil !== 0) {
       this.limitedUntil = 0;
       log.info("usage-limit pause over; triage resumes");
+    }
+
+    // With accounts imported: acquire first, and skip the cycle when every account is limited.
+    const gate = triageAccountGate;
+    let accountId: string | null = null;
+    if (gate) {
+      const lease = gate.beforeCall();
+      if (lease.skip) {
+        if (!this.exhaustedLogged) {
+          this.exhaustedLogged = true;
+          log.warn(
+            { until: lease.untilMs ? new Date(lease.untilMs).toISOString() : undefined },
+            "every Claude account is limited; triage skips cycles until one resets",
+          );
+        }
+        return { decisions: [], signalsProcessed: signals.length, llmCalled: false };
+      }
+      if (this.exhaustedLogged) {
+        this.exhaustedLogged = false;
+        log.info("a Claude account is usable again; triage resumes");
+      }
+      accountId = lease.accountId;
     }
 
     // Build the triage prompt
@@ -154,6 +201,14 @@ export class TriageRunner {
       }
       const failure = err instanceof OneShotError ? err.failure : undefined;
       const failureClass = failure?.class;
+      // Report the limit against the account that ran the call; when another
+      // account can serve, the next cycle simply uses it (no retry loop here).
+      if (gate && failure && (failure.class === "usage_limit_account" || failure.class === "auth")) {
+        if (gate.reportFailure(accountId, failure)) {
+          log.warn({ failureClass: failure.class }, "triage hit an account limit; the next cycle uses the next account");
+          return { decisions: [], signalsProcessed: signals.length, llmCalled: false };
+        }
+      }
       if (isUsageLimit(failure)) {
         const fallback = now + LIMIT_PAUSE_UNKNOWN_MS;
         this.limitedUntil = Math.max(failure.resetAtMs ?? fallback, now + LIMIT_PAUSE_MIN_MS);
