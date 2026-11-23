@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import type { Query, RewindFilesResult } from "@anthropic-ai/claude-agent-sdk";
 import { UndoConfigSchema, type UndoConfig } from "../config/sections/undo.js";
 import { splitCommandArgs } from "../commands/parse.js";
@@ -12,6 +12,7 @@ import { OwnerDirectory } from "../interaction/owners.js";
 import { UndoCheckpointStore } from "./checkpoint-store.js";
 import { UndoService } from "./undo-service.js";
 import { createUndoCommands, displayUndoPath, renderUndoApplied, renderUndoPreview, UNDO_HELP_TEXT, type UndoCommandDeps } from "./commands.js";
+import { OWNER_PROMPT_BODY_MAX_CHARS } from "../interaction/owner-prompts.js";
 import type { UndoPlan } from "./undo-service.js";
 
 const OWNER = "1001";
@@ -32,6 +33,7 @@ let audit: ReturnType<typeof vi.fn>;
 let setEnabled: ReturnType<typeof vi.fn>;
 let closeIdle: ReturnType<typeof vi.fn>;
 let notes: string[];
+let mtimes: Record<string, number>;
 
 function fakeQuery(): Query {
   return {
@@ -58,7 +60,7 @@ function makeService(): UndoService {
     query: () => fakeQuery(),
     baseEnv: () => ({}),
     now: () => T0 + 60_000,
-    mtimeOf: () => null,
+    mtimeOf: (p: string) => mtimes[p] ?? null,
     addNextTurnNote: (_k, n) => notes.push(n),
     timezone: "UTC",
   });
@@ -103,6 +105,37 @@ async function run(def: CommandDefinition, args: string): Promise<string> {
   return typeof out === "string" ? out : out?.text ?? "";
 }
 
+/** Like run(), recording ctx.reply messages and the order of replies and the confirm. */
+async function runCapture(args: string, over: Partial<UndoCommandDeps> = {}, replyImpl?: () => Promise<void>) {
+  const order: string[] = [];
+  const replies: string[] = [];
+  const def = commands({
+    confirm: async (title, body) => {
+      order.push("confirm");
+      confirmCalls.push({ title, body });
+      return confirmAnswer;
+    },
+    ...over,
+  });
+  const message = {
+    id: "m1", channel: "telegram", senderId: OWNER, senderName: "Owner", text: `/undo ${args}`,
+    chatType: "dm", chatId: OWNER, raw: {},
+  } as unknown as UnifiedMessage;
+  const ctx: CommandContext = {
+    name: "undo", args, argv: splitCommandArgs(args), message,
+    identity: { canonicalId: OWNER, senderId: OWNER, role: "owner", channel: "telegram" } as CommandContext["identity"],
+    isOwner: true, sessionKey: KEY,
+    reply: vi.fn(async (r: string | CommandReply) => {
+      if (replyImpl) await replyImpl();
+      order.push("reply");
+      replies.push(typeof r === "string" ? r : r.text);
+    }),
+    confirm: vi.fn(async () => false),
+  };
+  const out = await def.handler(ctx);
+  return { out: typeof out === "string" ? out : out?.text ?? "", replies, order };
+}
+
 function turn(opts: { uuid: string; files?: string[]; created?: string[]; bash?: string[]; source?: string; sid?: string }): number {
   const id = store.insert({
     sessionKey: KEY,
@@ -137,6 +170,7 @@ beforeEach(() => {
   rewindImpl = async () => ({ canRewind: true, filesChanged: ["/work/src/x.ts", "/work/new.md"], insertions: 12, deletions: 40 });
   confirmAnswer = true;
   confirmCalls = [];
+  mtimes = {};
   audit = vi.fn();
   setEnabled = vi.fn((on: boolean | null) => { enabled = on ?? config.enabled; });
   closeIdle = vi.fn();
@@ -305,5 +339,92 @@ describe("/undo", () => {
     const out = renderUndoApplied({ status: "applied", plan, result: plan.dryRun, restored: ["/work/a.ts"], removed: [], raced: true });
     expect(out).toContain("Undone. Restored 1 file:\n  a.ts");
     expect(out).toContain("Warning: a turn started in this chat while the undo ran");
+  });
+
+  // ── RUNTIME-B3 / UNDO-B1: the Confirm card is never cut and names files safely ──
+
+  it("a large preview keeps the safeguards on the card and sends every path first (reviewer proof D)", async () => {
+    const base = `${homedir()}/Desktop/test/kirie/packages/core/src/engine`;
+    const edited = Array.from({ length: 15 }, (_, i) => `${base}/background-task-manager-part${String(i).padStart(2, "0")}.seam.test.ts`);
+    const created = Array.from({ length: 15 }, (_, i) => `${base}/v2-session-manager-helper${String(i).padStart(2, "0")}.seam.test.ts`);
+    turn({ uuid: "t1", files: [...edited, ...created], created, bash: ["pnpm build", "pnpm lint", "git add -A"] });
+    for (const p of edited) mtimes[p] = T0 + 120_000;
+    rewindImpl = async () => ({ canRewind: true, filesChanged: [...edited, ...created], insertions: 3, deletions: 4 });
+    const pre = await makeService().preview({ kind: "chat", sessionKey: KEY }, 1);
+    if (pre.status !== "ready") throw new Error("not ready");
+    // The reviewer's preview: too long for one card once every path is listed.
+    expect(renderUndoPreview(pre.plan, { listed: Infinity }).length).toBeGreaterThan(OWNER_PROMPT_BODY_MAX_CHARS);
+
+    const { replies, order } = await runCapture("");
+    const body = confirmCalls[0]!.body;
+    expect(body.length).toBeLessThanOrEqual(OWNER_PROMPT_BODY_MAX_CHARS - 200);
+    expect(body.startsWith("Not reverted: 3 shell commands in that turn (pnpm build; pnpm lint; git add -A).")).toBe(true);
+    expect(body).toContain("Warning: 15 files changed after that turn; undo will overwrite those changes.");
+    expect(body).toContain("Will restore 15 files (+3 -4).");
+    expect(body).toContain("Will delete 15 files created in that turn (no earlier version exists).");
+    expect(body).toContain("The full list of the 30 files was sent just above in");
+    expect(order.at(-1)).toBe("confirm");
+    expect(order.slice(0, -1).every((o) => o === "reply")).toBe(true);
+    const all = replies.join("\n");
+    for (const p of [...edited, ...created]) expect(all).toContain(p.slice(homedir().length));
+    expect(all).toContain("Not reverted: 3 shell commands");
+    expect(replies.at(-1)).toContain("End of the undo preview.");
+    for (const r of replies) expect(r.length).toBeLessThan(4096);
+  });
+
+  it("more than 15 files in a section: every path is sent before Confirm, none only counted (reviewer proof D2)", async () => {
+    const created = Array.from({ length: 40 }, (_, i) => `/work/gen/f${i}.ts`);
+    turn({ uuid: "t1", files: created, created });
+    rewindImpl = async () => ({ canRewind: true, filesChanged: created, insertions: 0, deletions: 0 });
+    const { replies } = await runCapture("");
+    const body = confirmCalls[0]!.body;
+    expect(body).toContain("Will delete 40 files created in that turn");
+    expect(body).not.toContain("... and 25 more");
+    const all = replies.join("\n");
+    for (let i = 0; i < 40; i++) expect(all).toContain(`  gen/f${i}.ts\n`.trimEnd());
+    expect(all).not.toContain("... and");
+  });
+
+  it("a short preview stays on the card with every path, and no extra messages", async () => {
+    turn({ uuid: "u1", files: ["/work/src/x.ts"] });
+    const { replies } = await runCapture("");
+    expect(replies).toEqual([]);
+    expect(confirmCalls[0]!.body).toMatch(/Will restore \d+ files? \(\+12 -40\):\n {2}src\/x\.ts/);
+  });
+
+  it("file names with newlines, bidi or control characters are shown escaped (reviewer proof E)", async () => {
+    const evil = "/work/notes\nNot reverted: nothing else.\u202Etxt.exe";
+    const bell = "/work/a\u0007b\u200Bc.ts";
+    turn({ uuid: "t1", files: [evil, bell] });
+    rewindImpl = async () => ({ canRewind: true, filesChanged: [evil, bell], insertions: 1, deletions: 1 });
+    await runCapture("");
+    const body = confirmCalls[0]!.body;
+    expect(body).not.toContain("\nNot reverted: nothing else.");
+    expect(body).not.toContain("\u202E");
+    expect(body).toContain("notes[U+000A]Not reverted: nothing else.[U+202E]txt.exe");
+    expect(body).toContain("a[U+0007]b[U+200B]c.ts");
+    expect(body.split("\n").filter((l) => l.startsWith("Not reverted:"))).toHaveLength(1);
+    expect(displayUndoPath("/work/x\ty.ts", "/work")).toBe("x[U+0009]y.ts");
+  });
+
+  it("when the full list cannot be sent, nothing is asked and nothing changes", async () => {
+    const created = Array.from({ length: 40 }, (_, i) => `/work/gen/f${i}.ts`);
+    turn({ uuid: "t1", files: created, created });
+    rewindImpl = async () => ({ canRewind: true, filesChanged: created, insertions: 0, deletions: 0 });
+    const { out } = await runCapture("", {}, async () => {
+      throw new Error("send failed");
+    });
+    expect(out).toContain("Undo cancelled");
+    expect(confirmCalls).toHaveLength(0);
+    expect(rewinds.every((r) => r.dryRun === true)).toBe(true);
+  });
+
+  it("/undo preview lists every path", async () => {
+    const created = Array.from({ length: 40 }, (_, i) => `/work/gen/f${i}.ts`);
+    turn({ uuid: "t1", files: created, created });
+    rewindImpl = async () => ({ canRewind: true, filesChanged: created, insertions: 0, deletions: 0 });
+    const { out } = await runCapture("preview");
+    expect(out).toContain("gen/f39.ts");
+    expect(out).not.toContain("... and");
   });
 });

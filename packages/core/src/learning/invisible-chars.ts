@@ -47,12 +47,14 @@ function marker(c: string): string {
 
 /**
  * For text shown to the owner for a decision (prompt cards, file names):
- * every invisible, bidi and control character (other than tab and newline)
- * as a visible `[U+XXXX]` marker, with the number replaced.
+ * every invisible, bidi and control character (other than tab and newline,
+ * unless `lineBreaks` is set) as a visible `[U+XXXX]` marker, with the number
+ * replaced. Set `lineBreaks` for one-line values such as file names.
  */
-export function revealHiddenChars(text: string): { text: string; hidden: number } {
+export function revealHiddenChars(text: string, opts: { lineBreaks?: boolean } = {}): { text: string; hidden: number } {
   let hidden = 0;
-  const out = text.replace(new RegExp(HIDDEN_RE_SOURCE, "gu"), (c) => {
+  const source = opts.lineBreaks ? `[${INVISIBLE_CLASS}${CONTROL_CLASS}\\t\\n]` : HIDDEN_RE_SOURCE;
+  const out = text.replace(new RegExp(source, "gu"), (c) => {
     hidden++;
     return marker(c);
   });

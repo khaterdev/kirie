@@ -14,6 +14,9 @@ import { relative, isAbsolute, sep } from "node:path";
 import type { CommandContext, CommandDefinition } from "../commands/types.js";
 import { parseIntInRange } from "../commands/parse.js";
 import { scrubSecrets } from "../security/secret-scrubber.js";
+import { revealHiddenChars } from "../learning/invisible-chars.js";
+import { OWNER_PROMPT_BODY_MAX_CHARS } from "../interaction/owner-prompts.js";
+import { FULL_TEXT_PAGE_CHARS, splitPages } from "../interaction/text-pages.js";
 import type { UndoConfig } from "../config/sections/undo.js";
 import type { UndoCheckpoint } from "./checkpoint-store.js";
 import {
@@ -27,8 +30,10 @@ import {
 } from "./undo-service.js";
 
 export const UNDO_ENABLED_SETTING = "undo.enabled";
-/** Paths listed per section of a preview */
+/** Paths listed per section of a Confirm card that lists files */
 const MAX_LISTED = 15;
+/** A Confirm card body stays below this (OwnerPrompts' limit, with room for scrubbing). */
+const UNDO_CARD_BODY_MAX_CHARS = OWNER_PROMPT_BODY_MAX_CHARS - 200;
 
 export interface UndoCommandDeps {
   /** Null in v1 mode: every form but help answers "needs v2" */
@@ -77,20 +82,25 @@ function scrub(text: string): string {
   return scrubSecrets(text, { sink: "prompt-card" });
 }
 
-/** A path as the owner reads it: relative to the turn's cwd when inside it, else with ~ for home. */
+/**
+ * A path as the owner reads it: relative to the turn's cwd when inside it,
+ * else with ~ for home. Control (newlines included), invisible and bidi
+ * characters are shown as [U+XXXX], so a file name cannot forge a line.
+ */
 export function displayUndoPath(path: string, cwd: string): string {
+  let shown = path;
   if (isAbsolute(path)) {
     const rel = relative(cwd, path);
-    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) return rel;
     const home = homedir();
-    if (path === home || path.startsWith(home + sep)) return `~${path.slice(home.length)}`;
+    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) shown = rel;
+    else if (path === home || path.startsWith(home + sep)) shown = `~${path.slice(home.length)}`;
   }
-  return path;
+  return revealHiddenChars(shown, { lineBreaks: true }).text;
 }
 
-function listPaths(paths: readonly string[], cwd: string, marks?: ReadonlySet<string>): string[] {
-  const out = paths.slice(0, MAX_LISTED).map((p) => `  ${displayUndoPath(p, cwd)}${marks?.has(p) ? " (changed since; will be overwritten)" : ""}`);
-  if (paths.length > MAX_LISTED) out.push(`  ... and ${paths.length - MAX_LISTED} more`);
+function listPaths(paths: readonly string[], cwd: string, marks?: ReadonlySet<string>, max: number = MAX_LISTED): string[] {
+  const out = paths.slice(0, max).map((p) => `  ${displayUndoPath(p, cwd)}${marks?.has(p) ? " (changed since; will be overwritten)" : ""}`);
+  if (paths.length > max) out.push(`  ... and ${paths.length - max} more`);
   return out;
 }
 
@@ -101,7 +111,8 @@ function plural(n: number, one: string, many = `${one}s`): string {
 function shellLine(plan: Pick<UndoPlan, "bashCount" | "bashSamples" | "rows">): string {
   const span = plan.rows.length === 1 ? "that turn" : "those turns";
   if (plan.bashCount === 0) return `Not reverted: anything done through Bash (no shell commands ran in ${span}).`;
-  const samples = plan.bashSamples.length > 0 ? ` (${plan.bashSamples.join("; ")}${plan.bashCount > plan.bashSamples.length ? "; ..." : ""})` : "";
+  const shown = plan.bashSamples.map((c) => revealHiddenChars(c, { lineBreaks: true }).text);
+  const samples = shown.length > 0 ? ` (${shown.join("; ")}${plan.bashCount > shown.length ? "; ..." : ""})` : "";
   return `Not reverted: ${plural(plan.bashCount, "shell command")} in ${span}${samples}.`;
 }
 
@@ -114,31 +125,58 @@ export function undoPreviewTitle(plan: UndoPlan, timezone?: string, now?: number
   return `Undo the last ${plan.rows.length} turns (since ${when}${prompt})?`;
 }
 
-/** The preview body (scrubbed). */
-export function renderUndoPreview(plan: UndoPlan): string {
+/**
+ * The preview body (scrubbed). The safeguards come first so they can never
+ * be the part that is cut: what is not reverted, files that changed since and
+ * will be overwritten, running tasks. Then the file sections, each with its
+ * count. `listed` is the number of paths per section (default 15; Infinity
+ * lists every path; 0 gives counts only).
+ */
+export function renderUndoPreview(plan: UndoPlan, opts: { listed?: number } = {}): string {
+  const max = opts.listed ?? MAX_LISTED;
   const cwd = plan.target.cwd;
   const changedSince = new Set(plan.modifiedAfter);
-  const lines: string[] = [];
-  if (plan.restore.length > 0) {
-    lines.push(`Will restore ${plural(plan.restore.length, "file")} (+${plan.dryRun.insertions} -${plan.dryRun.deletions}):`);
-    lines.push(...listPaths(plan.restore, cwd, changedSince));
-  }
-  if (plan.remove.length > 0) {
-    lines.push(`Will delete ${plural(plan.remove.length, "file")} created in ${plan.rows.length === 1 ? "that turn" : "those turns"} (no earlier version exists):`);
-    lines.push(...listPaths(plan.remove, cwd, changedSince));
-  }
-  lines.push(shellLine(plan));
-  if (plan.notCovered.length > 0) {
-    lines.push(`Not restorable: ${plural(plan.notCovered.length, "file")} edited by a subagent, which the SDK did not track:`);
-    lines.push(...listPaths(plan.notCovered, cwd));
-  }
+  const lines: string[] = [shellLine(plan)];
   if (plan.modifiedAfter.length > 0) {
     lines.push(`Warning: ${plural(plan.modifiedAfter.length, "file")} changed after that turn; undo will overwrite those changes.`);
   }
   if (plan.runningTasks > 0) {
     lines.push(`Note: ${plural(plan.runningTasks, "background task")} started from this chat ${plan.runningTasks === 1 ? "is" : "are"} still running and may be editing the same files.`);
   }
+  if (plan.notCovered.length > 0) {
+    lines.push(`Not restorable: ${plural(plan.notCovered.length, "file")} edited by a subagent, which the SDK did not track${max > 0 ? ":" : "."}`);
+    if (max > 0) lines.push(...listPaths(plan.notCovered, cwd, undefined, max));
+  }
+  if (plan.restore.length > 0) {
+    lines.push(`Will restore ${plural(plan.restore.length, "file")} (+${plan.dryRun.insertions} -${plan.dryRun.deletions})${max > 0 ? ":" : "."}`);
+    if (max > 0) lines.push(...listPaths(plan.restore, cwd, changedSince, max));
+  }
+  if (plan.remove.length > 0) {
+    lines.push(`Will delete ${plural(plan.remove.length, "file")} created in ${plan.rows.length === 1 ? "that turn" : "those turns"} (no earlier version exists)${max > 0 ? ":" : "."}`);
+    if (max > 0) lines.push(...listPaths(plan.remove, cwd, changedSince, max));
+  }
   return scrub(lines.join("\n"));
+}
+
+/** True when a section has more paths than a card lists. */
+function listsAreCut(plan: UndoPlan): boolean {
+  return plan.restore.length > MAX_LISTED || plan.remove.length > MAX_LISTED || plan.notCovered.length > MAX_LISTED;
+}
+
+/**
+ * The Confirm card body, and the messages to send before it. The card lists
+ * every path when it can; otherwise every path goes out first as plain
+ * messages and the card carries the safeguards and the counts.
+ */
+export function planUndoConfirm(plan: UndoPlan): { body: string; before: string[] } {
+  const listed = renderUndoPreview(plan);
+  if (!listsAreCut(plan) && listed.length <= UNDO_CARD_BODY_MAX_CHARS) return { body: listed, before: [] };
+  const pages = splitPages(renderUndoPreview(plan, { listed: Infinity }), FULL_TEXT_PAGE_CHARS);
+  const n = pages.length;
+  const before = pages.map((p, i) => `Undo preview, part ${i + 1} of ${n}: every file\n\n${p}${i === n - 1 ? "\n\nEnd of the undo preview." : ""}`);
+  const files = plan.restore.length + plan.remove.length + plan.notCovered.length;
+  const body = `${renderUndoPreview(plan, { listed: 0 })}\nThe full list of the ${plural(files, "file")} was sent just above in ${plural(n, "message")}. Read it before you confirm.`;
+  return { body, before };
 }
 
 /** The reply after a real undo (scrubbed). */
@@ -183,10 +221,18 @@ export function createUndoCommands(deps: UndoCommandDeps): CommandDefinition[] {
     }
     const { plan } = pre;
     const title = scrub(undoPreviewTitle(plan, deps.timezone, now()));
-    const body = renderUndoPreview(plan);
     deps.audit?.("previewed", by, { scope: scope.kind, rows: plan.rows.map((r) => r.id), files: plan.restore.length + plan.remove.length });
-    if (!confirm) return `${title}\n${body}\nSend /undo${scope.kind === "task" ? ` task ${scope.taskId}` : turns > 1 ? ` ${turns}` : ""} to apply it.`;
+    if (!confirm) {
+      return `${title}\n${renderUndoPreview(plan, { listed: Infinity })}\nSend /undo${scope.kind === "task" ? ` task ${scope.taskId}` : turns > 1 ? ` ${turns}` : ""} to apply it.`;
+    }
 
+    const { body, before } = planUndoConfirm(plan);
+    try {
+      for (const page of before) await ctx.reply(page);
+    } catch {
+      deps.audit?.("cancelled", by, { scope: scope.kind, rows: plan.rows.map((r) => r.id), reason: "preview not delivered" });
+      return "Undo cancelled: the full preview could not be sent. Nothing was changed.";
+    }
     const ok = await (deps.confirm ? deps.confirm(title, body) : ctx.confirm(title, body));
     if (!ok) {
       deps.audit?.("cancelled", by, { scope: scope.kind, rows: plan.rows.map((r) => r.id) });
