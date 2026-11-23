@@ -115,11 +115,9 @@ async function askOwnerToStart(ctx: DaemonContext, loop: LoopRecord): Promise<bo
   const res = await ctx.ownerPrompts.ask({
     kind: "loop",
     title: `Start loop ${loop.id}?`,
-    body: [
-      `The agent wants to re-run this prompt in your DM every ${formatDuration(loop.baseIntervalSec * 1000)}, up to ${loop.maxRuns} runs, for at most ${hours}h${loop.backoff ? ", checking less often while nothing changes" : ""}:`,
-      "",
-      loop.prompt,
-    ].join("\n"),
+    body: `The agent wants to re-run this prompt in your DM every ${formatDuration(loop.baseIntervalSec * 1000)}, up to ${loop.maxRuns} runs, for at most ${hours}h${loop.backoff ? ", checking less often while nothing changes" : ""}.`,
+    // Shown in full, or Start only after all of it was sent (E.3).
+    content: { label: "Prompt", text: loop.prompt },
     options: [
       { id: "start", label: "Start" },
       { id: "decline", label: "Decline" },

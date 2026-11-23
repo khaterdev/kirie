@@ -424,9 +424,8 @@ export class GoalController {
   private askOwner(goal: GoalRecord): void {
     const ac = new AbortController();
     this.asking.set(goal.id, ac);
+    // The goal text goes in `content`: shown in full, or Start only after all of it was sent (E.3).
     const body = [
-      goal.goal.slice(0, 1500),
-      "",
       `Chat: ${goal.sessionKey}`,
       `Caps: ${formatGoalCaps(goal)}`,
       "No must-pass checks (only the owner can set checks, with /goal ... --check).",
@@ -437,6 +436,7 @@ export class GoalController {
         kind: "goal",
         title: `The agent wants to start goal ${goal.id}`,
         body,
+        content: { label: "Goal text", text: goal.goal },
         options: [
           { id: "start", label: "Start" },
           { id: "decline", label: "Decline" },

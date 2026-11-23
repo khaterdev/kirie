@@ -30,6 +30,7 @@ import type { LearningKv } from "./learning-db.js";
 import type { ProposalRecord, ProposalStore } from "./proposal-store.js";
 import { payloadHash8, type ProposalOrigin } from "./proposal-types.js";
 import { revealInvisibleChars } from "./invisible-chars.js";
+import { FULL_TEXT_PAGE_CHARS, splitPages } from "../interaction/text-pages.js";
 
 const log = createModuleLogger("learning-notifier");
 
@@ -39,7 +40,7 @@ export const DIGEST_MAX_CARDS = 5;
 export const CARD_FULL_CONTENT_CHARS = 2500;
 const CARD_TRUNCATED_CHARS = 600;
 /** Content characters per /proposals show message (each message stays under Telegram's 4096). */
-export const SHOW_PAGE_CHARS = 3000;
+export const SHOW_PAGE_CHARS = FULL_TEXT_PAGE_CHARS;
 const MAX_QUEUED_LINES = 20;
 const DIGEST_ORIGINS: readonly ProposalOrigin[] = ["reflection", "curator", "user_model"];
 const LAST_DIGEST_KEY = "notify:last_digest_at";
@@ -196,20 +197,6 @@ export function proposalCardButtons(rec: ProposalRecord, preview: string): NonNu
 
 export function renderProposalCard(rec: ProposalRecord, preview: string): OwnerCard {
   return { text: renderProposalCardText(rec, preview), buttons: proposalCardButtons(rec, preview), plain: true };
-}
-
-/** Split text into chunks of at most `max` characters, at a line break when one is near. */
-function splitPages(text: string, max: number): string[] {
-  const out: string[] = [];
-  let rest = text;
-  while (rest.length > max) {
-    let cut = rest.lastIndexOf("\n", max);
-    if (cut < max / 2) cut = max;
-    out.push(rest.slice(0, cut));
-    rest = rest.slice(cut).replace(/^\n/, "");
-  }
-  out.push(rest);
-  return out;
 }
 
 /**

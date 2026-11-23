@@ -8,6 +8,14 @@
  * - `sendCard` / `onAction`: a durable card with no timer. Its buttons are
  *   routed to a namespace handler registered at boot, so they survive restarts.
  *
+ * Every title and body is scrubbed and has hidden, bidi and control
+ * characters shown as `[U+XXXX]`. A body that does not fit is cut with an
+ * explicit TRUNCATED marker. Text the owner approves for the agent to act on
+ * goes in `content`: it is shown in full on the card, or the card says
+ * TRUNCATED with the total length and offers only "Show full text" and the
+ * safe option; the approving option is offered on a second card, after the
+ * whole text was sent (`askWithContent`).
+ *
  * Prompts and cards go only to the owner's primary DM (`owners.primary()`),
  * never to a group. A press is accepted only when the prompt exists, has not
  * expired, the chat and message ids match the ones recorded when it was sent,
@@ -20,6 +28,8 @@ import type { ChannelAdapter, InlineButton } from "../channels/adapter.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { AuditTrail } from "../security/audit-trail.js";
 import type { OwnerDirectory } from "./owners.js";
+import { revealHiddenChars } from "../learning/invisible-chars.js";
+import { FULL_TEXT_PAGE_CHARS, splitPages } from "./text-pages.js";
 import {
   InteractionRouter,
   INTERACTION_EXPIRED_TEXT,
@@ -41,8 +51,13 @@ export interface OwnerAskRequest {
   /** "approval" | "confirm" | "goal" | "loop" | "voice" | "computer" | "accounts" | ... */
   kind: string;
   title: string;
-  /** Plain text. Scrubbed and truncated to 3000 chars */
+  /** Plain text. Scrubbed, hidden characters made visible, cut at 3000 chars with a TRUNCATED marker */
   body?: string;
+  /**
+   * The exact text the owner is asked to approve (an agent's goal or loop
+   * prompt). Never cut silently: see `OwnerPrompts.askWithContent`.
+   */
+  content?: OwnerAskContent;
   /** 2 to 6 options */
   options: readonly OwnerAskOption[];
   /** Returned on timeout, cancel and unavailable. Must be the safe choice */
@@ -50,6 +65,12 @@ export interface OwnerAskRequest {
   /** Clamped to 5_000 .. 86_400_000 */
   timeoutMs: number;
   signal?: AbortSignal;
+}
+
+export interface OwnerAskContent {
+  /** What the text is, e.g. "Goal text", "Prompt" */
+  label: string;
+  text: string;
 }
 
 export type OwnerAskOutcome = "answered" | "timeout" | "cancelled" | "unavailable";
@@ -106,6 +127,10 @@ export const OWNER_PROMPT_NAMESPACE = "ask";
 export const OWNER_PROMPT_MIN_TIMEOUT_MS = 5_000;
 export const OWNER_PROMPT_MAX_TIMEOUT_MS = 86_400_000;
 export const OWNER_PROMPT_BODY_MAX_CHARS = 3000;
+/** Characters of `content` shown on a card that cannot show all of it. */
+export const OWNER_PROMPT_CONTENT_PREVIEW_CHARS = 600;
+/** Option id of the "Show full text" button on a card whose content is cut. */
+export const OWNER_PROMPT_SHOW_FULL_ID = "show_full";
 const TITLE_MAX_CHARS = 200;
 const OPTION_ID_RE = /^[a-z0-9_]{1,16}$/;
 const PROMPT_ID_RE = /^[0-9a-f]{16}$/;
@@ -147,6 +172,81 @@ export class OwnerPrompts {
 
   /** Ask the owner. Never rejects. */
   ask(req: OwnerAskRequest): Promise<OwnerAskResult> {
+    if (req && typeof req === "object" && req.content) return this.askWithContent(req, req.content);
+    return this.open(req, (body) => truncateMarked(body, OWNER_PROMPT_BODY_MAX_CHARS));
+  }
+
+  /**
+   * The full-content rule for approvals of agent-written text (E.3): the card
+   * shows all of the content, or says TRUNCATED with the total length and
+   * offers only "Show full text" and the default (safe) option. "Show full
+   * text" sends the whole content as plain messages, then a second card offers
+   * the original options. An approving answer is therefore only possible
+   * after the owner was sent every character.
+   */
+  private async askWithContent(req: OwnerAskRequest, content: OwnerAskContent): Promise<OwnerAskResult> {
+    const base = req;
+    const shown = revealHiddenChars(this.scrub(String(content.text ?? "")));
+    const label = String(content.label || "Text");
+    const total = shown.text.length.toLocaleString("en-US");
+    const hiddenLine = shown.hidden > 0
+      ? `\nWarning: it contains ${shown.hidden} hidden, bidi or control character${shown.hidden === 1 ? "" : "s"}, shown as [U+XXXX].`
+      : "";
+    const head = base.body ? `${this.prepareText(base.body)}\n\n` : "";
+
+    const full = `${head}${label}: ${total} characters, shown in full.${hiddenLine}\n\n${shown.text}`;
+    if (full.length <= OWNER_PROMPT_BODY_MAX_CHARS) return this.open(base, () => full);
+
+    const pages = splitPages(shown.text, FULL_TEXT_PAGE_CHARS);
+    const safe = base.options?.find((o) => o.id === base.defaultOptionId);
+    const approving = (base.options ?? []).filter((o) => o.id !== base.defaultOptionId).map((o) => o.label).join(" or ");
+    const first = await this.open(
+      {
+        ...base,
+        options: safe ? [{ id: OWNER_PROMPT_SHOW_FULL_ID, label: "Show full text" }, safe] : base.options,
+      },
+      () =>
+        `${head}${label}: ${total} characters. TRUNCATED: this card shows only the first ${OWNER_PROMPT_CONTENT_PREVIEW_CHARS}. ` +
+        `Tap Show full text to receive all of it (${pages.length} message${pages.length === 1 ? "" : "s"}); ${approving || "approval"} is offered only after that.${hiddenLine}\n\n` +
+        `${shown.text.slice(0, OWNER_PROMPT_CONTENT_PREVIEW_CHARS)}…`,
+    );
+    if (first.outcome !== "answered" || first.optionId !== OWNER_PROMPT_SHOW_FULL_ID) return first;
+
+    const sent = await this.sendPages(label, pages);
+    if (!sent) return { optionId: base.defaultOptionId, outcome: "unavailable", code: first.code };
+    return this.open(
+      base,
+      () => `${head}${label}: ${total} characters, sent in full in the ${pages.length} message${pages.length === 1 ? "" : "s"} above (part 1 to ${pages.length}). Read ${pages.length === 1 ? "it" : "them"} before you answer.${hiddenLine}`,
+    );
+  }
+
+  /** Send already prepared pages to the owner's primary DM. False when any send fails. */
+  private async sendPages(label: string, pages: readonly string[]): Promise<boolean> {
+    if (this.closed) return false;
+    const target = this.deps.owners.primary();
+    if (!target) return false;
+    const adapter = this.runningAdapter(target.channel);
+    if (!adapter) return false;
+    const n = pages.length;
+    try {
+      for (let i = 0; i < n; i++) {
+        const text = [`${label}, part ${i + 1} of ${n}`, "", pages[i]!, ...(i === n - 1 ? ["", `End of ${label.toLowerCase()}.`] : [])].join("\n");
+        await adapter.sendText({ ctx: { chatId: target.chatId }, text, plain: true });
+      }
+      return true;
+    } catch (err) {
+      log.warn({ err: err instanceof Error ? err.message : String(err) }, "owner prompt full text send failed");
+      return false;
+    }
+  }
+
+  /** Scrub, then make hidden, bidi and control characters visible. */
+  private prepareText(text: string): string {
+    return revealHiddenChars(this.scrub(text)).text;
+  }
+
+  /** Create and deliver one prompt. `renderBody` gets the prepared body (or "" when there is none). */
+  private open(req: OwnerAskRequest, renderBody: (preparedBody: string) => string): Promise<OwnerAskResult> {
     return new Promise<OwnerAskResult>((resolve) => {
       const unavailable = (reason: string): void => {
         log.info({ kind: req?.kind, reason }, "owner prompt unavailable");
@@ -174,8 +274,8 @@ export class OwnerPrompts {
       const timeoutMs = clamp(req.timeoutMs, OWNER_PROMPT_MIN_TIMEOUT_MS, OWNER_PROMPT_MAX_TIMEOUT_MS);
       const id = randomBytes(8).toString("hex");
       const code = this.newCode();
-      const title = truncate(this.scrub(req.title), TITLE_MAX_CHARS);
-      const body = req.body ? truncate(this.scrub(req.body), OWNER_PROMPT_BODY_MAX_CHARS) : undefined;
+      const title = truncate(this.prepareText(req.title), TITLE_MAX_CHARS);
+      const body = renderBody(req.body ? this.prepareText(req.body) : "") || undefined;
       const interactive = canSendButtons(adapter);
       const text = renderPrompt(title, body, code, req.options, interactive);
 
@@ -480,6 +580,14 @@ function clamp(n: number, min: number, max: number): number {
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
+/** Never a silent cut: the marker says how much is missing. */
+function truncateMarked(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const marker = (n: number): string => `\n…[TRUNCATED: ${n.toLocaleString("en-US")} more characters not shown]`;
+  const kept = max - marker(s.length).length;
+  return s.slice(0, kept) + marker(s.length - kept);
 }
 
 function clock(): string {

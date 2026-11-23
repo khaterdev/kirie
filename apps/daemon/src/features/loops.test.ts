@@ -167,6 +167,8 @@ describe("setupLoops", () => {
       kind: "loop",
       options: [{ id: "start", label: "Start" }, { id: "decline", label: "Decline" }],
       defaultOptionId: "decline",
+      // RUNTIME-B2: the prompt goes in `content`, which OwnerPrompts shows in full with hidden characters visible.
+      content: { label: "Prompt", text: "watch the queue" },
     }));
     await vi.waitFor(() => {
       const s = new LoopStore(join(dataDir, "loops.db"));

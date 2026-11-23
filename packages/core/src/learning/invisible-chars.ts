@@ -34,5 +34,27 @@ export function stripInvisibleChars(text: string): string {
 
 /** Replace each invisible character with a visible `[U+XXXX]` marker. */
 export function revealInvisibleChars(text: string): string {
-  return text.replace(invisibleCharsRegex(), (c) => `[U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}]`);
+  return text.replace(invisibleCharsRegex(), marker);
+}
+
+/** C0 controls other than tab and newline, DEL and C1 controls. */
+const CONTROL_CLASS = "\\u0000-\\u0008\\u000B-\\u001F\\u007F-\\u009F";
+const HIDDEN_RE_SOURCE = `[${INVISIBLE_CLASS}${CONTROL_CLASS}]`;
+
+function marker(c: string): string {
+  return `[U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}]`;
+}
+
+/**
+ * For text shown to the owner for a decision (prompt cards, file names):
+ * every invisible, bidi and control character (other than tab and newline)
+ * as a visible `[U+XXXX]` marker, with the number replaced.
+ */
+export function revealHiddenChars(text: string): { text: string; hidden: number } {
+  let hidden = 0;
+  const out = text.replace(new RegExp(HIDDEN_RE_SOURCE, "gu"), (c) => {
+    hidden++;
+    return marker(c);
+  });
+  return { text: out, hidden };
 }
