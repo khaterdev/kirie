@@ -86,10 +86,6 @@ export * from "./security/audit-trail.js";
 // Secret scrubber (PLAN B.8)
 export * from "./security/secret-scrubber.js";
 export * from "./security/secret-patterns.js";
-export * from "./hooks/types.js";
-export * from "./hooks/registry.js";
-export * from "./plugins/types.js";
-export * from "./plugins/loader.js";
 export * from "./engine/agent-registry.js";
 export * from "./engine/media-output-parser.js";
 export * from "./engine/a2a-policy.js";
@@ -110,10 +106,6 @@ export * from "./routing/labels.js";
 // Config doctor
 export * from "./config/doctor.js";
 
-// Sandbox
-export * from "./sandbox/types.js";
-export * from "./sandbox/docker.js";
-export * from "./sandbox/manager.js";
 
 // Memory file watcher
 export { MemoryFileWatcher, type FileWatcherOptions } from "./memory/file-watcher.js";
@@ -127,3 +119,18 @@ export { checkPlaywrightStatus, ensurePlaywrightInstalled } from "./mcp/tools/br
 export { createProactiveToolHandlers } from "./mcp/tools/proactive-tools.js";
 export { HeartbeatLogStore, createHeartbeatLogToolHandlers } from "./mcp/tools/heartbeat-logs.js";
 export type { HeartbeatLogEntry, HeartbeatLogInput, HeartbeatLogTier, HeartbeatLogLevel, HeartbeatLogMinLevels } from "./mcp/tools/heartbeat-logs.js";
+
+// Feature directories (PLAN B.10 seam 5). Each feature exports from its own
+// index.ts; nobody edits this file after W1B.
+export * from "./accounts/index.js";
+export * from "./approvals/index.js";
+export * from "./sandbox/index.js";
+export * from "./undo/index.js";
+export * from "./learning/index.js";
+export * from "./goals/index.js";
+export * from "./loops/index.js";
+export * from "./webhooks/index.js";
+export * from "./plugins/index.js";
+export * from "./hooks/index.js";
+export * from "./computer-use/index.js";
+export * from "./security/secrets-index.js";
