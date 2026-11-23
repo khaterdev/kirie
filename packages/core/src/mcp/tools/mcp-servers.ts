@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { isComputerUseDriverServer, isComputerUseReservedServerName } from "../../computer-use/mcp-config.js";
 
 const CONFIG_PATH = join(homedir(), ".kirie", "config.yaml");
 
@@ -88,7 +89,8 @@ export function createMcpServersToolHandlers() {
       description:
         "Add a new external MCP server to config.yaml. Supports stdio servers (command + args + env) " +
         "and HTTP/SSE servers (url + headers). After adding, Kirie must be restarted to connect " +
-        "to the new server. The 'kirie-tools' name is reserved and cannot be used.",
+        "to the new server. The 'kirie-tools' name is reserved and cannot be used. Desktop-control servers (cua-driver) " +
+        "cannot be added: computer use is set up by the owner and armed with /computer on.",
       parameters: {
         type: "object" as const,
         properties: {
@@ -140,6 +142,14 @@ export function createMcpServersToolHandlers() {
         const url = params.url as string | undefined;
         const headers = params.headers as Record<string, string> | undefined;
         const enabled = params.enabled as boolean | undefined;
+
+        if (isComputerUseReservedServerName(name)) {
+          return { error: `'${name}' is reserved for computer use, which only the owner sets up (/computer, docs/computer-use-setup.md)` };
+        }
+
+        if (command && isComputerUseDriverServer({ command, args: Array.isArray(args) ? args : [] })) {
+          return { error: "A cua-driver (desktop control) server cannot be added as an MCP server. Computer use is set up by the owner and armed with /computer on." };
+        }
 
         if (!command && !url) {
           return { error: "Either 'command' (for stdio) or 'url' (for HTTP/SSE) must be provided" };
