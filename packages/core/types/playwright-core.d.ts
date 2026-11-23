@@ -6,7 +6,9 @@
  *
  * This ambient declaration lets the optional dynamic import typecheck. The call
  * site immediately casts the result to its own structural PlaywrightModule
- * interface, so nothing here is relied on for type safety.
+ * interface, so nothing here is relied on for type safety. That interface
+ * (browser-tool.ts) follows the pinned PLAYWRIGHT_VERSION: `page.accessibility`
+ * is gone there, `locator(...).ariaSnapshot()` replaces it.
  */
 declare module "playwright-core" {
   const playwright: unknown;
