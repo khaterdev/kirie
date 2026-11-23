@@ -100,8 +100,11 @@ function clientIpFrom(headers: Headers, trustedHeader: string): string | null {
   if (!trustedHeader) return null;
   const raw = headers.get(trustedHeader);
   if (!raw) return null;
-  const first = raw.split(",")[0]!.trim();
-  return /^[0-9a-fA-F:.]{2,45}$/.test(first) ? first : null;
+  // A list (X-Forwarded-For style) is client-controlled at the front; use the
+  // last hop, the one the nearest proxy appended. cf-connecting-ip has one value.
+  const parts = raw.split(",");
+  const last = parts[parts.length - 1]!.trim();
+  return /^[0-9a-fA-F:.]{2,45}$/.test(last) ? last : null;
 }
 
 /** Reads at most `max` bytes. Returns null when the body is larger. */
@@ -140,7 +143,8 @@ export function createWebhookIngressApp(opts: WebhookIngressAppOptions): Hono<{ 
     const clientIp = clientIpFrom(headers, trustedHeader);
     if (!test) {
       const t = now();
-      if (!global.take("all", t) || !perIp.take(clientIp ?? "unknown", t)) {
+      // Per IP first: a client over its own limit must not use up the shared allowance.
+      if (!perIp.take(clientIp ?? "unknown", t) || !global.take("all", t)) {
         return jsonResponse(429, '{"status":"throttled"}');
       }
     }

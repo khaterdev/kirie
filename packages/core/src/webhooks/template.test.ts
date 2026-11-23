@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildWebhookPrompt,
+  defangWebhookLinks,
   detectSuspiciousWebhookPayload,
   extractWebhookFields,
   getWebhookField,
@@ -105,5 +106,13 @@ describe("suspicious payloads and notices", () => {
     expect(text).toContain("repository.full_name: example/app");
     expect(text).toContain("workflow_run.conclusion: failure");
     expect(text).not.toContain(FAKE_TOKEN);
+  });
+});
+
+describe("defangWebhookLinks", () => {
+  it("breaks scheme and domain auto-links but keeps the text readable", () => {
+    const out = defangWebhookLinks("see https://evil.example/?d=QUJD and docs.example.com, v1.2 ok");
+    expect(out).toBe("see https[:]//evil[.]example/?d=QUJD and docs[.]example[.]com, v1.2 ok");
+    expect(out).not.toMatch(/https?:\/\//);
   });
 });

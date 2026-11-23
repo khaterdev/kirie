@@ -6,7 +6,7 @@ import { PublicIngress } from "../ingress/public-ingress.js";
 import { WebhooksConfigSchema, type WebhooksConfig } from "../config/sections/webhooks.js";
 import type { BackgroundTask, BackgroundTaskMeta } from "../engine/background-task-store.js";
 import { WebhookStore, webhookPrevSecretRef, webhookSecretRef } from "./store.js";
-import { buildWebhookTaskProfile, WEBHOOK_INVESTIGATE_TOOLS, WebhookService } from "./service.js";
+import { buildWebhookTaskProfile, WEBHOOK_INVESTIGATE_TOOLS, WebhookService, type WebhookServiceDeps } from "./service.js";
 import { signWebhookPayload } from "./verify.js";
 import { WEBHOOK_NOT_FOUND_BODY } from "./ingress-app.js";
 import type { WebhookSource } from "./types.js";
@@ -26,7 +26,7 @@ let service: WebhookService;
 let ingress: PublicIngress;
 let now: number;
 
-function makeService(): WebhookService {
+function makeService(over: Partial<WebhookServiceDeps> = {}): WebhookService {
   return new WebhookService({
     openStore: () => new WebhookStore(join(dir, "webhooks.db")),
     config: () => cfg,
@@ -48,6 +48,7 @@ function makeService(): WebhookService {
     publicBaseUrl: () => "https://hooks.example.test",
     trustedIpHeader: () => "cf-connecting-ip",
     now: () => now,
+    ...over,
   });
 }
 
@@ -210,6 +211,17 @@ describe("accepted deliveries", () => {
     }
   });
 
+  it("a Sentry delivery edited in whitespace still verifies (re-serialised fallback) but is a duplicate", async () => {
+    const h = await addEnabled("errors", "sentry");
+    const body = { action: "created", data: { issue: { title: "boom" } } };
+    const canonical = Buffer.from(JSON.stringify(body));
+    const sig = signWebhookPayload("sentry", h.secret, canonical);
+    expect((await ingress.handle(request(h.id, canonical, sig))).status).toBe(202);
+    const edited = Buffer.from(JSON.stringify(body, null, 1));
+    const res = await ingress.handle(request(h.id, edited, sig));
+    expect(await res.text()).toBe('{"status":"duplicate"}');
+  });
+
   it("GitHub ping answers pong, marks the hook verified and tells the owner", async () => {
     const gh = await addEnabled("deploys", "github");
     const d = signed("github", gh.secret, { zen: "hi", hook_id: 1 }, { "x-github-event": "ping" });
@@ -291,6 +303,27 @@ describe("limits", () => {
     expect((await hit("192.0.2.2")).status).toBe(404);
   });
 
+  it("a client over its per-IP limit does not use up the global allowance", async () => {
+    cfg = { ...cfg, rateLimit: { ...cfg.rateLimit, perIpPerMinute: 1, globalPerMinute: 2 } };
+    service.stop();
+    service = makeService();
+    const ing = new PublicIngress({ port: 0, trustedIpHeader: "cf-connecting-ip" });
+    ing.mount("/hooks", service.ingressApp());
+    const raw = Buffer.from("{}");
+    const hit = (ip: string) => ing.handle(request("nope-00000000", raw, { "cf-connecting-ip": ip }));
+    expect((await hit("192.0.2.1")).status).toBe(404);
+    for (let i = 0; i < 5; i++) expect((await hit("192.0.2.1")).status).toBe(429);
+    expect((await hit("192.0.2.2")).status).toBe(404);
+  });
+
+  it("a multi-value IP header uses the last hop, not the client-supplied first entry", async () => {
+    const gh = await addEnabled("deploys", "github");
+    service.updateHook(gh.id, { ipAllowlist: ["203.0.113.0/24"] }, "t");
+    const d = signed("github", gh.secret, ghBody());
+    expect((await ingress.handle(request(gh.id, d.raw, { ...d.headers, "cf-connecting-ip": "203.0.113.9, 198.51.100.7" }))).status).toBe(404);
+    expect((await ingress.handle(request(gh.id, d.raw, { ...d.headers, "cf-connecting-ip": "198.51.100.7, 203.0.113.9" }))).status).toBe(202);
+  });
+
   it("IP allowlist uses the trusted header and accepts a matching address", async () => {
     const gh = await addEnabled("deploys", "github");
     service.updateHook(gh.id, { ipAllowlist: ["203.0.113.0/24", "2001:db8::/32"] }, "t");
@@ -332,8 +365,35 @@ describe("actions", () => {
     const task = { id: "task-1", result: "Looked at the logs: flaky test.", error: null, meta: tasks[0]!.meta } as unknown as BackgroundTask;
     await service.onTaskCompleted(task);
     expect(sent.at(-1)!.text).toContain("flaky test");
+    expect(sent.at(-1)!.text).toContain("links defanged");
     await flush();
     expect(service.workload().active).toBe(0);
+  });
+
+  it("a cancelled webhook task releases its slot (no completion handler runs for it)", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      let status = "running";
+      service.stop();
+      const svc = makeService({ taskStatus: () => status });
+      service = svc;
+      const ing = new PublicIngress({ port: 0, trustedIpHeader: "" });
+      ing.mount("/hooks", svc.ingressApp());
+      const gh = await addEnabled("deploys", "github", { action: "task", toolProfile: "investigate" });
+      const d = signed("github", gh.secret, ghBody());
+      expect((await ing.handle(request(gh.id, d.raw, d.headers))).status).toBe(202);
+      await flush();
+      expect(svc.workload().active).toBe(1);
+      vi.advanceTimersByTime(30_000);
+      await flush();
+      expect(svc.workload().active).toBe(1);
+      status = "cancelled";
+      vi.advanceTimersByTime(30_000);
+      await flush();
+      expect(svc.workload().active).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a suspicious payload is downgraded to summarize with a warning", async () => {
@@ -444,6 +504,26 @@ describe("secrets", () => {
     await service.rotateSecret(res.hook.id, { graceMinutes: 0, fromFile: true, by: "t" });
     expect(secrets.get(webhookSecretRef(res.hook.id))).toBe(value);
     expect(existsSync(path)).toBe(false);
+  });
+});
+
+describe("revealed secret files", () => {
+  it("are deleted at stop, swept at start when older than 10 minutes, and a second reveal replaces the first", async () => {
+    const res = await service.addHook({ name: "deploys", source: "github", channel: "telegram", chatId: "1", by: "t" });
+    const path = res.secretFile;
+    await service.revealSecretToFile(res.hook.id, "t");
+    expect(existsSync(path)).toBe(true);
+    service.stop();
+    expect(existsSync(path)).toBe(false);
+
+    service = makeService();
+    const again = await service.revealSecretToFile(res.hook.id, "t");
+    // Simulate a crash: the next process finds the file and its age.
+    const leftover = makeService();
+    now += 11 * 60_000;
+    leftover.sweepSecretFiles();
+    expect(existsSync(again)).toBe(false);
+    leftover.stop();
   });
 });
 

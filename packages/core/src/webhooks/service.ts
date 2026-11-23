@@ -21,7 +21,7 @@
 
 import { randomBytes } from "node:crypto";
 import { BlockList, isIP } from "node:net";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
@@ -51,6 +51,7 @@ import { webhookPrevSecretRef, webhookSecretRef, type NewWebhookInput, type Webh
 import {
   buildWebhookPrompt,
   cleanWebhookText,
+  defangWebhookLinks,
   detectSuspiciousWebhookPayload,
   renderWebhookNotice,
   WEBHOOK_SUMMARY_SYSTEM_PROMPT,
@@ -73,6 +74,8 @@ export const WEBHOOK_SECRET_FILE_TTL_MS = 10 * 60_000;
 export const WEBHOOK_MAX_GRACE_MINUTES = 60;
 /** A webhook background task that never reports back releases its slot after this. */
 const TASK_SLOT_TIMEOUT_MS = 2 * 60 * 60_000;
+/** How often a held task slot checks whether its task was cancelled. */
+export const WEBHOOK_TASK_SLOT_CHECK_MS = 30_000;
 const REJECT_AUDIT_INTERVAL_MS = 5 * 60_000;
 const AUTH_ALERT_WINDOW_MS = 60 * 60_000;
 const MESSAGE_MAX_CHARS = 3500;
@@ -110,6 +113,12 @@ export interface WebhookServiceDeps {
   summarize(input: { system: string; prompt: string; label: string }): Promise<string>;
   /** BackgroundTaskStore.create */
   createTask(sessionKey: string, description: string, prompt: string, meta: BackgroundTaskMeta): { id: string };
+  /**
+   * Status of a background task (BackgroundTaskStore.get). Completion and
+   * failure handlers are not called for a cancelled task, so the slot is also
+   * released once the task is no longer pending or running.
+   */
+  taskStatus?(id: string): string | null;
   /** ~/.kirie/secrets */
   secretsDir: string;
   publicBaseUrl(): string | null;
@@ -168,6 +177,8 @@ export class WebhookService implements WebhookDeliveryHandler {
   private readonly rejects = new Map<string, RejectCounter>();
   private readonly taskSlots = new Map<string, () => void>();
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  /** Revealed secret files and their deletion timers. */
+  private readonly secretFiles = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly unavailableNotified = new Set<string>();
   private readonly queue: WebhookWorkQueue;
   private readonly log: Logger;
@@ -234,6 +245,8 @@ export class WebhookService implements WebhookDeliveryHandler {
     this.queue.clear();
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
+    // A revealed secret never outlives the process: the owner can reveal it again.
+    for (const path of [...this.secretFiles.keys()]) this.deleteSecretFile(path);
     for (const release of this.taskSlots.values()) release();
     this.taskSlots.clear();
     this.storeInstance?.close();
@@ -333,17 +346,49 @@ export class WebhookService implements WebhookDeliveryHandler {
     if (entry.kind !== "ok") throw new Error("The secret of this hook is unavailable");
     this.ensureSecretsDir();
     const path = this.secretFilePath(hook.id);
-    if (existsSync(path)) unlinkSync(path);
+    this.deleteSecretFile(path);
     writeFileSync(path, `${entry.set.current}\n`, { mode: 0o600, flag: "wx" });
     chmodSync(path, 0o600);
-    const t = setTimeout(() => {
-      this.timers.delete(t);
-      try { if (existsSync(path)) unlinkSync(path); } catch { /* already gone */ }
-    }, WEBHOOK_SECRET_FILE_TTL_MS);
-    t.unref?.();
-    this.timers.add(t);
+    this.scheduleSecretFileDeletion(path, WEBHOOK_SECRET_FILE_TTL_MS);
     this.audit("secret.revealed", by, { hookId: hook.id, via: "file" });
     return path;
+  }
+
+  private scheduleSecretFileDeletion(path: string, delayMs: number): void {
+    const t = setTimeout(() => this.deleteSecretFile(path), Math.max(0, delayMs));
+    t.unref?.();
+    this.secretFiles.set(path, t);
+  }
+
+  private deleteSecretFile(path: string): void {
+    const t = this.secretFiles.get(path);
+    if (t) clearTimeout(t);
+    this.secretFiles.delete(path);
+    try { if (existsSync(path)) unlinkSync(path); } catch { /* already gone */ }
+  }
+
+  /**
+   * Startup: remove revealed secret files a previous process left behind
+   * (older than the 10-minute window), and schedule the younger ones. Runs
+   * whether or not webhooks are on.
+   */
+  sweepSecretFiles(): void {
+    let names: string[];
+    try {
+      names = readdirSync(this.deps.secretsDir);
+    } catch {
+      return;
+    }
+    const nowMs = this.now();
+    for (const name of names) {
+      if (!/^webhook-[a-z0-9-]+\.txt$/.test(name)) continue;
+      const path = join(this.deps.secretsDir, name);
+      try {
+        const age = nowMs - lstatSync(path).mtimeMs;
+        if (age >= WEBHOOK_SECRET_FILE_TTL_MS) this.deleteSecretFile(path);
+        else this.scheduleSecretFileDeletion(path, WEBHOOK_SECRET_FILE_TTL_MS - age);
+      } catch { /* gone meanwhile */ }
+    }
   }
 
   // ── owner operations ───────────────────────────────────────────────────
@@ -415,9 +460,8 @@ export class WebhookService implements WebhookDeliveryHandler {
     for (const key of [hook.secretRef, webhookPrevSecretRef(hook.id)]) {
       try { await this.deps.secrets.delete(key); } catch { /* reported below if the main key stays */ }
     }
-    for (const path of [this.secretFilePath(hook.id), this.importFilePath(hook.id)]) {
-      try { if (existsSync(path)) unlinkSync(path); } catch { /* best effort */ }
-    }
+    this.deleteSecretFile(this.secretFilePath(hook.id));
+    try { if (existsSync(this.importFilePath(hook.id))) unlinkSync(this.importFilePath(hook.id)); } catch { /* best effort */ }
     this.audit("hook.removed", by, { hookId: hook.id });
     return hook;
   }
@@ -785,8 +829,17 @@ export class WebhookService implements WebhookDeliveryHandler {
       this.markDelivery(deliveryId, { status: "done", taskId: task.id });
       const timer = setTimeout(() => release(), TASK_SLOT_TIMEOUT_MS);
       timer.unref?.();
+      const check = setInterval(() => {
+        const lookup = this.deps.taskStatus;
+        if (!lookup) return;
+        let status: string | null;
+        try { status = lookup(task.id); } catch { return; }
+        if (status !== "pending" && status !== "running") release();
+      }, WEBHOOK_TASK_SLOT_CHECK_MS);
+      check.unref?.();
       const release = (): void => {
         clearTimeout(timer);
+        clearInterval(check);
         this.taskSlots.delete(task.id);
         resolve();
       };
@@ -812,10 +865,11 @@ export class WebhookService implements WebhookDeliveryHandler {
     const hook = hookId ? this.store.getHook(hookId) : null;
     if (!ok && deliveryId !== null) this.markDelivery(deliveryId, { status: "failed", note: "task failed" });
     const name = hook?.name ?? hookId ?? "unknown";
-    const body = ok
+    // The task could read local files: links in its words are defanged so no preview fetches them.
+    const body = defangWebhookLinks(ok
       ? cleanWebhookText(task.result ?? "(no result)", MESSAGE_MAX_CHARS)
-      : `failed: ${cleanWebhookText(task.error ?? "unknown error", 300)}`;
-    const text = `Webhook ${name} task ${task.id.slice(0, 8)}${ok ? " finished" : ""}:\n${body}`;
+      : `failed: ${cleanWebhookText(task.error ?? "unknown error", 300)}`);
+    const text = `Webhook ${name} task ${task.id.slice(0, 8)}${ok ? " finished" : ""} (links defanged):\n${body}`;
     if (hook) {
       await this.send(hook, text);
     } else {

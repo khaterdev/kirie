@@ -92,6 +92,9 @@ export interface WebhookClaimInput {
   receivedAt: string;
 }
 
+/** How long a replay key outlives its delivery row. */
+export const WEBHOOK_REPLAY_KEY_DAYS = 365;
+
 /** Credential-store key of a hook's current secret. */
 export function webhookSecretRef(id: string): string {
   return `webhook.${id}.secret`;
@@ -174,6 +177,12 @@ export class WebhookStore {
         UNIQUE(hook_id, dedupe_key)
       );
       CREATE INDEX IF NOT EXISTS idx_deliveries_hook_time ON deliveries(hook_id, received_at);
+      CREATE TABLE IF NOT EXISTS replay_keys (
+        hook_id    TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        seen_at    TEXT NOT NULL,
+        PRIMARY KEY (hook_id, dedupe_key)
+      );
     `);
   }
 
@@ -263,6 +272,8 @@ export class WebhookStore {
    * left `throttled` by a post-auth limit can be claimed again by a retry.
    */
   claimDelivery(input: WebhookClaimInput): { claimed: boolean; id: number } {
+    const old = this.db.prepare("SELECT 1 FROM replay_keys WHERE hook_id = ? AND dedupe_key = ?").get(input.hookId, input.dedupeKey);
+    if (old) return { claimed: false, id: 0 };
     const res = this.db.prepare(`
       INSERT INTO deliveries (hook_id, dedupe_key, provider_id, event, status, body_bytes, remote_ip, received_at)
       VALUES (?, ?, ?, ?, 'accepted', ?, ?, ?)
@@ -330,10 +341,26 @@ export class WebhookStore {
     return this.db.prepare("DELETE FROM deliveries WHERE id = ?").run(id).changes > 0;
   }
 
-  /** Drops rows older than the retention window. Returns the count removed. */
+  /**
+   * Drops delivery rows older than the retention window. Their replay keys
+   * move to `replay_keys` and are kept `WEBHOOK_REPLAY_KEY_DAYS` (a year), so
+   * a captured unsigned-timestamp delivery (github, sentry, bearer) is still
+   * refused after the log entry is gone. Returns the delivery rows removed.
+   */
   pruneDeliveries(retentionDays: number, now: Date = new Date()): number {
     const cutoff = new Date(now.getTime() - retentionDays * 86_400_000).toISOString();
-    return this.db.prepare("DELETE FROM deliveries WHERE received_at < ?").run(cutoff).changes;
+    const keyCutoff = new Date(now.getTime() - WEBHOOK_REPLAY_KEY_DAYS * 86_400_000).toISOString();
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO replay_keys (hook_id, dedupe_key, seen_at)
+        SELECT hook_id, dedupe_key, received_at FROM deliveries
+        WHERE received_at < ? AND status <> 'throttled'
+      `).run(cutoff);
+      const n = this.db.prepare("DELETE FROM deliveries WHERE received_at < ?").run(cutoff).changes;
+      this.db.prepare("DELETE FROM replay_keys WHERE seen_at < ?").run(keyCutoff);
+      return n;
+    });
+    return tx();
   }
 
   /**

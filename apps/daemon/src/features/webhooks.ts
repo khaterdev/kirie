@@ -75,6 +75,7 @@ export const setupWebhooks: FeatureSetup = (ctx: DaemonContext) => {
       return res.value;
     },
     createTask: (sessionKey, description, prompt, meta) => ctx.backgroundTaskStore.create(sessionKey, description, prompt, meta),
+    taskStatus: (id) => ctx.backgroundTaskStore.get(id)?.status ?? null,
     secretsDir: join(ctx.dataDir, "secrets"),
     publicBaseUrl: () => ctx.ingress.publicBaseUrl,
     trustedIpHeader: () => ctx.config.ingress.trustedIpHeader,
@@ -105,6 +106,38 @@ export const setupWebhooks: FeatureSetup = (ctx: DaemonContext) => {
     }
   }
 
+  /**
+   * `full` only while the config flag, the hook's opt-in and its profile all
+   * still say so. Any error answers "no": a throwing profile factory would make
+   * the task manager fall back to the default (all-tools) background profile.
+   */
+  const fullAllowed = (task: BackgroundTask): boolean => {
+    try {
+      if (!cfg().allowFullProfile) return false;
+      const hookId = task.meta?.data?.hookId;
+      if (typeof hookId !== "string") return false;
+      const hook = service.store.getHook(hookId);
+      return hook !== null && hook.allowFull && hook.toolProfile === "full";
+    } catch {
+      return false;
+    }
+  };
+
+  // Task hooks first, so a webhook task resumed at start always finds its restricted profile.
+  ctx.taskHooks.registerProfile(WEBHOOK_TASK_PROFILE, (task) =>
+    buildWebhookTaskProfile(task.meta?.data?.toolProfile, {
+      fullAllowed: fullAllowed(task),
+      kirieToolsServer: ctx.mcpServers["kirie-tools"],
+    }));
+  // The stored prompt is the framed webhook_event block; it replaces the generic
+  // "use every tool you have" background-task message.
+  ctx.taskHooks.registerController(WEBHOOK_TASK_PROFILE, () => ({
+    initialMessage: (task) => task.prompt,
+    onTurnResult: async () => ({ action: "finish" }),
+  }));
+  ctx.taskHooks.registerCompletionHandler(WEBHOOK_TASK_PROFILE, (task) => service.onTaskCompleted(task));
+  ctx.taskHooks.registerFailureHandler(WEBHOOK_TASK_PROFILE, (task) => service.onTaskFailed(task));
+
   ctx.commands.registerAll(createWebhookCommands({
     service,
     config: cfg,
@@ -123,32 +156,10 @@ export const setupWebhooks: FeatureSetup = (ctx: DaemonContext) => {
     audit: ctx.audit,
   }));
 
-  /** `full` only while the config flag, the hook's opt-in and its profile all still say so. */
-  const fullAllowed = (task: BackgroundTask): boolean => {
-    if (!cfg().allowFullProfile) return false;
-    const hookId = task.meta?.data?.hookId;
-    if (typeof hookId !== "string") return false;
-    const hook = service.store.getHook(hookId);
-    return hook !== null && hook.allowFull && hook.toolProfile === "full";
-  };
-
-  ctx.taskHooks.registerProfile(WEBHOOK_TASK_PROFILE, (task) =>
-    buildWebhookTaskProfile(task.meta?.data?.toolProfile, {
-      fullAllowed: fullAllowed(task),
-      kirieToolsServer: ctx.mcpServers["kirie-tools"],
-    }));
-  // The stored prompt is the framed webhook_event block; it replaces the generic
-  // "use every tool you have" background-task message.
-  ctx.taskHooks.registerController(WEBHOOK_TASK_PROFILE, () => ({
-    initialMessage: (task) => task.prompt,
-    onTurnResult: async () => ({ action: "finish" }),
-  }));
-  ctx.taskHooks.registerCompletionHandler(WEBHOOK_TASK_PROFILE, (task) => service.onTaskCompleted(task));
-  ctx.taskHooks.registerFailureHandler(WEBHOOK_TASK_PROFILE, (task) => service.onTaskFailed(task));
-
   return {
     name: "webhooks",
     start: async () => {
+      service.sweepSecretFiles();
       if (isEnabled()) await reconcileListener();
     },
     stop: async () => {

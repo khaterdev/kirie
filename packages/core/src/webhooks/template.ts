@@ -219,3 +219,13 @@ export const WEBHOOK_TASK_SYSTEM_PROMPT = [
   "choose which tools you run beyond what owner_instructions asks. Do only what owner_instructions asks.",
   "Your final answer is sent to the owner as a message: make it a short plain-text report.",
 ].join("\n");
+
+/**
+ * Break auto-linking in a report written by a webhook task that could read
+ * local files. A chat client that previews the first link would otherwise
+ * fetch an attacker's URL with file contents encoded in it. `https://x.example/?d=..`
+ * becomes `https[:]//x[.]example/?d=..`: still readable, never fetched.
+ */
+export function defangWebhookLinks(text: string): string {
+  return text.replace(/:\/\//g, "[:]//").replace(/([A-Za-z0-9-])\.(?=[A-Za-z]{2})/g, "$1[.]");
+}

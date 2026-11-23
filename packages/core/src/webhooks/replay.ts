@@ -26,5 +26,19 @@ export function webhookDedupeKey(
   if (source === "generic" && verified.signature) {
     return sha256Hex(`${hookId}:sig:${verified.signature}`);
   }
+  if (source === "sentry") {
+    // Sentry may sign re-serialised JSON, which verify accepts as a fallback.
+    // Key on that canonical form, so a whitespace edit of a captured delivery
+    // (which still verifies) is the same delivery, not a new one.
+    return sha256Hex(`${hookId}:json:${sha256Hex(canonicalJson(rawBody))}`);
+  }
   return sha256Hex(`${hookId}:${sha256Hex(rawBody)}`);
+}
+
+function canonicalJson(rawBody: Buffer): Buffer {
+  try {
+    return Buffer.from(JSON.stringify(JSON.parse(rawBody.toString("utf8"))), "utf8");
+  } catch {
+    return rawBody;
+  }
 }

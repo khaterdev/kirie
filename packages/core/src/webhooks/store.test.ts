@@ -84,6 +84,17 @@ describe("WebhookStore deliveries", () => {
     expect(store.claimDelivery({ ...at("2026-11-23T11:40:00.000Z"), dedupeKey: "a" }).claimed).toBe(true);
   });
 
+  it("replay keys outlive the delivery log (prune keeps them a year)", () => {
+    const now = new Date("2026-11-23T12:00:00.000Z");
+    store.claimDelivery({ ...at("2026-10-01T00:00:00.000Z"), dedupeKey: "old" });
+    expect(store.pruneDeliveries(30, now)).toBe(1);
+    expect(store.recentDeliveries({})).toHaveLength(0);
+    expect(store.claimDelivery({ ...at("2026-11-23T11:00:00.000Z"), dedupeKey: "old" }).claimed).toBe(false);
+    // After a year the key is dropped too.
+    store.pruneDeliveries(30, new Date("2027-10-02T00:00:00.000Z"));
+    expect(store.claimDelivery({ ...at("2027-10-02T00:00:00.000Z"), dedupeKey: "old" }).claimed).toBe(true);
+  });
+
   it("startup reconciliation marks accepted rows failed (at most once, never re-run)", () => {
     const a = store.claimDelivery({ ...at("2026-11-23T10:00:00.000Z"), dedupeKey: "k1" });
     const b = store.claimDelivery({ ...at("2026-11-23T10:00:00.000Z"), dedupeKey: "k2" });

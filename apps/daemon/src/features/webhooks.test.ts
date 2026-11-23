@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -157,6 +157,17 @@ describe("setupWebhooks", () => {
     handle = h;
     await h.start?.();
     expect(ingress.isListening()).toBe(true);
+  });
+
+  it("the task profile fails closed to the read-only allowlist when the hook database cannot be read", async () => {
+    const config = KirieConfigSchema.parse({ webhooks: { allowFullProfile: true } });
+    const ctx = context(config);
+    // dataDir is a regular file: opening webhooks.db under it throws.
+    const blocker = join(dir, "not-a-dir");
+    writeFileSync(blocker, "x");
+    handle = await setupWebhooks({ ...ctx, dataDir: blocker } as DaemonContext);
+    const task = { id: "t", meta: { origin: "webhook", profile: "webhook", data: { hookId: "x-00000000", toolProfile: "full" } } } as unknown as BackgroundTask;
+    expect(taskHooks.profileFor(task)?.toolAllowlist).toEqual(WEBHOOK_INVESTIGATE_TOOLS);
   });
 
   it("registers the webhook task profile: read-only allowlist unless full is allowed twice", async () => {
