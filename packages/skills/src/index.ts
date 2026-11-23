@@ -4,11 +4,14 @@ export type {
   SkillInstallSpec,
 } from "./types.js";
 export {
+  parseFrontmatter,
   parseSkillFile,
   scanSkillDirectory,
   isEligible,
   loadAllSkills,
 } from "./loader.js";
+export type { ParsedFrontmatter } from "./loader.js";
 export { SkillWorkspace } from "./workspace.js";
 export type { ScanResult } from "./scanner.js";
 export { scanCode, hasBlockingIssues } from "./scanner.js";
+export * from "./curator/index.js";

@@ -5,6 +5,40 @@ import { parse as parseYaml } from "yaml";
 import { binExists } from "@kirie/core";
 import type { SkillDefinition, SkillSource } from "./types.js";
 
+export interface ParsedFrontmatter {
+  /** The YAML mapping, or null when there is no frontmatter block or it does not parse to a mapping */
+  frontmatter: Record<string, unknown> | null;
+  /** Markdown after the frontmatter block (the whole text when there is no block), trimmed */
+  body: string;
+  /** Set when the block is missing or invalid */
+  error?: string;
+}
+
+/**
+ * Tolerant frontmatter parser for SKILL.md (curator, R4 item 4 B2). Accepts
+ * CRLF line endings, a UTF-8 BOM and a closing `---` with no trailing newline.
+ * Never throws: a missing block or bad YAML is reported in `error`.
+ * `parseSkillFile` keeps its stricter behaviour so the boot sync is unchanged.
+ */
+export function parseFrontmatter(raw: string): ParsedFrontmatter {
+  const text = raw.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+  const m = /^---[ \t]*\n(?:([\s\S]*?)\n)?---[ \t]*(?:\n|$)([\s\S]*)$/.exec(text);
+  if (!m) return { frontmatter: null, body: text.trim(), error: "no frontmatter block" };
+  const body = (m[2] ?? "").trim();
+  let data: unknown;
+  try {
+    data = parseYaml(m[1] ?? "");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.split("\n")[0] ?? "" : String(err);
+    return { frontmatter: null, body, error: `frontmatter YAML does not parse: ${msg.slice(0, 160)}` };
+  }
+  if (data === null || data === undefined) return { frontmatter: {}, body };
+  if (typeof data !== "object" || Array.isArray(data)) {
+    return { frontmatter: null, body, error: "frontmatter is not a YAML mapping" };
+  }
+  return { frontmatter: data as Record<string, unknown>, body };
+}
+
 /** Parse SKILL.md file: YAML frontmatter between --- delimiters + markdown body */
 export function parseSkillFile(
   content: string,
