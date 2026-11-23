@@ -52,7 +52,7 @@ function rewriteCaption(media: unknown, filter: ChannelOutboundFilter): unknown 
   return { ...(media as Record<string, unknown>), caption: filterText((media as { caption?: unknown }).caption, filter) };
 }
 
-/** Button rows: filter the visible label fields, never the callback data. */
+/** Button rows: filter the visible label fields and link urls, never the callback data. */
 function rewriteButtons(rows: unknown, filter: ChannelOutboundFilter): unknown {
   if (!Array.isArray(rows)) return rows;
   return rows.map((row: unknown) =>
@@ -62,6 +62,7 @@ function rewriteButtons(rows: unknown, filter: ChannelOutboundFilter): unknown {
           const out: Record<string, unknown> = { ...(button as Record<string, unknown>) };
           if (typeof out.label === "string") out.label = filterText(out.label, filter);
           if (typeof out.text === "string") out.text = filterText(out.text, filter);
+          if (typeof out.url === "string") out.url = filterText(out.url, filter);
           return out;
         })
       : row,
