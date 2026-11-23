@@ -89,6 +89,21 @@ describe("proposal intake", () => {
     expect((rec.payload as { content: string }).content).toBe("Likes tea");
   });
 
+  // LEARN-N11: intake strips the same invisible characters the user model does.
+  it.each([
+    ["U+2066 LRI", 0x2066], ["U+2067 RLI", 0x2067], ["U+2068 FSI", 0x2068], ["U+2069 PDI", 0x2069],
+    ["U+00AD soft hyphen", 0x00ad], ["U+061C Arabic letter mark", 0x061c], ["U+FE0F variation selector", 0xfe0f],
+    ["U+180E Mongolian vowel separator", 0x180e], ["U+034F combining grapheme joiner", 0x034f], ["U+3164 Hangul filler", 0x3164],
+    ["U+E0041 tag letter A", 0xe0041], ["U+200B zero width space", 0x200b], ["U+202E RLO", 0x202e],
+  ])("strips and flags %s at intake", (_label, cp) => {
+    const hidden = String.fromCodePoint(cp);
+    const id = idOf(intake.submit(mem({ title: `Remember${hidden} tea` }, { key: `owner:inv${cp}`, content: `Likes${hidden} tea` })));
+    const rec = store.get(id)!;
+    expect(rec.riskFlags).toContain("injection_pattern");
+    expect((rec.payload as { content: string }).content).toBe("Likes tea");
+    expect(rec.title).toBe("Remember tea");
+  });
+
   it("rejects an invalid skill name, a missing frontmatter and a name mismatch", () => {
     expect(intake.submit(skill("../evil"))).toEqual({ dropped: expect.stringContaining("invalid_payload") });
     expect(intake.submit(skill("tool", {}, "# no frontmatter"))).toEqual({ dropped: expect.stringContaining("invalid_skill") });

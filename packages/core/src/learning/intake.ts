@@ -19,6 +19,7 @@ import { SUSPICIOUS_INPUT_PATTERNS } from "../security/input-guard.js";
 import { scanCode } from "../security/code-scanner.js";
 import type { AuditTrail } from "../security/audit-trail.js";
 import { createModuleLogger } from "../logging/logger.js";
+import { stripInvisibleChars } from "./invisible-chars.js";
 import type { ProposalStore } from "./proposal-store.js";
 import type { SkillStateStore } from "./skill-state-store.js";
 import {
@@ -70,8 +71,6 @@ export type LearningAuditSink = Pick<AuditTrail, "record">;
 // Content checks (steps 1 to 5)
 // ---------------------------------------------------------------------------
 
-/** Invisible and bidi controls (R4 0.7 step 3). */
-const INVISIBLE_RE = /[​-‏‪-‮⁠-⁤﻿]/g;
 
 const EXTRA_INJECTION_PATTERNS: readonly RegExp[] = [
   /\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:the\s+|your\s+)?(?:previous|prior|above|earlier|preceding)\s+(?:instructions?|prompts?|rules?|messages?)/i,
@@ -169,7 +168,7 @@ export function checkProposalContent(
   let redactions = 0;
   const scrubber = getScrubber();
   const clean = (s: string): string => {
-    const stripped = s.replace(INVISIBLE_RE, "");
+    const stripped = stripInvisibleChars(s);
     if (stripped !== s) invisible = true;
     const r = scrubber.scrubWithCount(stripped, { sink: "proposal" });
     redactions += r.count;

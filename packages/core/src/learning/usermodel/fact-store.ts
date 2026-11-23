@@ -15,6 +15,7 @@
 
 import { sha256Hex } from "../proposal-types.js";
 import type { LearningDb } from "../learning-db.js";
+import { invisibleCharsRegex } from "../invisible-chars.js";
 
 export const USER_FACT_CATEGORIES = [
   "identity",
@@ -95,14 +96,11 @@ export function isUserFactCategory(value: unknown): value is UserFactCategory {
 // Text and vectors
 // ---------------------------------------------------------------------------
 
-// Zero-width, bidi controls and other invisible format characters.
-const INVISIBLE_RE = /[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ]/g;
-
 /** NFKC, invisible characters removed, angle brackets neutralised (the card is wrapped in a tag), whitespace collapsed. */
 export function normalizeUserFactStatement(text: string): string {
   return text
     .normalize("NFKC")
-    .replace(INVISIBLE_RE, "")
+    .replace(invisibleCharsRegex(), "")
     .replace(/</g, "‹")
     .replace(/>/g, "›")
     .replace(/\s+/g, " ")
