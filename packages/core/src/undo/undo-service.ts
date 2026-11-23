@@ -112,7 +112,7 @@ export interface UndoServiceDeps {
   recorder: Pick<UndoRecorder, "turnEpoch" | "liveBinding" | "isStreamActive">;
   config: () => UndoConfig;
   isEnabled: () => boolean;
-  /** pipeline.isBusy(key) || v2.isBusy(key) */
+  /** Turns only: pipeline.isBusy(key, { ignoreHolds: true }) || v2.isBusy(key). The undo holds the chat itself */
   isChatBusy: (sessionKey: string) => boolean;
   /** Null in v1 mode */
   v2: { getIdleQuery(sessionKey: string): Query | undefined; closeAndWait(sessionKey: string, timeoutMs?: number): Promise<void> } | null;

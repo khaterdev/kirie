@@ -13,6 +13,7 @@ import {
   effectiveSettingFlag,
   type HeartbeatTickEvent,
   type PromptAddendumContext,
+  type UndoScope,
 } from "@kirie/core";
 import type { FeatureSetup } from "./types.js";
 
@@ -30,6 +31,34 @@ export function renderUndoAddendum(enabled: boolean, p: PromptAddendumContext): 
     "If a system note says the owner ran /undo, your earlier edits to those files no longer exist: re-read a file before editing it again.",
     "</undo>",
   ].join("\n");
+}
+
+type UndoCommandService = Pick<UndoService, "preview" | "apply" | "list" | "resolveTaskId">;
+
+/**
+ * Wrap `preview` and `apply` so the chat is held (MessagePipeline.holdSession)
+ * for the whole dry run or rewind: no turn can start in the chat while the SDK
+ * rewinds its files. New messages wait and run after the release.
+ */
+export function holdUndoSessions(
+  service: UndoCommandService,
+  hold: (sessionKey: string) => () => void,
+  sessionKeyOf: (scope: UndoScope) => string | null,
+): UndoCommandService {
+  const withHold = async <R>(key: string | null, run: () => Promise<R>): Promise<R> => {
+    const release = key ? hold(key) : null;
+    try {
+      return await run();
+    } finally {
+      release?.();
+    }
+  };
+  return {
+    preview: (scope, turns) => withHold(sessionKeyOf(scope), () => service.preview(scope, turns)),
+    apply: (plan) => withHold(plan.sessionKey, () => service.apply(plan)),
+    list: (sessionKey, limit) => service.list(sessionKey, limit),
+    resolveTaskId: (idOrPrefix) => service.resolveTaskId(idOrPrefix),
+  };
 }
 
 /**
@@ -82,7 +111,8 @@ export const setupUndo: FeatureSetup = (ctx) => {
     recorder,
     config: () => ctx.config.undo,
     isEnabled,
-    isChatBusy: (sessionKey) => ctx.pipeline.isBusy(sessionKey) || v2.isBusy(sessionKey),
+    // Turns only: the undo's own session hold must not count as busy.
+    isChatBusy: (sessionKey) => ctx.pipeline.isBusy(sessionKey, { ignoreHolds: true }) || v2.isBusy(sessionKey),
     v2,
     taskStatus: (taskId) => ctx.backgroundTaskStore.get(taskId)?.status ?? null,
     runningTaskCount: (sessionKey) =>
@@ -96,9 +126,15 @@ export const setupUndo: FeatureSetup = (ctx) => {
     ...(timezone ? { timezone } : {}),
   });
 
+  const heldService = holdUndoSessions(
+    service,
+    (sessionKey) => ctx.pipeline.holdSession(sessionKey),
+    (scope) => (scope.kind === "chat" ? scope.sessionKey : store.taskSessionKey(scope.taskId)),
+  );
+
   ctx.commands.registerAll(
     createUndoCommands({
-      service,
+      service: heldService,
       config: () => ctx.config.undo,
       isEnabled,
       setEnabled,

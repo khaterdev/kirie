@@ -32,6 +32,9 @@ interface Harness {
   closeIdleSessions: ReturnType<typeof vi.fn>;
   audit: ReturnType<typeof vi.fn>;
   rewindFiles: ReturnType<typeof vi.fn>;
+  /** Session keys currently held through pipeline.holdSession */
+  held: string[];
+  holdSession: ReturnType<typeof vi.fn>;
 }
 
 function harness(dataDir: string, opts: { v2?: boolean; config?: Record<string, unknown> } = {}): Harness {
@@ -43,7 +46,22 @@ function harness(dataDir: string, opts: { v2?: boolean; config?: Record<string, 
   const requestApproval = vi.fn(async () => ({ outcome: "approved", optionId: "approve", code: "K7Q2" }));
   const closeIdleSessions = vi.fn(() => 0);
   const audit = vi.fn();
-  const rewindFiles = vi.fn(async () => ({ canRewind: true, filesChanged: [join(dataDir, "a.txt")], insertions: 1, deletions: 1 }));
+  const held: string[] = [];
+  const holdSession = vi.fn((key: string) => {
+    held.push(key);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      held.splice(held.indexOf(key), 1);
+    };
+  });
+  const heldDuringRewind: string[][] = [];
+  const rewindFiles = vi.fn(async () => {
+    heldDuringRewind.push([...held]);
+    return { canRewind: true, filesChanged: [join(dataDir, "a.txt")], insertions: 1, deletions: 1 };
+  });
+  Object.assign(rewindFiles, { heldDuringRewind });
   const liveQuery = { rewindFiles, close: vi.fn() };
   const v2 = {
     isBusy: () => false,
@@ -63,14 +81,14 @@ function harness(dataDir: string, opts: { v2?: boolean; config?: Record<string, 
     sdkOptions,
     turnContext: { get: () => ({ origin: "owner_message", startedAt: 0, textPreview: "write a.txt" }) },
     promptAddenda: new PromptAddenda(),
-    pipeline: { isBusy: () => false, addNextTurnNote },
+    pipeline: { isBusy: () => false, addNextTurnNote, holdSession },
     heartbeat,
     backgroundTaskStore: { get: () => null, list: () => [] },
     sessionStore: { get: () => "sid-1" },
     chatHistoryStore: { append: historyAppend },
     v2Sessions: opts.v2 === false ? null : v2,
   } as unknown as DaemonContext;
-  return { ctx, sdkOptions, heartbeat, addNextTurnNote, historyAppend, requestApproval, closeIdleSessions, audit, rewindFiles };
+  return { ctx, sdkOptions, heartbeat, addNextTurnNote, historyAppend, requestApproval, closeIdleSessions, audit, rewindFiles, held, holdSession };
 }
 
 async function send(ctx: DaemonContext, text: string, senderId = OWNER): Promise<string[]> {
@@ -177,6 +195,40 @@ describe("setupUndo", () => {
 
     const [again] = await send(h.ctx, "/undo");
     expect(again).toContain("No turn with file edits");
+  });
+
+  it("holds the chat for the dry run and for the rewind, and releases it after each", async () => {
+    const h = harness(dataDir);
+    handle = await setupUndo(h.ctx);
+    await handle.start?.();
+    await send(h.ctx, "/undo on");
+    runTurn(h, dataDir, "u-1");
+
+    let heldWhileAsking: string[] = [];
+    h.requestApproval.mockImplementation(async () => {
+      heldWhileAsking = [...h.held];
+      return { outcome: "approved", optionId: "approve", code: "K7Q2" };
+    });
+    const [reply] = await send(h.ctx, "/undo");
+    expect(reply).toContain("Undone.");
+    const during = (h.rewindFiles as unknown as { heldDuringRewind: string[][] }).heldDuringRewind;
+    expect(during).toEqual([[KEY], [KEY]]);
+    expect(heldWhileAsking).toEqual([]);
+    expect(h.holdSession).toHaveBeenCalledTimes(2);
+    expect(h.held).toEqual([]);
+  });
+
+  it("releases the hold when the rewind throws", async () => {
+    const h = harness(dataDir);
+    handle = await setupUndo(h.ctx);
+    await handle.start?.();
+    await send(h.ctx, "/undo on");
+    runTurn(h, dataDir, "u-1");
+    h.rewindFiles.mockImplementation(async () => { throw new Error("Failed to rewind"); });
+    const [reply] = await send(h.ctx, "/undo");
+    expect(reply).toMatch(/cannot undo/i);
+    expect(h.holdSession).toHaveBeenCalled();
+    expect(h.held).toEqual([]);
   });
 
   it("a stranger cannot run /undo", async () => {

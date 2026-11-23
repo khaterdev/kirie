@@ -212,6 +212,12 @@ export class MessagePipeline {
   private readonly turnCompleteListeners = new Set<(ev: TurnCompleteEvent) => void>();
   private readonly turnErrorListeners = new Set<(ev: TurnErrorEvent) => void>();
   private messageTransform: MessageTransform | null = null;
+  /** Active session holds (holdSession), per session key */
+  private readonly holds = new Map<string, Set<symbol>>();
+  /** Messages waiting for a hold to be released, per session key */
+  private readonly holdWaiters = new Map<string, Array<() => void>>();
+  /** A hold that is never released expires after this long, so a crashed holder cannot block a chat */
+  static readonly DEFAULT_HOLD_TIMEOUT_MS = 120_000;
 
   constructor(config: MessagePipelineConfig) {
     this.config = config;
@@ -229,13 +235,76 @@ export class MessagePipeline {
 
   // ── Extension points (PLAN B.14) ──────────────────────────────────────────
 
-  /** A running query or queued lane work (or a message being prepared) for this session. */
-  isBusy(sessionKey: string): boolean {
+  /**
+   * A running query or queued lane work (or a message being prepared, or a
+   * session hold) for this session. `ignoreHolds` answers for turns only: the
+   * holder itself uses it to check that no turn is running.
+   */
+  isBusy(sessionKey: string, opts?: { ignoreHolds?: boolean }): boolean {
+    if (!opts?.ignoreHolds && this.isHeld(sessionKey)) return true;
     return (
       this.runningQueries.has(sessionKey) ||
       this.laneQueue.isBusy(sessionKey) ||
       (this.preparing.get(sessionKey) ?? 0) > 0
     );
+  }
+
+  /**
+   * Hold a session: while held it counts as busy, injected messages with
+   * skipIfBusy return "busy", and any other new message for it waits before
+   * it is prepared or queued, then runs in order once the last hold is
+   * released. Commands still run. The returned release is idempotent; a hold
+   * that is not released expires after `timeoutMs` (default 120 s).
+   */
+  holdSession(sessionKey: string, opts?: { timeoutMs?: number }): () => void {
+    const token = Symbol("hold");
+    let set = this.holds.get(sessionKey);
+    if (!set) {
+      set = new Set();
+      this.holds.set(sessionKey, set);
+    }
+    set.add(token);
+    let released = false;
+    const timeoutMs = opts?.timeoutMs ?? MessagePipeline.DEFAULT_HOLD_TIMEOUT_MS;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      clearTimeout(timer);
+      const current = this.holds.get(sessionKey);
+      if (!current) return;
+      current.delete(token);
+      if (current.size > 0) return;
+      this.holds.delete(sessionKey);
+      this.wakeHoldWaiters(sessionKey);
+    };
+    const timer = setTimeout(() => {
+      if (released) return;
+      log.warn({ sessionKey, timeoutMs }, "session hold expired without release");
+      release();
+    }, timeoutMs);
+    timer.unref?.();
+    return release;
+  }
+
+  private isHeld(sessionKey: string): boolean {
+    return (this.holds.get(sessionKey)?.size ?? 0) > 0;
+  }
+
+  private wakeHoldWaiters(sessionKey: string): void {
+    const waiters = this.holdWaiters.get(sessionKey);
+    if (!waiters) return;
+    this.holdWaiters.delete(sessionKey);
+    for (const wake of waiters) wake();
+  }
+
+  /** Resolves at once when the session is not held, else when the last hold is released or the pipeline stops. */
+  private waitForHold(sessionKey: string): Promise<void> {
+    if (!this.isHeld(sessionKey)) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const list = this.holdWaiters.get(sessionKey) ?? [];
+      list.push(resolve);
+      this.holdWaiters.set(sessionKey, list);
+    });
   }
 
   /** A one-shot `<system_note>` prefixed to the next executed message of this session. */
@@ -423,6 +492,8 @@ export class MessagePipeline {
    */
   async stop(): Promise<void> {
     this.started = false;
+    // Wake messages waiting on a session hold; they see the pipeline stopped and end.
+    for (const key of [...this.holdWaiters.keys()]) this.wakeHoldWaiters(key);
     // Abort running agents and reject all pending queue items.
     this.abortAll();
     // Wait for in-flight handlers to settle before stores are closed.
@@ -495,6 +566,14 @@ export class MessagePipeline {
     }
 
     const earlyKey = sessionKeyOf(message);
+    // A held session (holdSession) makes new turns wait until it is released.
+    // The wait is before "preparing", so the holder's own turn-only busy check
+    // (isBusy with ignoreHolds) does not see the waiting message.
+    if (this.isHeld(earlyKey)) {
+      log.info({ messageId, sessionKey: earlyKey }, "session held, message waits for release");
+      await this.waitForHold(earlyKey);
+      if (!this.started) return { status: "error" };
+    }
     this.preparing.set(earlyKey, (this.preparing.get(earlyKey) ?? 0) + 1);
     let preparingReleased = false;
     const releasePreparing = () => {
