@@ -46,6 +46,12 @@ export interface PromptConfig {
   timezone?: string;
   /** Feature prompt additions (PLAN B.10 seam 7), appended at the end of the prompt */
   addenda?: PromptAddendaRenderer;
+  /**
+   * `learning.memoryPolicy`. "direct" (default) keeps the memory rules that
+   * tell the agent to save on its own initiative; "propose" replaces them with
+   * rules that file learning_propose proposals instead.
+   */
+  memoryPolicy?: "direct" | "propose";
 }
 
 /**
@@ -390,6 +396,51 @@ chat_history_recent, or chat_history_search. Do NOT invent or guess session keys
 </self_learning_rules>`;
 
 /**
+ * Memory rules that tell the agent to save on its own initiative, and what
+ * replaces each under `learning.memoryPolicy: "propose"`. Each `from` is an
+ * exact slice of SELF_LEARNING_RULES; the "direct" prompt is never modified.
+ */
+export const MEMORY_PROPOSE_REPLACEMENTS: ReadonlyArray<{ from: string; to: string }> = [
+  {
+    from: "Your searchable permanent knowledge base. **Save things here aggressively and often.**",
+    to: "Your searchable permanent knowledge base. **Memory policy is \"propose\": you write here only when the owner explicitly asks in the current conversation.**",
+  },
+  {
+    from: SELF_LEARNING_RULES.slice(
+      SELF_LEARNING_RULES.indexOf("**WHAT TO SAVE"),
+      SELF_LEARNING_RULES.indexOf("\n\n**HOW TO SAVE:**"),
+    ),
+    to: [
+      "**WHAT TO DO WITH THINGS WORTH KEEPING (memory policy \"propose\"):**",
+      "- Save to the memory DB, MEMORY.md or daily notes directly only when the owner explicitly asks in the current conversation (\"remember this\", \"note that\").",
+      "- Anything else worth keeping (preferences, people, projects, decisions, solved problems): file it with learning_propose (kind memory, or memory_md for a MEMORY.md line). The owner reviews it with /proposals; nothing is stored until they approve.",
+      "- Do not save conversation summaries or periodic flushes on your own initiative. Propose the few facts that matter instead, at natural breakpoints.",
+    ].join("\n"),
+  },
+  {
+    from: "- Use daily_note_append to log notable events, decisions, and discoveries AS THEY HAPPEN throughout each day",
+    to: "- Use daily_note_append only when the owner asks you to note something (memory policy \"propose\"); otherwise propose it with learning_propose",
+  },
+  {
+    from: "- Proactively record: conversations had, tasks completed, decisions made, things learned, problems solved\n",
+    to: "",
+  },
+  {
+    from: "\n- Log a daily note entry for every significant conversation or event — don't wait to be asked",
+    to: "",
+  },
+];
+
+/** The self-learning rules for a data dir and memory policy. "direct" is the unmodified text. */
+export function renderSelfLearningRules(dataDir: string, memoryPolicy: "direct" | "propose" = "direct"): string {
+  let rules = SELF_LEARNING_RULES;
+  if (memoryPolicy === "propose") {
+    for (const { from, to } of MEMORY_PROPOSE_REPLACEMENTS) rules = rules.replace(from, to);
+  }
+  return rules.replace("{dataDir}", dataDir);
+}
+
+/**
  * Builds the appended system prompt section that gives the agent
  * awareness of its identity, the channel, and the sender.
  */
@@ -497,7 +548,7 @@ function buildAppendedPrompt(
     }
 
     lines.push("");
-    lines.push(SELF_LEARNING_RULES.replace("{dataDir}", config.dataDir));
+    lines.push(renderSelfLearningRules(config.dataDir, config.memoryPolicy));
   }
 
   return appendPromptAddenda(lines.join("\n"), config.addenda, {
@@ -617,7 +668,7 @@ export function buildBackgroundTaskSystemPrompt(config: PromptConfig): string {
     }
 
     lines.push("");
-    lines.push(SELF_LEARNING_RULES.replace("{dataDir}", config.dataDir));
+    lines.push(renderSelfLearningRules(config.dataDir, config.memoryPolicy));
   }
 
   return appendPromptAddenda(lines.join("\n"), config.addenda, { kind: "background", ownerDm: false });

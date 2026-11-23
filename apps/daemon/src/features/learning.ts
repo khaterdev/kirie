@@ -12,7 +12,6 @@ import {
   type LearningMemoryTarget,
   type LearningSystem,
   type MemoryManagerLike,
-  type PromptAddendumContext,
 } from "@kirie/core";
 import type { DaemonContext, FeatureSetup } from "./types.js";
 
@@ -43,18 +42,6 @@ export function getLearningSystem(ctx: DaemonContext): LearningSystem | null {
 /** Ticks are 10 s apart: reflection idle check and digest once a minute, expiry hourly. */
 const MINUTE_TICKS = 6;
 const HOUR_TICKS = 360;
-
-export const MEMORY_PROPOSE_ADDENDUM = [
-  "<learning_memory_policy>",
-  "Memory policy is \"propose\". This overrides the memory rules above that tell you to save on your own initiative:",
-  "- Save to the memory DB, daily notes or MEMORY.md directly only when the owner explicitly asks in this conversation.",
-  "- Anything else you would like to remember: file it with learning_propose (kind memory, or memory_md for a MEMORY.md line). The owner reviews it with /proposals.",
-  "</learning_memory_policy>",
-].join("\n");
-
-export function renderLearningAddendum(memoryPolicy: "direct" | "propose", _ctx: PromptAddendumContext): string | null {
-  return memoryPolicy === "propose" ? MEMORY_PROPOSE_ADDENDUM : null;
-}
 
 type MemoryManagerWithDelete = MemoryManagerLike & { delete?(key: string): boolean; list?(tag?: string, limit?: number): Array<{ key: string }> };
 
@@ -123,7 +110,7 @@ export const setupLearning: FeatureSetup = (ctx) => {
   const unsubscribeTurns = ctx.pipeline.onTurnComplete(system.onTurnComplete);
   ctx.ownerPrompts.onAction(PROPOSAL_ACTION_NS, system.actionHandler);
   ctx.commands.registerAll(system.commands);
-  ctx.promptAddenda.register("learning", (p) => renderLearningAddendum(cfg.memoryPolicy, p));
+  // learning.memoryPolicy "propose" is applied by the prompt builder (lifecycle passes it in PromptConfig).
   // The stdio subprocess's learning_propose reads these (no secrets in either).
   ctx.kirieToolsEnv[LEARNING_TOOLS_ENV.config] = JSON.stringify(cfg);
   ctx.kirieToolsEnv[LEARNING_TOOLS_ENV.skillsRoot] = system.skillsRoot;

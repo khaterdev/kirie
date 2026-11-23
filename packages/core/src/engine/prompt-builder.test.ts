@@ -2,10 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import {
   buildPrompt,
   buildBackgroundTaskSystemPrompt,
   DEFAULT_SYSTEM_PROMPT,
+  MEMORY_PROPOSE_REPLACEMENTS,
+  renderSelfLearningRules,
   type ChannelContext,
   type SenderIdentity,
   type PromptConfig,
@@ -422,5 +425,56 @@ describe("learning prompt rules (PLAN C.3, DECISIONS 4)", () => {
   it("keeps the direct memory DB rules (memoryPolicy direct is the default)", () => {
     const [chat] = prompts();
     expect(chat).toContain("Save things here aggressively and often");
+  });
+});
+
+describe("learning.memoryPolicy in the prompt (item 5)", () => {
+  let tmpDir: string;
+  beforeEach(() => { tmpDir = mkdtempSync(join(tmpdir(), "kirie-test-memory-policy-")); });
+  afterEach(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  function prompts(memoryPolicy?: "direct" | "propose"): string[] {
+    const config = { ...baseConfig, dataDir: tmpDir, ...(memoryPolicy ? { memoryPolicy } : {}) };
+    const chat = buildPrompt({ config, channel: dmChannel, sender: ownerSender });
+    const background = buildBackgroundTaskSystemPrompt(config);
+    // The clock line is the only part that changes between two builds.
+    return [chat.systemPrompt.append, background].map((t) => t.replace(/<current_time>[^<]*<\/current_time>/g, ""));
+  }
+
+  it("direct is byte-identical to the rules before memoryPolicy existed", () => {
+    // sha256 of SELF_LEARNING_RULES with dataDir "/DATA", taken from the source before this change.
+    const hash = createHash("sha256").update(renderSelfLearningRules("/DATA", "direct")).digest("hex");
+    expect(hash).toBe("61b9e1940a8a29f06f669ac4f9b0fd2345396d4c5dd37ca756a3aba2c79cf828");
+    expect(renderSelfLearningRules("/DATA")).toBe(renderSelfLearningRules("/DATA", "direct"));
+  });
+
+  it("an unset memoryPolicy and \"direct\" build the same chat and background prompts", () => {
+    expect(prompts("direct")).toEqual(prompts());
+  });
+
+  it("every replaced slice exists exactly once in the direct rules", () => {
+    const direct = renderSelfLearningRules("/DATA", "direct");
+    for (const { from } of MEMORY_PROPOSE_REPLACEMENTS) {
+      expect(from.length).toBeGreaterThan(20);
+      expect(direct.split(from)).toHaveLength(2);
+    }
+  });
+
+  it("propose replaces the save-on-your-own rules in the chat and background prompts", () => {
+    for (const text of prompts("propose")) {
+      expect(text).not.toContain("Save things here aggressively and often");
+      expect(text).not.toContain("WHAT TO SAVE");
+      expect(text).not.toContain("Save AS YOU GO");
+      expect(text).not.toContain("Proactive flush");
+      expect(text).not.toContain("Proactively record");
+      expect(text).not.toContain("Log a daily note entry for every significant conversation");
+      expect(text).toContain("Memory policy is \"propose\"");
+      expect(text).toContain("file it with learning_propose (kind memory, or memory_md for a MEMORY.md line)");
+      expect(text).toContain("Use daily_note_append only when the owner asks you to note something");
+      // The rest of the rules are untouched.
+      expect(text).toContain("**HOW TO SAVE:**");
+      expect(text).toContain("CRITICAL RULE — NEVER say");
+      expect(text).toContain("Never edit SOUL.md, TOOLS.md or any skill on your own initiative");
+    }
   });
 });

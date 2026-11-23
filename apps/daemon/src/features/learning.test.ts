@@ -18,7 +18,7 @@ import {
   type TurnCompleteEvent,
 } from "@kirie/core";
 import type { DaemonContext } from "./types.js";
-import { MEMORY_PROPOSE_ADDENDUM, getLearningSystem, setupLearning } from "./learning.js";
+import { getLearningSystem, setupLearning } from "./learning.js";
 
 const OWNER = "1001";
 let dir: string;
@@ -99,11 +99,13 @@ describe("learning feature", () => {
     await handle.stop?.();
   });
 
-  it("the memoryPolicy propose variant adds the override addendum", async () => {
-    const ctx = context({ memoryPolicy: "propose" });
-    const handle = await setupLearning(ctx);
-    expect(ctx.promptAddenda.render({ kind: "chat", ownerDm: true })).toContain(MEMORY_PROPOSE_ADDENDUM);
-    await handle.stop?.();
+  it("adds no prompt addendum for either memoryPolicy (the prompt builder applies \"propose\")", async () => {
+    for (const memoryPolicy of ["direct", "propose"] as const) {
+      const ctx = context({ memoryPolicy });
+      const handle = await setupLearning(ctx);
+      expect(ctx.promptAddenda.render({ kind: "chat", ownerDm: true })).toBe("");
+      await handle.stop?.();
+    }
   });
 
   it("the guard denies a background task's skill write through the SDK options", async () => {

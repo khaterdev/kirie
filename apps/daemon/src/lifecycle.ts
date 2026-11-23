@@ -567,6 +567,7 @@ export async function startDaemon(): Promise<void> {
       dataDir,
       timezone: config.proactive?.activeHours?.timezone,
       addenda: promptAddenda,
+      memoryPolicy: config.learning.memoryPolicy,
     },
     cwd: config.agent.workspace || dataDir,
     allowedTools,
@@ -1061,6 +1062,7 @@ export async function startDaemon(): Promise<void> {
     model: config.agent.model,
     dataDir,
     timezone: config.proactive?.activeHours?.timezone,
+    memoryPolicy: config.learning.memoryPolicy,
   });
 
   const backgroundTaskManager = new BackgroundTaskManager(backgroundTaskStore, {
