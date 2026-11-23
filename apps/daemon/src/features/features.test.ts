@@ -85,9 +85,10 @@ describe("FEATURES", () => {
     const started = await startFeatures(handles);
     expect(started).toHaveLength(FEATURES.length);
     // Only core-commands registers commands and an addendum; only scrubbing sets an env key.
-    expect(ctx.commands.list()).toHaveLength(14);
+    // Filled-in features are checked in their own tests (secrets: features/secrets.test.ts).
+    expect(ctx.commands.list().filter((c) => c.name !== "secrets")).toHaveLength(14);
     expect(ctx.promptAddenda.names()).toEqual(["commands"]);
-    expect(Object.keys(ctx.kirieToolsEnv)).toEqual(["KIRIE_SCRUB_CONFIG"]);
+    expect(Object.keys(ctx.kirieToolsEnv).filter((k) => k !== "KIRIE_SECRETS_SCAN_TOOL")).toEqual(["KIRIE_SCRUB_CONFIG"]);
     expect(ctx.internalApi.apps()).toEqual([]);
     expect(ctx.notifyOwner).not.toHaveBeenCalled();
     await stopFeatures(started);
