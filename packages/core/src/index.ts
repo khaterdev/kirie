@@ -75,6 +75,7 @@ export * from "./ingress/index.js";
 export * from "./mcp/server.js";
 export * from "./mcp/feature-tools.js";
 export { MemoryStore, type MemoryManagerLike } from "./mcp/tools/memory.js";
+export { ScheduleStore } from "./mcp/tools/schedule.js";
 export * from "./auto-reply/auto-reply.js";
 export { registerBuiltinCommands } from "./auto-reply/commands.js";
 // Command registry, owner identity and prompts, runtime settings, audit trail (PLAN B.4 to B.6)

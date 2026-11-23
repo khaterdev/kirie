@@ -24,7 +24,7 @@ export interface CoreCommandDeps {
     abortAll(): number;
     clearSession(sessionKey: string): void;
   };
-  backgroundTaskManager?: { cancelAll(): Promise<number> };
+  backgroundTaskManager?: { cancelAll(): number | Promise<number> };
   onRestart?: () => void;
   chatHistoryStore?: { messageCount(sessionKey: string): number };
   usageDashboard?: Pick<UsageDashboard, "getSummary" | "getTopSessions">;

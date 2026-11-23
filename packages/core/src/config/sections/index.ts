@@ -16,3 +16,4 @@ export * from "./undo.js";
 export * from "./computer-use.js";
 export * from "./voice.js";
 export * from "./plugins.js";
+export * from "./effective.js";
