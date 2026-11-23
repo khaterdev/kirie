@@ -206,15 +206,17 @@ describe("drift detector", () => {
     expect(overridden.propose.map((d) => d.name)).toEqual(["weather"]);
   });
 
-  it("auto-adopts a drift within two minutes of an owner-turn direct write, not later", () => {
+  // LEARN-B2: a modification time next to an owner-turn write explains nothing; the owner decides.
+  it("never auto-adopts; a drift near a recorded owner-turn write gets a hint, not an approval", () => {
     const d = tree.write("notes", { "SKILL.md": skillMd("notes", "edited") });
     const mtime = new Date("2026-11-23T10:00:00.000Z");
     utimesSync(join(d, "SKILL.md"), mtime, mtime);
     const s = snap("notes", { state: { approvedHash: sha256Text(skillMd("notes")) } });
     const near = detectDrift([s], { directWrites: [{ skill: "notes", atMs: mtime.getTime() + 60_000 }] });
-    expect(near.autoAdopt.map((x) => x.name)).toEqual(["notes"]);
-    expect(near.propose).toEqual([]);
-    const far = detectDrift([s], { directWrites: [{ skill: "notes", atMs: mtime.getTime() + 10 * 60_000 }, { skill: "other", atMs: mtime.getTime() }] });
-    expect(far.propose.map((x) => x.name)).toEqual(["notes"]);
+    expect(near).not.toHaveProperty("autoAdopt");
+    expect(near.propose).toEqual([{ name: "notes", currentHash: sha256Text(skillMd("notes", "edited")), approvedHash: sha256Text(skillMd("notes")), directWriteAtMs: mtime.getTime() + 60_000 }]);
+    expect(near.findings[0]).toMatchObject({ detector: "drift", severity: "warn" });
+    const none = detectDrift([s], { directWrites: [{ skill: "other", atMs: mtime.getTime() }] });
+    expect(none.propose[0]).not.toHaveProperty("directWriteAtMs");
   });
 });

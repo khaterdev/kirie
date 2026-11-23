@@ -29,7 +29,7 @@ function seed(): void {
     counts: { skills: 2, broken: 1, duplicates: 0, stale: 0, drift: 0, proposals: 1 },
     findings: [{ skill: "notes", root: "project", detector: "B6", category: "broken", severity: "warn", message: "References missing files: scripts/x.sh.", data: { missing: ["scripts/x.sh"] } }],
     proposals: [{ id: 3, kind: "skill.archive", skill: "old", title: "Archive skill old" }],
-    dropped: [], staleMarked: [], possibleDuplicates: [], autoAdopted: [], llm: { calls: 0, costUsd: 0, errors: 0 }, errors: [],
+    dropped: [], staleMarked: [], possibleDuplicates: [], llm: { calls: 0, costUsd: 0, errors: 0 }, errors: [],
   };
   runs.finish(id, report);
   db.close();

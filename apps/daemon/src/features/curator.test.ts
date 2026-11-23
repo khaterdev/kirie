@@ -182,13 +182,30 @@ describe("curator feature", () => {
   });
 
   it("reports a skill with no frontmatter as broken and proposes a fix instead of crashing", async () => {
+    // Present at the first inventory, so it is part of the approved baseline.
+    mkdirSync(join(skillsDir(), "remotion"), { recursive: true });
+    writeFileSync(join(skillsDir(), "remotion", "SKILL.md"), "# Remotion\n\nRender videos with React.\n");
+    const b = await boot();
+    try {
+      const run = await say(b.ctx, "/curator run");
+      expect(run.reply).toMatch(/#\d+ fix remotion/);
+      expect((await say(b.ctx, "/curator list broken")).reply).toContain("remotion · B2");
+      expect(readFileSync(join(skillsDir(), "remotion", "SKILL.md"), "utf8")).toBe("# Remotion\n\nRender videos with React.\n");
+    } finally {
+      await shutdown(b);
+    }
+  });
+
+  // LEARN-B1: a skill that appears later is unapproved content: an adopt card, never a one-tap fix.
+  it("a skill without frontmatter that appears after the baseline gets an untrusted adopt, not a fix", async () => {
     const b = await boot();
     try {
       mkdirSync(join(skillsDir(), "remotion"));
       writeFileSync(join(skillsDir(), "remotion", "SKILL.md"), "# Remotion\n\nRender videos with React.\n");
       const run = await say(b.ctx, "/curator run");
-      expect(run.reply).toMatch(/#\d+ fix remotion/);
-      expect((await say(b.ctx, "/curator list broken")).reply).toContain("remotion · B2");
+      expect(run.reply).not.toMatch(/fix remotion/);
+      const pending = getLearningSystem(b.ctx)!.store.list({ status: "pending" }).filter((p) => JSON.stringify(p.payload).includes("remotion"));
+      expect(pending.map((p) => `${p.kind}:${p.trust}`)).toEqual(["skill.adopt:untrusted"]);
       expect(readFileSync(join(skillsDir(), "remotion", "SKILL.md"), "utf8")).toBe("# Remotion\n\nRender videos with React.\n");
     } finally {
       await shutdown(b);

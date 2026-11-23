@@ -90,7 +90,6 @@ export function renderCuratorRunSummary(report: CuratorReport): string {
     lines.push(`Possible duplicates (report only): ${report.possibleDuplicates.slice(0, 5).map((g) => g.join(" + ")).join("; ")}. /curator run merge asks the model for a merge.`);
   }
   if (report.staleMarked.length > 0) lines.push(`Marked stale: ${report.staleMarked.slice(0, 10).join(", ")}.`);
-  if (report.autoAdopted.length > 0) lines.push(`Recorded your own edits as approved: ${report.autoAdopted.slice(0, 10).join(", ")}.`);
   const dropped = report.dropped.filter((d) => d.reason !== "previously_rejected");
   if (dropped.length > 0) lines.push(`Not filed: ${dropped.slice(0, 5).map((d) => `${d.skill} (${d.reason})`).join(", ")}.`);
   if (report.llm.calls > 0) lines.push(`Merge pass: ${plural(report.llm.calls, "model call")}, $${report.llm.costUsd.toFixed(3)}.`);

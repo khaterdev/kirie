@@ -32,7 +32,7 @@ import {
   sha256Hex,
   type MemoryMdAppendPayload,
 } from "./proposal-types.js";
-import type { SkillStateStore } from "./skill-state-store.js";
+import type { SkillStateRecord, SkillStateStore } from "./skill-state-store.js";
 import { diffStats, unifiedLineDiff } from "./text-diff.js";
 
 /** What the memory kinds need from the memory system. */
@@ -314,6 +314,20 @@ export function createSkillCreateHandler(deps: LearningKindHandlerDeps): Proposa
   };
 }
 
+/**
+ * The content a patch or fix starts from must be content the owner approved
+ * (or a bundled skill as shipped). Otherwise applying it would activate and
+ * record as approved text the owner only saw as diff context (LEARN-B1). A
+ * skill with no state row is of unknown provenance and is refused too.
+ */
+function baseIsApproved(row: SkillStateRecord | null, baseHash: string): boolean {
+  if (!row) return false;
+  if (row.source === "bundled" && !row.override) return true;
+  return row.approvedHash === baseHash;
+}
+
+const UNAPPROVED_BASE_TEXT = "has content you have not approved (it changed outside an approved change or appeared on its own). Approve or revert that change first: /curator run files the card";
+
 function createSkillPatchLikeHandler(deps: LearningKindHandlerDeps, schema: typeof SkillPatchPayloadSchema | typeof SkillFixPayloadSchema): ProposalKindHandler {
   return {
     async apply(raw, ctx) {
@@ -325,21 +339,18 @@ function createSkillPatchLikeHandler(deps: LearningKindHandlerDeps, schema: type
       const current = readIfExists(file);
       if (current === null) throw new ProposalApplyError("stale", `skill "${p.name}" no longer exists`);
       if (sha256Hex(current) !== p.baseHash) throw new ProposalApplyError("stale", `skill "${p.name}" changed since the proposal was made`);
+      const row = deps.skillState.get("project", p.name);
+      if (!row || !baseIsApproved(row, p.baseHash)) throw new ProposalApplyError("stale", `skill "${p.name}" ${UNAPPROVED_BASE_TEXT}`);
       const backupFile = join(ctx.backupDir, "SKILL.md");
       copyFileSync(file, backupFile);
       writeFileAtomic(file, p.newSkillMd);
       const hash = sha256Hex(p.newSkillMd);
       const at = (deps.now?.() ?? new Date()).toISOString();
-      const row = deps.skillState.get("project", p.name);
       let overrideSet = false;
-      if (row) {
-        deps.skillState.setApprovedHash("project", p.name, hash, at);
-        if (row.source === "bundled" && !row.override) {
-          deps.skillState.setOverride("project", p.name, true);
-          overrideSet = true;
-        }
-      } else {
-        deps.skillState.insert({ name: p.name, root: "project", source: "local", approvedHash: hash, approvedAt: at });
+      deps.skillState.setApprovedHash("project", p.name, hash, at);
+      if (row.source === "bundled" && !row.override) {
+        deps.skillState.setOverride("project", p.name, true);
+        overrideSet = true;
       }
       return {
         skill: p.name, file, backupFile, previousHash: p.baseHash, hash, overrideSet,
@@ -375,6 +386,9 @@ function createSkillPatchLikeHandler(deps: LearningKindHandlerDeps, schema: type
         lines.push("(the skill no longer exists)", "", p.newSkillMd);
       } else {
         if (sha256Hex(current) !== p.baseHash) lines.push("Warning: the skill changed since this was proposed; applying will fail as stale.");
+        else if (!baseIsApproved(deps.skillState.get("project", p.name), p.baseHash)) {
+          lines.push(`Warning: the current SKILL.md is not approved. This skill ${UNAPPROVED_BASE_TEXT}; until then this cannot be applied.`);
+        }
         const st = diffStats(current, p.newSkillMd);
         lines.push(`Diff: +${st.added} -${st.removed} lines`, "", unifiedLineDiff(current, p.newSkillMd));
       }

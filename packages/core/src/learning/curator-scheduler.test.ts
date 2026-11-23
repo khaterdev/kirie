@@ -118,7 +118,7 @@ describe("CuratorRunStore", () => {
       counts: { skills: 2, broken: 1, duplicates: 0, stale: 0, drift: 0, proposals: 1 },
       findings: [{ skill: "x", root: "project", detector: "B1", category: "broken", severity: "error", message: "no SKILL.md" }],
       proposals: [{ id: 4, kind: "skill.archive", skill: "x", title: "Archive x" }],
-      dropped: [], staleMarked: [], possibleDuplicates: [], autoAdopted: [], llm: { calls: 0, costUsd: 0, errors: 0 }, errors: [],
+      dropped: [], staleMarked: [], possibleDuplicates: [], llm: { calls: 0, costUsd: 0, errors: 0 }, errors: [],
     } satisfies CuratorReport;
     runs.finish(id, report);
     const last = runs.last()!;

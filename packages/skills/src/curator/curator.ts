@@ -480,18 +480,11 @@ export class SkillCurator {
     const drift = detectDrift(snaps, { directWrites });
     findings.push(...drift.findings);
 
-    // Bookkeeping: stale state, drift explained by an owner-turn edit.
+    // Bookkeeping: stale state. Drift is never adopted here (LEARN-B2): every drift is an adopt-or-revert card.
     for (const name of stale.markStale) {
       if (this.deps.skillState.setState("project", name, "stale")) report.staleMarked.push(name);
     }
     const byName = new Map(project.map((s) => [s.name, s]));
-    for (const d of drift.autoAdopt) {
-      const snap = byName.get(d.name);
-      this.deps.skillState.setApprovedHash("project", d.name, d.currentHash, started.toISOString());
-      if (snap?.raw && SKILL_NAME_RE.test(d.name)) saveSkillApprovedCopy(this.deps.archiveRoot, d.name, snap.raw);
-      report.autoAdopted.push(d.name);
-      this.deps.audit?.record({ feature: "curator", action: "skill.drift_auto_adopted", actor: "system", detail: { skill: d.name, hash8: d.currentHash.slice(0, 8) } });
-    }
     for (const d of drift.propose) {
       this.deps.audit?.record({ feature: "curator", action: "skill.drift", actor: "system", detail: { skill: d.name, hash8: d.currentHash.slice(0, 8), approved8: d.approvedHash?.slice(0, 8) ?? null } });
     }
@@ -620,10 +613,13 @@ export class SkillCurator {
       archive(s, f.detector, reason);
     }
     // B2/B3 on a local or learned skill: deterministic frontmatter fix. Bundled skills are never patched.
+    // Only for content the owner approved: a fix would otherwise activate and approve unseen content
+    // (LEARN-B1). Unapproved content gets the adopt-or-revert card below first.
     for (const f of broken) {
       if (f.root !== "project" || (f.detector !== "B2" && f.detector !== "B3")) continue;
       const s = eligible(f.skill, false);
       if (!s || s.source === "bundled" || s.contentHash === null) continue;
+      if (s.state?.approvedHash !== s.contentHash) continue;
       const fixed = buildFixedSkillMd(s);
       if (!fixed || fixed === s.raw) continue;
       taken.add(s.name);
@@ -650,19 +646,23 @@ export class SkillCurator {
       const used = c.lastUsedAt ? `last used ${c.lastUsedAt.slice(0, 10)}` : `no recorded use since ${c.since.slice(0, 10)}`;
       archive(s, "stale", `${used}, unused for more than ${cfg.archiveAfterDays} days`);
     }
-    // Drift: keep current (adopt), and revert when the approved version was saved.
+    // Drift: keep current (adopt), and revert when the approved version was saved. The content
+    // is unapproved by definition, so both are untrusted: no one-tap, no bulk, read it in full first.
     for (const d of driftPropose) {
       const s = eligible(d.name, false);
       if (!s) continue;
       taken.add(s.name);
       const payload = { name: d.name, currentHash: d.currentHash, approvedHash: d.approvedHash };
+      const hint = d.directWriteAtMs !== undefined
+        ? ` A file-tool write to this skill was recorded in one of your own turns on ${new Date(d.directWriteAtMs).toISOString().slice(0, 10)}; that record does not show what was written, so read the content before approving.`
+        : "";
       out.push({
         kind: "skill.adopt",
         skill: d.name,
         title: d.approvedHash ? `Skill ${d.name} changed outside an approved change: keep it` : `New skill ${d.name} appeared without approval: keep it`,
-        rationale: "Approve to record the current content as approved. Reject to leave it flagged.",
+        rationale: `Approve to record the current content as approved. Reject to leave it flagged.${hint}`,
         payload,
-        trust: "owner",
+        trust: "untrusted",
       });
       if (d.approvedHash && readSkillApprovedCopy(this.deps.archiveRoot, d.name, d.approvedHash) !== null) {
         out.push({
@@ -671,7 +671,7 @@ export class SkillCurator {
           title: `Skill ${d.name} changed outside an approved change: revert it`,
           rationale: "Approve to restore the last approved SKILL.md (the current one is kept in the backups).",
           payload,
-          trust: "owner",
+          trust: "untrusted",
         });
       }
     }
@@ -697,7 +697,9 @@ export class SkillCurator {
         continue;
       }
       const usable = members.length === cluster.members.length && members.every((s) =>
-        !guard.taken.has(s.name) && !guard.reserved.has(s.name) && s.source !== "bundled" && !s.isSymlink && s.raw !== null && s.contentHash !== null && !s.state?.pinned && SKILL_NAME_RE.test(s.name));
+        !guard.taken.has(s.name) && !guard.reserved.has(s.name) && s.source !== "bundled" && !s.isSymlink && s.raw !== null && s.contentHash !== null && !s.state?.pinned && SKILL_NAME_RE.test(s.name)
+        // Only approved content is merged: a merge would otherwise approve text the owner never saw (LEARN-B1).
+        && s.state?.approvedHash === s.contentHash);
       if (!usable || calls >= MAX_LLM_CLUSTERS) {
         report.possibleDuplicates.push(cluster.members);
         continue;

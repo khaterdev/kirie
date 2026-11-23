@@ -206,10 +206,18 @@ describe("skill.merge", () => {
     for (const n of [into, ...from]) baseHashes[n] = sha256Hex(readFileSync(join(skillsRoot, n, "SKILL.md"), "utf8"));
     return { into, from, mergedSkillMd: merged, baseHashes };
   }
+  /** The curator only proposes merges of approved content. */
+  function approveAll(...names: string[]): void {
+    for (const n of names) {
+      system.skillState.insert({ name: n, root: "project", source: "local" });
+      system.skillState.setApprovedHash("project", n, sha256Hex(readFileSync(join(skillsRoot, n, "SKILL.md"), "utf8")), new Date().toISOString());
+    }
+  }
 
   it("writes the merged skill and archives the others with absorbed_into", async () => {
     writeSkill("deploy-app");
     writeSkill("deploy-service");
+    approveAll("deploy-app", "deploy-service");
     const merged = skillMd("deploy-app", "Deploy apps and services");
     const id = file("skill.merge", mergePayload("deploy-app", ["deploy-service"], merged), "mixed");
     const out = await system.applier.approve(id, owner);
@@ -229,6 +237,7 @@ describe("skill.merge", () => {
     writeSkill("deploy-app");
     writeSkill("deploy-one");
     writeSkill("deploy-two");
+    approveAll("deploy-app", "deploy-one", "deploy-two");
     const merged = skillMd("deploy-app", "Deploy everything");
     const id = file("skill.merge", mergePayload("deploy-app", ["deploy-one", "deploy-two"], merged), "mixed");
     // The second archive move fails.
@@ -246,6 +255,18 @@ describe("skill.merge", () => {
     expect(existsSync(join(skillsRoot, "deploy-one", "SKILL.md"))).toBe(true);
     expect(existsSync(join(skillsRoot, "deploy-two", "SKILL.md"))).toBe(true);
     expect(system.skillState.get("project", "deploy-one")?.state ?? "active").toBe("active");
+  });
+
+  // LEARN-B1: a merge never records unapproved content as approved.
+  it("refuses a merge whose inputs include content the owner has not approved", async () => {
+    writeSkill("deploy-app");
+    writeSkill("deploy-planted");
+    approveAll("deploy-app");
+    system.skillState.insert({ name: "deploy-planted", root: "project", source: "local" });
+    const id = file("skill.merge", mergePayload("deploy-app", ["deploy-planted"], skillMd("deploy-app", "merged")), "mixed");
+    expect(await system.applier.approve(id, owner)).toMatchObject({ ok: false, code: "stale" });
+    expect(readFileSync(join(skillsRoot, "deploy-app", "SKILL.md"), "utf8")).toBe(skillMd("deploy-app"));
+    expect(existsSync(join(skillsRoot, "deploy-planted", "SKILL.md"))).toBe(true);
   });
 
   it("refuses bundled skills and changed inputs", async () => {

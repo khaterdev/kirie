@@ -80,8 +80,6 @@ export interface CuratorReport {
   staleMarked: string[];
   /** Clusters of possible duplicates that were reported but not proposed */
   possibleDuplicates: string[][];
-  /** Drifts adopted automatically because an owner-turn direct write explains them */
-  autoAdopted: string[];
   llm: { calls: number; costUsd: number; errors: number };
   errors: string[];
 }

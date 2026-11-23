@@ -40,7 +40,7 @@ function report(over: Partial<CuratorReport> = {}): CuratorReport {
       { skill: "deploy-a", root: "project", detector: "D3", category: "duplicate", severity: "info", message: "Possible duplicate of \"deploy-b\"." },
     ],
     proposals: [{ id: 7, kind: "skill.fix", skill: "remotion", title: "Fix skill remotion: add valid frontmatter" }],
-    dropped: [], staleMarked: ["old-tool"], possibleDuplicates: [["deploy-a", "deploy-b"]], autoAdopted: [],
+    dropped: [], staleMarked: ["old-tool"], possibleDuplicates: [["deploy-a", "deploy-b"]],
     llm: { calls: 0, costUsd: 0, errors: 0 }, errors: [],
     ...over,
   };

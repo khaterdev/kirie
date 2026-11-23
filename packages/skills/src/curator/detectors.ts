@@ -380,47 +380,48 @@ export function detectStale(snapshots: readonly SkillSnapshot[], opts: StaleOpti
 // ---------------------------------------------------------------------------
 
 export interface DriftOptions {
-  /** Owner-turn file-tool writes the skill write guard allowed (audit guard.direct_write) */
+  /**
+   * Owner-turn file-tool writes the skill write guard allowed (audit
+   * guard.direct_write). Used only for a hint on the adopt card: a record says
+   * a write was allowed, not what content it produced, so it never approves
+   * anything (LEARN-B2).
+   */
   directWrites: ReadonlyArray<{ skill: string; atMs: number }>;
-  /** A drift whose SKILL.md mtime is this close to such a write is adopted automatically. Default 2 min. */
-  windowMs?: number;
 }
 
 export interface DriftCandidate {
   name: string;
   currentHash: string;
   approvedHash: string | null;
+  /** Newest recorded owner-turn file-tool write to this skill, if any (a hint for the card) */
+  directWriteAtMs?: number;
 }
 
 export interface DriftResult {
   findings: CuratorFinding[];
-  /** Drifts the owner must decide on (skill.adopt, and skill.revert when an approved copy exists) */
+  /** Every drift: the owner decides (skill.adopt, and skill.revert when an approved copy exists) */
   propose: DriftCandidate[];
-  /** Drifts explained by a recorded owner-turn direct write */
-  autoAdopt: DriftCandidate[];
 }
 
+/** Content that differs from its approved hash. Nothing is ever adopted here; every drift goes to the owner. */
 export function detectDrift(snapshots: readonly SkillSnapshot[], opts: DriftOptions): DriftResult {
   const findings: CuratorFinding[] = [];
   const propose: DriftCandidate[] = [];
-  const autoAdopt: DriftCandidate[] = [];
-  const windowMs = opts.windowMs ?? 120_000;
   for (const s of snapshots) {
     const st = s.state;
     if (s.root !== "project" || s.isSymlink || !st || st.state === "archived" || s.contentHash === null) continue;
     if (s.source === "bundled" && !st.override) continue;
     if (s.contentHash === st.approvedHash) continue;
-    const cand: DriftCandidate = { name: s.name, currentHash: s.contentHash, approvedHash: st.approvedHash };
-    const explained = s.mtimeMs !== null && opts.directWrites.some((w) => w.skill === s.name && Math.abs(w.atMs - s.mtimeMs!) <= windowMs);
-    if (explained) {
-      autoAdopt.push(cand);
-      findings.push(finding(s, "drift", "drift", "info", "SKILL.md changed by an owner-requested edit; recorded as approved."));
-    } else {
-      propose.push(cand);
-      findings.push(finding(s, "drift", "drift", "warn", st.approvedHash
-        ? "SKILL.md changed outside an approved change."
-        : "This skill appeared without an approved change."));
-    }
+    const writes = opts.directWrites.filter((w) => w.skill === s.name).map((w) => w.atMs);
+    propose.push({
+      name: s.name,
+      currentHash: s.contentHash,
+      approvedHash: st.approvedHash,
+      ...(writes.length > 0 ? { directWriteAtMs: Math.max(...writes) } : {}),
+    });
+    findings.push(finding(s, "drift", "drift", "warn", st.approvedHash
+      ? "SKILL.md changed outside an approved change."
+      : "This skill appeared without an approved change."));
   }
-  return { findings, propose, autoAdopt };
+  return { findings, propose };
 }

@@ -23,7 +23,6 @@ export function newCuratorReport(trigger: CuratorTrigger, startedAt: Date, merge
     dropped: [],
     staleMarked: [],
     possibleDuplicates: [],
-    autoAdopted: [],
     llm: { calls: 0, costUsd: 0, errors: 0 },
     errors: [],
   };

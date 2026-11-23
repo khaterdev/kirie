@@ -560,7 +560,10 @@ export function createSkillMergeHandler(deps: CuratorApplyDeps): ProposalKindHan
         const expected = p.baseHashes[name];
         if (!expected) throw new ProposalApplyError("invalid", `no base hash for "${name}"`);
         if (skillMdHash(dir) !== expected) throw new ProposalApplyError("stale", `skill "${name}" changed since the proposal was made`);
-        if (deps.skillState.get("project", name)?.pinned && name !== p.into) throw new ProposalApplyError("stale", `skill "${name}" is pinned`);
+        const row = deps.skillState.get("project", name);
+        if (row?.pinned && name !== p.into) throw new ProposalApplyError("stale", `skill "${name}" is pinned`);
+        // A merge records the result as approved: only approved content may go into it (LEARN-B1).
+        if (row?.approvedHash !== expected) throw new ProposalApplyError("stale", `skill "${name}" has content you have not approved; approve or revert that change first`);
       }
       const archivedRows = deps.skillState.list({ root: "project", state: "archived" });
       for (const name of from) {
