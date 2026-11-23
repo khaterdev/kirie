@@ -1,3 +1,7 @@
+# Kirie docker sandbox image (PLAN C.10). Built locally by scripts/sandbox-setup.sh;
+# Kirie never pulls it. The container runs as the daemon's own uid:gid with a
+# read-only root, every capability dropped, no network by default and one bind
+# mount (the sandbox workspace), so nothing here may rely on root at run time.
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -6,11 +10,28 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
+    coreutils \
     curl \
+    file \
     git \
     jq \
+    less \
+    procps \
     python3 \
+    python3-venv \
     ripgrep \
+    unzip \
+    xz-utils \
+    zip \
   && rm -rf /var/lib/apt/lists/*
+
+# The run-time user has no passwd entry; give it a writable HOME on the /tmp tmpfs.
+ENV HOME=/tmp \
+    LANG=C.UTF-8 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+LABEL org.opencontainers.image.title="kirie-sandbox" \
+      org.opencontainers.image.description="Shell sandbox for Kirie's docker mode"
 
 CMD ["sleep", "infinity"]

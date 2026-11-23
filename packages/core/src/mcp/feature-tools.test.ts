@@ -19,7 +19,7 @@ const ctx: FeatureToolContext = {
 };
 
 /** Factories whose stub has been replaced; each is covered by its own test file. */
-const FILLED_FACTORIES = new Set(["createAccountsTools", "createApprovalsTools", "createComputerUseTools", "createCuratorTools", "createGoalsTools", "createLearningTools", "createLoopsTools", "createPluginsTools", "createSecretsTools", "createUserModelTools", "createVoiceTools", "createWebhooksTools"]);
+const FILLED_FACTORIES = new Set(["createAccountsTools", "createApprovalsTools", "createComputerUseTools", "createCuratorTools", "createGoalsTools", "createLearningTools", "createLoopsTools", "createPluginsTools", "createSandboxTools", "createSecretsTools", "createUserModelTools", "createVoiceTools", "createWebhooksTools"]);
 
 function tool(description: string): McpToolDefinition {
   return { description, parameters: { type: "object", properties: {} }, handler: () => ({ ok: true }) };

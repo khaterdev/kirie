@@ -24,6 +24,7 @@ export const SandboxConfigSchema = z.object({
     image: z.string().default("kirie-sandbox:latest"),
     workspaceDir: z.string().default("~/.kirie/sandbox-workspace"),
     readPaths: z.array(z.string()).default([]),
+    /** The container is always read-only with every capability dropped; false here is ignored (docs/sandbox.md). */
     readOnlyRoot: z.boolean().default(true),
     network: z.enum(["none", "bridge"]).default("none"),
     capDrop: z.array(z.string()).default(["ALL"]),
