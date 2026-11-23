@@ -54,7 +54,11 @@ describe("feature tool seam", () => {
   });
 
   it("factories see the env flags so a tool can exist only when its feature is on", () => {
-    const sandbox: FeatureToolFactory = (c) => (c.env.KIRIE_SANDBOX_MODE === "docker" ? { sandbox_bash: tool("x") } : {});
+    const sandbox: FeatureToolFactory = (c) => {
+      const out: Record<string, McpToolDefinition> = {};
+      if (c.env.KIRIE_SANDBOX_MODE === "docker") out.sandbox_bash = tool("x");
+      return out;
+    };
     expect(featureToolNames(ctx, [sandbox])).toEqual([]);
     expect(featureToolNames({ ...ctx, env: { KIRIE_SANDBOX_MODE: "docker" } }, [sandbox])).toEqual(["sandbox_bash"]);
   });
