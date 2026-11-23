@@ -640,6 +640,33 @@ export function collectAttackSurface(config: KirieConfig): AuditFinding[] {
     });
   }
 
+  const approvals = config.approvals;
+  if (approvals && !approvals.enabled) {
+    findings.push({
+      category: "attack-surface",
+      severity: "warning",
+      message: "Approval gate disabled (approvals.enabled: false) — no tool call is checked, not even catastrophic commands",
+      remediation: "Set approvals.enabled to true",
+    });
+  } else if (approvals) {
+    if (approvals.mode === "yolo") {
+      findings.push({
+        category: "attack-surface",
+        severity: "info",
+        message: "Approval gate in yolo mode — risky commands run without asking (only the hardline list and the deny list block)",
+        remediation: "Run /approvals mode ask, then /approvals test a few everyday commands",
+      });
+    }
+    if (!approvals.hardline) {
+      findings.push({
+        category: "attack-surface",
+        severity: "warning",
+        message: "Approval hardline list is off — catastrophic commands (rm -rf /, disk formatting, fork bombs) are not blocked",
+        remediation: "Set approvals.hardline to true",
+      });
+    }
+  }
+
   if (config.sandbox.mode === "off") {
     findings.push({
       category: "attack-surface",
