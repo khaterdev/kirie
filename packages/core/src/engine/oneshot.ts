@@ -66,7 +66,8 @@ export function ensureOneShotCwd(dir: string): string {
   return dir;
 }
 
-export type OneShotErrorReason = "failed" | "timeout" | "no_result" | "parse";
+/** "aborted": the caller's `signal` fired (no spawn when it fired before the call). */
+export type OneShotErrorReason = "failed" | "timeout" | "no_result" | "parse" | "aborted";
 
 /** A one-shot call that did not produce a usable value. */
 export class OneShotError extends Error {
@@ -125,8 +126,11 @@ export async function runOneShot<T>(opts: {
   cwd?: string;
   /** Addition to PLAN B.3: turn cap. Default 3. */
   maxTurns?: number;
+  /** Addition to PLAN B.3: abort the call (e.g. /goal stop). Rejects with reason "aborted". */
+  signal?: AbortSignal;
 }): Promise<{ value: T; costUsd: number; model?: string }> {
   const label = opts.label ?? opts.kind;
+  if (opts.signal?.aborted) throw new OneShotError(`${label} aborted before it started`, "aborted");
   const cwd = ensureOneShotCwd(opts.cwd ?? defaultOneShotCwd());
   const options = noToolsOptions({
     model: opts.model,
@@ -138,6 +142,12 @@ export async function runOneShot<T>(opts: {
   if (opts.maxBudgetUsd !== undefined) options.maxBudgetUsd = opts.maxBudgetUsd;
   const abortController = new AbortController();
   options.abortController = abortController;
+  let aborted = false;
+  const onAbort = (): void => {
+    aborted = true;
+    abortController.abort();
+  };
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
 
   const ctx: SdkCallContext = { kind: opts.kind, ownerDm: false, interactive: false, label, cwd };
   opts.sdkOptions?.apply(options, ctx);
@@ -202,7 +212,8 @@ export async function runOneShot<T>(opts: {
       }
     }
   } catch (err) {
-    endTurn(true, timedOut);
+    endTurn(true, timedOut || aborted);
+    if (aborted) throw new OneShotError(`${label} aborted`, "aborted", undefined, costUsd, err);
     if (timedOut) {
       throw new OneShotError(`${label} timed out after ${opts.timeoutMs} ms`, "timeout", undefined, costUsd, err);
     }
@@ -210,8 +221,13 @@ export async function runOneShot<T>(opts: {
     throw new OneShotError(`${label} failed (${failure?.class ?? "unknown"})`, "failed", failure, costUsd, err);
   } finally {
     if (timer) clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onAbort);
   }
 
+  if (aborted) {
+    endTurn(true, true);
+    throw new OneShotError(`${label} aborted`, "aborted", undefined, costUsd);
+  }
   endTurn(isError || !gotResult, false);
 
   if (!gotResult) {

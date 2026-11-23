@@ -407,7 +407,11 @@ export class BackgroundTaskManager {
   private runTask(task: BackgroundTask, resumed = false): void {
     log.info({ taskId: task.id, description: task.description, resumed }, "starting background task");
 
-    this.store.markRunning(task.id, task.sdk_session_id ?? undefined);
+    // A row cancelled or finished between the poll and here stays as it is.
+    if (!this.store.markRunning(task.id, task.sdk_session_id ?? undefined)) {
+      log.info({ taskId: task.id }, "task is no longer pending or running; not starting it");
+      return;
+    }
 
     const controller = this.safeHook("controllerFor", task, this.config.controllerFor && (() => this.config.controllerFor!(task)));
     const profile = this.safeHook("profileFor", task, this.config.profileFor && (() => this.config.profileFor!(task)));

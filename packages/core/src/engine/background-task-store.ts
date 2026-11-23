@@ -174,17 +174,28 @@ export class BackgroundTaskStore {
   /**
    * Create a new background task in pending state.
    */
-  create(sessionKey: string, description: string, prompt: string, meta?: BackgroundTaskMeta): BackgroundTask {
+  /**
+   * `opts.resumeSessionId` makes the task resume that SDK session when it
+   * starts (e.g. a goal continuing a paused worker), instead of a new one.
+   */
+  create(
+    sessionKey: string,
+    description: string,
+    prompt: string,
+    meta?: BackgroundTaskMeta,
+    opts?: { resumeSessionId?: string },
+  ): BackgroundTask {
     const id = randomUUID();
     const now = new Date().toISOString();
     const metaJson = meta ? JSON.stringify(meta) : null;
+    const resume = opts?.resumeSessionId ?? null;
 
     this.db
       .prepare(
-        `INSERT INTO background_tasks (id, session_key, description, prompt, status, created_at, updated_at, meta)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+        `INSERT INTO background_tasks (id, session_key, description, prompt, status, created_at, updated_at, meta, sdk_session_id)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
       )
-      .run(id, sessionKey, description, prompt, now, now, metaJson);
+      .run(id, sessionKey, description, prompt, now, now, metaJson, resume);
 
     return {
       id,
@@ -198,7 +209,7 @@ export class BackgroundTaskStore {
       num_turns: 0,
       created_at: now,
       updated_at: now,
-      sdk_session_id: null,
+      sdk_session_id: resume,
       meta: metaJson ? parseMeta(metaJson) : null,
       account_id: null,
       rotation_attempts: 0,
@@ -278,16 +289,20 @@ export class BackgroundTaskStore {
   }
 
   /**
-   * Update task status to running and set the SDK session ID.
+   * Update task status to running and set the SDK session ID. Only a pending
+   * or running row changes: a message still buffered after the task was
+   * completed, failed or cancelled must not flip it back to running.
+   * Returns true when the row changed.
    */
-  markRunning(id: string, sdkSessionId?: string): void {
-    this.db
+  markRunning(id: string, sdkSessionId?: string): boolean {
+    const info = this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'running', sdk_session_id = ?, updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
       .run(sdkSessionId ?? null, id);
+    return info.changes > 0;
   }
 
   /** Record the Claude account a running task was spawned with. */
