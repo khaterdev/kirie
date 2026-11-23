@@ -32,26 +32,6 @@ export interface ActiveHoursConfig {
   days?: number[]; // [1,2,3,4,5] = weekdays
 }
 
-export interface WebhookEntry {
-  name: string;
-  path: string;
-  method: string;
-  handler_message: string;
-  channel: string;
-  chat_id: string;
-  created_at: string;
-}
-
-export interface WebhookFireEvent {
-  name: string;
-  path: string;
-  handlerMessage: string;
-  channel: string;
-  chatId: string;
-  requestBody?: unknown;
-  requestHeaders?: Record<string, string>;
-}
-
 interface ScheduleRow {
   name: string;
   cron: string;
@@ -66,16 +46,6 @@ interface ScheduleRow {
   at: string | null;
   timezone: string | null;
   delivery: string | null;
-}
-
-interface WebhookRow {
-  name: string;
-  path: string;
-  method: string;
-  handler_message: string;
-  channel: string;
-  chat_id: string;
-  created_at: string;
 }
 
 export type ScheduleDeliveryMode = "announce" | "post-to-main" | "payload" | "none";
@@ -178,18 +148,6 @@ export class ScheduleStore extends EventEmitter {
       // Column already exists
     }
 
-    // Webhooks table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS webhooks (
-        name            TEXT PRIMARY KEY,
-        path            TEXT NOT NULL UNIQUE,
-        method          TEXT NOT NULL DEFAULT 'POST',
-        handler_message TEXT NOT NULL,
-        channel         TEXT NOT NULL,
-        chat_id         TEXT NOT NULL,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-    `);
   }
 
   private startCronJob(row: ScheduleRow): void {
@@ -365,52 +323,6 @@ export class ScheduleStore extends EventEmitter {
     this.startCronJob(row);
 
     return this.rowToEntry(row);
-  }
-
-  // ── Webhook methods ──────────────────────────────────────────────────────
-
-  createWebhook(
-    name: string,
-    path: string,
-    method: string,
-    handlerMessage: string,
-    channel: string,
-    chatId: string,
-  ): WebhookEntry {
-    this.db
-      .prepare(
-        `INSERT INTO webhooks (name, path, method, handler_message, channel, chat_id)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET
-           path            = excluded.path,
-           method          = excluded.method,
-           handler_message = excluded.handler_message,
-           channel         = excluded.channel,
-           chat_id         = excluded.chat_id`,
-      )
-      .run(name, path, method, handlerMessage, channel, chatId);
-
-    return this.db.prepare("SELECT * FROM webhooks WHERE name = ?").get(name) as WebhookEntry;
-  }
-
-  getWebhook(nameOrPath: string): WebhookEntry | null {
-    const row = this.db
-      .prepare("SELECT * FROM webhooks WHERE name = ? OR path = ?")
-      .get(nameOrPath, nameOrPath) as WebhookRow | undefined;
-    return row ?? null;
-  }
-
-  listWebhooks(): WebhookEntry[] {
-    return this.db
-      .prepare("SELECT * FROM webhooks ORDER BY created_at ASC")
-      .all() as WebhookEntry[];
-  }
-
-  deleteWebhook(name: string): boolean {
-    const result = this.db
-      .prepare("DELETE FROM webhooks WHERE name = ?")
-      .run(name);
-    return result.changes > 0;
   }
 
   list(): ScheduleEntry[] {
@@ -633,65 +545,6 @@ export function createScheduleToolHandlers(store: ScheduleStore) {
       },
       handler(params: { name: string }): { deleted: boolean } {
         return { deleted: store.delete(params.name) };
-      },
-    },
-
-    schedule_webhook: {
-      description: "Create a webhook endpoint that triggers an agent task when called. The webhook URL will be /webhooks/<path>.",
-      parameters: {
-        type: "object" as const,
-        properties: {
-          name: { type: "string" as const, description: "Unique name for this webhook" },
-          path: { type: "string" as const, description: "URL path for the webhook (e.g., 'deploy-notify')" },
-          method: { type: "string" as const, description: "HTTP method: GET or POST (default: POST)" },
-          handlerMessage: { type: "string" as const, description: "Message/task to send to the agent when webhook is triggered" },
-          channel: { type: "string" as const, description: "Channel to route response through" },
-          chatId: { type: "string" as const, description: "Chat ID to route response to" },
-        },
-        required: ["name", "path", "handlerMessage", "channel", "chatId"] as const,
-      },
-      handler(params: {
-        name: string;
-        path: string;
-        method?: string;
-        handlerMessage: string;
-        channel: string;
-        chatId: string;
-      }): WebhookEntry {
-        return store.createWebhook(
-          params.name,
-          params.path,
-          params.method ?? "POST",
-          params.handlerMessage,
-          params.channel,
-          params.chatId,
-        );
-      },
-    },
-
-    webhook_list: {
-      description: "List all registered webhooks.",
-      parameters: {
-        type: "object" as const,
-        properties: {},
-        required: [] as const,
-      },
-      handler(): WebhookEntry[] {
-        return store.listWebhooks();
-      },
-    },
-
-    webhook_delete: {
-      description: "Delete a webhook by name.",
-      parameters: {
-        type: "object" as const,
-        properties: {
-          name: { type: "string" as const, description: "Name of the webhook to delete" },
-        },
-        required: ["name"] as const,
-      },
-      handler(params: { name: string }): { deleted: boolean } {
-        return { deleted: store.deleteWebhook(params.name) };
       },
     },
   };

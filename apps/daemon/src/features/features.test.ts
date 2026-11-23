@@ -24,7 +24,7 @@ import { KirieConfigSchema, type BackgroundTask } from "@kirie/core";
 
 const OWNER = "1001";
 /** Features whose stub has been replaced by a real setup; each is covered by its own test file. */
-const FILLED_FEATURES = new Set(["goals", "heartbeat-control", "loops", "plugins", "secrets"]);
+const FILLED_FEATURES = new Set(["goals", "heartbeat-control", "loops", "plugins", "secrets", "webhooks"]);
 const STUB_FEATURES = FEATURES.filter((f) => !FILLED_FEATURES.has(f.name));
 
 /** A DaemonContext with real registries and inert fakes for everything a stub never touches. */

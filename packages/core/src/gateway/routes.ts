@@ -5,7 +5,6 @@ import type { ChannelRegistry } from "../channels/registry.js";
 import type { SessionStore } from "../engine/session-store.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { UsageDashboard } from "../logging/usage-dashboard.js";
-import type { ScheduleStore, WebhookFireEvent } from "../mcp/tools/schedule.js";
 import type { ProactiveEngine } from "../engine/proactive.js";
 import { createModuleLogger } from "../logging/logger.js";
 import { scrubSecrets } from "../security/secret-scrubber.js";
@@ -38,10 +37,6 @@ export interface GatewayDeps {
   canvasClientDir?: string;
   /** Usage dashboard for token analytics */
   usageDashboard?: UsageDashboard;
-  /** Optional schedule store for webhook lookup */
-  scheduleStore?: ScheduleStore;
-  /** Optional callback when a webhook fires */
-  onWebhookFire?: (event: WebhookFireEvent) => void;
   /** Optional ProactiveEngine for proactive status/trigger API */
   proactiveEngine?: ProactiveEngine | null;
 }
@@ -290,65 +285,6 @@ export function createRoutes(deps: GatewayDeps): Hono {
     c.header("Content-Type", "text/csv");
     c.header("Content-Disposition", `attachment; filename="kirie-usage-${period}.csv"`);
     return c.body(csv);
-  });
-
-  // ── Webhook routes ────────────────────────────────────────────────────
-
-  app.all("/webhooks/:path", async (c) => {
-    const webhookPath = c.req.param("path");
-
-    if (!deps.scheduleStore) {
-      return c.json({ status: "error", message: "Webhooks not configured" }, 503);
-    }
-
-    const webhook = deps.scheduleStore.getWebhook(webhookPath);
-    if (!webhook) {
-      return c.json({ status: "error", message: `Webhook "${webhookPath}" not found` }, 404);
-    }
-
-    // Check HTTP method
-    if (webhook.method !== "GET" && webhook.method !== "POST") {
-      // Fallback: accept any method
-    } else if (c.req.method !== webhook.method && webhook.method !== "GET") {
-      return c.json(
-        { status: "error", message: `Expected ${webhook.method} request` },
-        405,
-      );
-    }
-
-    // Parse request body for POST requests
-    let requestBody: unknown;
-    if (c.req.method === "POST") {
-      try {
-        requestBody = await c.req.json();
-      } catch {
-        requestBody = await c.req.text();
-      }
-    }
-
-    // Extract headers
-    const requestHeaders: Record<string, string> = {};
-    for (const [key, value] of c.req.raw.headers.entries()) {
-      requestHeaders[key] = value;
-    }
-
-    const event: WebhookFireEvent = {
-      name: webhook.name,
-      path: webhook.path,
-      handlerMessage: webhook.handler_message,
-      channel: webhook.channel,
-      chatId: webhook.chat_id,
-      requestBody,
-      requestHeaders,
-    };
-
-    if (deps.onWebhookFire) {
-      deps.onWebhookFire(event);
-    }
-
-    log.info({ webhook: webhook.name, path: webhookPath }, "webhook fired");
-
-    return c.json({ status: "ok", webhook: webhook.name, message: "Webhook triggered" });
   });
 
   // ── Voice webhook routes ──────────────────────────────────────────────

@@ -26,6 +26,12 @@ export const WebhooksConfigSchema = z.object({
   onSuspiciousPayload: z.enum(["downgrade", "drop", "proceed"]).default("downgrade"),
   maxFieldChars: z.number().int().min(50).max(5000).default(500),
   maxPayloadChars: z.number().int().min(500).max(50_000).default(8000),
+  /**
+   * How a hook secret reaches the owner. Only "file" is implemented: a 0600
+   * file under ~/.kirie/secrets, removed after 10 minutes. "chat" is accepted
+   * for compatibility and treated as "file": outbound messages are scrubbed of
+   * known secrets, and nothing bypasses that filter.
+   */
   secretDelivery: z.enum(["file", "chat"]).default("file"),
   authFailureAlertThreshold: z.number().int().min(1).default(20),
 }).default({});
