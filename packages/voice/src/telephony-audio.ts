@@ -1,3 +1,4 @@
+// Not used by the webhook call path (PLAN C.14).
 /**
  * Audio format conversion for telephony (G.711 mu-law).
  * Used for Twilio WebSocket media streams.

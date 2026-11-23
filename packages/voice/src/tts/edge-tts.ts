@@ -1,3 +1,4 @@
+// Not used by the webhook call path (PLAN C.14).
 import type { TTSProvider, TTSOptions, Voice } from "./types.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, unlinkSync, mkdtempSync } from "node:fs";
