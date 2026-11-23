@@ -83,6 +83,12 @@ export interface SendTextParams {
   readonly text: string;
   /** Send as plain text: no Markdown or other parse mode */
   readonly plain?: boolean;
+  /**
+   * Ask the platform not to fetch a preview of links in the text (Telegram:
+   * `link_preview_options.is_disabled`). For untrusted or model-written text
+   * whose links must never be fetched. Adapters without previews ignore it.
+   */
+  readonly disableLinkPreview?: boolean;
 }
 
 /**

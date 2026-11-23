@@ -106,9 +106,9 @@ export interface WebhookServiceDeps {
   registerKnownSecret(value: string, label: string): void;
   audit?: Pick<AuditTrail, "record" | "recent">;
   /** One line to the owner's primary DM */
-  notifyOwner(text: string, opts?: { key?: string }): Promise<void>;
+  notifyOwner(text: string, opts?: { key?: string; disableLinkPreview?: boolean }): Promise<void>;
   /** Send to a hook's static target. Returns false when the channel is not running */
-  sendToChat(channel: string, chatId: string, text: string): Promise<boolean>;
+  sendToChat(channel: string, chatId: string, text: string, opts: { disableLinkPreview: boolean }): Promise<boolean>;
   /** A no-tools one-shot model call (runOneShot kind "oneshot"). Returns the summary text */
   summarize(input: { system: string; prompt: string; label: string }): Promise<string>;
   /** BackgroundTaskStore.create */
@@ -769,7 +769,8 @@ export class WebhookService implements WebhookDeliveryHandler {
 
   private async send(hook: WebhookDefinition, text: string): Promise<boolean> {
     try {
-      return await this.deps.sendToChat(hook.channel, hook.chatId, scrubSecrets(text, { sink: "channel" }));
+      // Every webhook message carries text from outside or from a model that read it: no link previews.
+      return await this.deps.sendToChat(hook.channel, hook.chatId, scrubSecrets(text, { sink: "channel" }), { disableLinkPreview: true });
     } catch (err) {
       this.log.warn({ hookId: hook.id, err: err instanceof Error ? err.message : String(err) }, "webhook message failed");
       return false;
@@ -873,7 +874,7 @@ export class WebhookService implements WebhookDeliveryHandler {
     if (hook) {
       await this.send(hook, text);
     } else {
-      await this.deps.notifyOwner(text);
+      await this.deps.notifyOwner(text, { disableLinkPreview: true });
     }
   }
 

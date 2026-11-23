@@ -230,10 +230,12 @@ export class TelegramAdapter implements ChannelAdapter {
     this.ensureConnected();
     const chunks = chunkText(params.text, MAX_TEXT_LENGTH);
     const results: SentMessage[] = [];
+    // Spread into every attempt below; empty unless asked, so other sends are unchanged.
+    const previewOpts = params.disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {};
 
     if (params.plain) {
       for (const chunk of chunks) {
-        results.push(await this.sendPlainChunk(params.ctx, chunk));
+        results.push(await this.sendPlainChunk(params.ctx, chunk, previewOpts));
       }
       return results;
     }
@@ -247,7 +249,7 @@ export class TelegramAdapter implements ChannelAdapter {
         ? { reply_parameters: { message_id: Number(params.ctx.replyToId) } }
         : {};
 
-      const baseOpts = { ...replyOpts, ...threadOpts };
+      const baseOpts = { ...replyOpts, ...threadOpts, ...previewOpts };
 
       let sent;
       try {
@@ -273,7 +275,7 @@ export class TelegramAdapter implements ChannelAdapter {
             // If the plain-text send also fails AND we were trying to reply,
             // fall back to sending without reply_parameters
             if (params.ctx.replyToId) {
-              const fallbackOpts = { ...threadOpts };
+              const fallbackOpts = { ...threadOpts, ...previewOpts };
               sent = await this.bot!.api.sendMessage(
                 params.ctx.chatId,
                 chunk,
@@ -287,7 +289,7 @@ export class TelegramAdapter implements ChannelAdapter {
           // Non-parse error while replying — fall back to sending without
           // reply_parameters so the message isn't silently lost
           try {
-            const fallbackOpts = { ...threadOpts };
+            const fallbackOpts = { ...threadOpts, ...previewOpts };
             sent = await this.bot!.api.sendMessage(
               params.ctx.chatId,
               chunk,
@@ -299,7 +301,7 @@ export class TelegramAdapter implements ChannelAdapter {
               fallbackErr instanceof Error &&
               fallbackErr.message.includes("can't parse entities");
             if (isFallbackParseError) {
-              const fallbackOpts = { ...threadOpts };
+              const fallbackOpts = { ...threadOpts, ...previewOpts };
               sent = await this.bot!.api.sendMessage(
                 params.ctx.chatId,
                 chunk,
@@ -330,7 +332,7 @@ export class TelegramAdapter implements ChannelAdapter {
   private async sendPlainChunk(
     ctx: ChannelContext,
     text: string,
-    extra: { reply_markup?: InlineKeyboardMarkup } = {},
+    extra: { reply_markup?: InlineKeyboardMarkup; link_preview_options?: { is_disabled: boolean } } = {},
   ): Promise<SentMessage> {
     const threadOpts = ctx.threadId ? { message_thread_id: Number(ctx.threadId) } : {};
     const replyOpts = ctx.replyToId ? { reply_parameters: { message_id: Number(ctx.replyToId) } } : {};

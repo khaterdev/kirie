@@ -13,6 +13,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { InputGuard, type SuspiciousPatternMatch } from "../security/input-guard.js";
 import { scrubSecrets } from "../security/secret-scrubber.js";
 import type { WebhookDefinition } from "./types.js";
@@ -221,11 +222,36 @@ export const WEBHOOK_TASK_SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
+ * Schemes a chat client may turn into a link without "//". Every scheme
+ * followed by "://" is defanged anyway.
+ */
+const BARE_LINK_SCHEMES = "mailto|tel|sms|tg|ton|tonsite|data|javascript|vbscript|file|magnet|bitcoin|xmpp|sip|sips|callto|facetime|geo|intent|skype";
+const BARE_SCHEME_RE = new RegExp(`\\b(${BARE_LINK_SCHEMES}):`, "gi");
+/** Candidate IPv6 literals (checked with isIP), with an optional zone id. */
+const IPV6_CANDIDATE_RE = /[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*(?:%[A-Za-z0-9_.-]+)?/g;
+const IPV4_RE = /(?<!\d)\d{1,3}(?:\.\d{1,3}){3}(?!\d)/g;
+/**
+ * A dot (or an IDNA full stop: U+3002, U+FF0E, U+FF61) after any non-space
+ * character and before two letters of any script: covers ASCII, IDN and
+ * punycode (`xn--`) host names and top-level domains.
+ */
+const HOST_DOT_RE = /(?<=[^\s[])[.\u3002\uFF0E\uFF61](?=[\p{L}\p{M}]{2})/gu;
+
+/**
  * Break auto-linking in a report written by a webhook task that could read
  * local files. A chat client that previews the first link would otherwise
- * fetch an attacker's URL with file contents encoded in it. `https://x.example/?d=..`
- * becomes `https[:]//x[.]example/?d=..`: still readable, never fetched.
+ * fetch an attacker's URL with file contents encoded in it. The message is
+ * also sent with link previews disabled; this is the second layer.
+ * `https://x.example/?d=..` becomes `https[:]//x[.]example/?d=..`: still
+ * readable, never fetched. Covers any scheme with "://", bare schemes such as
+ * `mailto:` and `tg:`, ASCII, IDN and punycode hosts, and IPv4 and IPv6
+ * literals. Idempotent.
  */
 export function defangWebhookLinks(text: string): string {
-  return text.replace(/:\/\//g, "[:]//").replace(/([A-Za-z0-9-])\.(?=[A-Za-z]{2})/g, "$1[.]");
+  return text
+    .replace(/:\/\//g, "[:]//")
+    .replace(BARE_SCHEME_RE, "$1[:]")
+    .replace(IPV6_CANDIDATE_RE, (m) => (isIP(m) === 6 ? m.replace(/[:.]/g, (c) => `[${c}]`) : m))
+    .replace(IPV4_RE, (m) => m.replace(/\./g, "[.]"))
+    .replace(HOST_DOT_RE, "[.]");
 }

@@ -16,7 +16,7 @@ export function createOwnerNotifier(deps: {
   owners: Pick<OwnerDirectory, "primary">;
   channelRegistry: Pick<ChannelRegistry, "getById" | "isRunning">;
   now?: () => number;
-}): (text: string, opts?: { key?: string; always?: boolean }) => Promise<void> {
+}): (text: string, opts?: { key?: string; always?: boolean; disableLinkPreview?: boolean }) => Promise<void> {
   const now = deps.now ?? Date.now;
   const lastByKey = new Map<string, number>();
   return async (text, opts) => {
@@ -38,7 +38,7 @@ export function createOwnerNotifier(deps: {
       return;
     }
     try {
-      await adapter.sendText({ ctx: { chatId: target.chatId }, text, plain: true });
+      await adapter.sendText({ ctx: { chatId: target.chatId }, text, plain: true, ...(opts?.disableLinkPreview ? { disableLinkPreview: true } : {}) });
       if (opts?.key) lastByKey.set(opts.key, now());
     } catch (err) {
       log.warn({ channel: target.channel, err: err instanceof Error ? err.message : String(err) }, "owner notice failed");

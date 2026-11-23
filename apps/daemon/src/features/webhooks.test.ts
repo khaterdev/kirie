@@ -19,6 +19,7 @@ import {
 } from "@kirie/core";
 import { TaskHooks } from "../task-hooks.js";
 import { setupWebhooks } from "./webhooks.js";
+import { createOwnerNotifier } from "./notify.js";
 import type { DaemonContext, FeatureHandle } from "./types.js";
 
 const OWNER = "1001";
@@ -29,6 +30,7 @@ let commands: CommandRegistry;
 let taskHooks: TaskHooks;
 let secrets: Map<string, string>;
 let sent: string[];
+let sentParams: Array<Record<string, unknown>>;
 let handle: FeatureHandle | null;
 
 function context(config: KirieConfig): DaemonContext {
@@ -37,7 +39,7 @@ function context(config: KirieConfig): DaemonContext {
   taskHooks = new TaskHooks();
   // Port 0: an ephemeral loopback port; never the real 18787.
   ingress = new PublicIngress({ ...config.ingress, port: 0 });
-  const adapter = { id: "telegram", sendText: async (p: { text: string }) => { sent.push(p.text); return [{ id: "1", timestamp: 0 }]; } };
+  const adapter = { id: "telegram", sendText: async (p: { text: string }) => { sent.push(p.text); sentParams.push(p); return [{ id: "1", timestamp: 0 }]; } };
   const ctx = {
     config,
     dataDir: dir,
@@ -78,6 +80,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "kirie-webhook-feature-"));
   secrets = new Map();
   sent = [];
+  sentParams = [];
   handle = null;
 });
 
@@ -138,6 +141,36 @@ describe("setupWebhooks", () => {
     await handle.stop?.();
     handle = null;
     expect(ingress.mountedPrefixes()).toEqual([]);
+  });
+
+  it("webhook messages reach the adapter as plain text with link previews disabled (HOOK-B1)", async () => {
+    const ctx = context(KirieConfigSchema.parse({ webhooks: { enabled: true } }));
+    handle = await setupWebhooks(ctx);
+    await handle.start?.();
+    await send("/webhook add deploys github");
+    const id = (await send("/webhook list")).split(/\s+/)[0]!;
+    await send(`/webhook enable ${id}`);
+    const raw = Buffer.from(JSON.stringify({ action: "completed", repository: { full_name: "example/app" } }));
+    const headers = { "content-type": "application/json", "x-github-event": "workflow_run", ...signWebhookPayload("github", secrets.get(webhookSecretRef(id))!, raw) };
+    const before = sentParams.length;
+    const ok = await fetch(`http://127.0.0.1:${ingress.port!}/hooks/${id}`, { method: "POST", headers, body: raw });
+    expect(ok.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 20));
+    const delivered = sentParams.slice(before).filter((p) => String(p.text).includes("example/app"));
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ plain: true, disableLinkPreview: true });
+  });
+
+  it("the owner notifier passes disableLinkPreview through, and adds nothing when it is not asked for", async () => {
+    const owners = new OwnerDirectory({ telegram: [OWNER] });
+    const adapter = { id: "telegram", sendText: async (p: Record<string, unknown>) => { sentParams.push(p); return [{ id: "1", timestamp: 0 }]; } };
+    const notify = createOwnerNotifier({ owners, channelRegistry: { getById: () => adapter, isRunning: () => true } as never });
+    await notify("report", { disableLinkPreview: true });
+    await notify("plain notice");
+    expect(sentParams).toEqual([
+      { ctx: { chatId: OWNER }, text: "report", plain: true, disableLinkPreview: true },
+      { ctx: { chatId: OWNER }, text: "plain notice", plain: true },
+    ]);
   });
 
   it("webhooks.enabled in config with an enabled hook binds at start", async () => {

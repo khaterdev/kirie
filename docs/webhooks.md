@@ -59,7 +59,7 @@ The agent has two read-only tools, `webhook_list` and `webhook_deliveries`. It c
 
 `full` needs **two** opt-ins: `webhooks.allowFullProfile: true` in `config.yaml`, and `/webhook set <id> tools=full`, which asks you to confirm. If either is withdrawn later, deliveries fall back to `summarize`. Webhook tasks run with the SDK call kind `webhook`, so the approvals gate can treat them as unattended.
 
-The result always goes to the DM the hook was created from. Nothing in a payload can choose the recipient. Reports from `investigate` and `full` tasks have their links defanged (`https[:]//host[.]example/...`), because a chat client that previews a link would fetch it: an injected task could otherwise put file contents into a URL that Telegram fetches for the preview.
+The result always goes to the DM the hook was created from. Nothing in a payload can choose the recipient. Every webhook message is sent with link previews disabled (Telegram `link_preview_options.is_disabled`), because a chat client that previews a link fetches it: an injected task could otherwise put file contents into a URL that Telegram fetches for the preview. As a second layer, reports from `investigate` and `full` tasks have their links defanged (`https[:]//host[.]example/...`): any `scheme://`, bare schemes such as `mailto:` and `tg:`, ASCII, non-ASCII (IDN) and punycode host names, and IPv4 and IPv6 addresses.
 
 ### The payload is untrusted
 

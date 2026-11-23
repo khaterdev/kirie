@@ -52,10 +52,10 @@ export const setupWebhooks: FeatureSetup = (ctx: DaemonContext) => {
     registerKnownSecret: (value, label) => ctx.scrubber.addKnownSecret(value, label),
     audit: ctx.audit,
     notifyOwner: (text, opts) => ctx.notifyOwner(text, opts),
-    sendToChat: async (channel, chatId, text) => {
+    sendToChat: async (channel, chatId, text, opts) => {
       const adapter = ctx.channelRegistry.getById(channel);
       if (!adapter || !ctx.channelRegistry.isRunning(channel)) return false;
-      await adapter.sendText({ ctx: { chatId }, text, plain: true });
+      await adapter.sendText({ ctx: { chatId }, text, plain: true, disableLinkPreview: opts.disableLinkPreview });
       return true;
     },
     summarize: async ({ system, prompt, label }) => {

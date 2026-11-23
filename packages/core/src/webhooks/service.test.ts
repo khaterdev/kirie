@@ -16,8 +16,9 @@ const SENTINEL = "PAYLOAD-SENTINEL-7f3a";
 let dir: string;
 let cfg: WebhooksConfig;
 let secrets: Map<string, string>;
-let sent: Array<{ channel: string; chatId: string; text: string }>;
+let sent: Array<{ channel: string; chatId: string; text: string; opts?: { disableLinkPreview?: boolean } }>;
 let notices: string[];
+let noticeOpts: Array<{ key?: string; disableLinkPreview?: boolean } | undefined>;
 let tasks: Array<{ sessionKey: string; description: string; prompt: string; meta: BackgroundTaskMeta }>;
 let audit: { record: ReturnType<typeof vi.fn>; recent: () => never[] };
 let summarize: ReturnType<typeof vi.fn>;
@@ -37,8 +38,8 @@ function makeService(over: Partial<WebhookServiceDeps> = {}): WebhookService {
     },
     registerKnownSecret: (v) => { known.push(v); },
     audit,
-    notifyOwner: async (t) => { notices.push(t); },
-    sendToChat: async (channel, chatId, text) => { sent.push({ channel, chatId, text }); return true; },
+    notifyOwner: async (t, o) => { notices.push(t); noticeOpts.push(o); },
+    sendToChat: async (channel, chatId, text, opts) => { sent.push({ channel, chatId, text, opts }); return true; },
     summarize,
     createTask: (sessionKey, description, prompt, meta) => {
       tasks.push({ sessionKey, description, prompt, meta });
@@ -58,6 +59,7 @@ beforeEach(() => {
   secrets = new Map();
   sent = [];
   notices = [];
+  noticeOpts = [];
   tasks = [];
   known = [];
   audit = { record: vi.fn(), recent: () => [] };
@@ -368,6 +370,38 @@ describe("actions", () => {
     expect(sent.at(-1)!.text).toContain("links defanged");
     await flush();
     expect(service.workload().active).toBe(0);
+  });
+
+  it("every webhook message goes out with link previews disabled, and task reports defang IDN and IP links (HOOK-B1)", async () => {
+    const notify = await addEnabled("pings", "github");
+    const n = signed("github", notify.secret, ghBody(), { "x-github-event": "workflow_run" });
+    expect((await ingress.handle(request(notify.id, n.raw, n.headers))).status).toBe(202);
+    const sum = await addEnabled("sums", "github", { action: "task", toolProfile: "summarize" });
+    const m = signed("github", sum.secret, ghBody(), { "x-github-event": "workflow_run" });
+    expect((await ingress.handle(request(sum.id, m.raw, m.headers))).status).toBe(202);
+    const gh = await addEnabled("issues", "github", { action: "task", toolProfile: "investigate" });
+    const d = signed("github", gh.secret, ghBody(), { "x-github-event": "workflow_run" });
+    expect((await ingress.handle(request(gh.id, d.raw, d.headers))).status).toBe(202);
+    await flush();
+    const meta = tasks[0]!.meta;
+    // Reviewer proof: an injected report that carries data in the path of a scheme-less IDN link.
+    const result = "Done. see пример.рф/c2VjcmV0 and evilÁ.com/c2VjcmV0 and 1.2.3.4/x and [2001:db8::1]/x";
+    await service.onTaskCompleted({ id: "task-1", result, error: null, meta } as unknown as BackgroundTask);
+    await service.onTaskFailed({ id: "task-2", result: null, error: "fetch 例え.jp/c2VjcmV0 failed", meta } as unknown as BackgroundTask);
+    expect(sent).toHaveLength(4);
+    for (const s of sent) expect(s.opts).toEqual({ disableLinkPreview: true });
+    const report = sent[2]!.text;
+    expect(report).toContain("пример[.]рф/c2VjcmV0");
+    expect(report).toContain("evilÁ[.]com/c2VjcmV0");
+    expect(report).toContain("1[.]2[.]3[.]4/x");
+    expect(report).toContain("2001[:]db8[:][:]1");
+    expect(sent[3]!.text).toContain("例え[.]jp/c2VjcmV0");
+
+    // A report for a hook that was removed meanwhile goes to the owner, also without a preview.
+    await service.removeHook(gh.id, "owner:test");
+    await service.onTaskCompleted({ id: "task-3", result: "see evil.рф/x", error: null, meta } as unknown as BackgroundTask);
+    expect(notices.at(-1)).toContain("evil[.]рф/x");
+    expect(noticeOpts.at(-1)).toEqual({ disableLinkPreview: true });
   });
 
   it("a cancelled webhook task releases its slot (no completion handler runs for it)", async () => {

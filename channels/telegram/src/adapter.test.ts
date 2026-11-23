@@ -201,6 +201,41 @@ describe("TelegramAdapter", () => {
       expect(api.sendMessage).toHaveBeenNthCalledWith(2, "1001", "x", {});
     });
 
+    it("disableLinkPreview maps to link_preview_options on every send attempt (HOOK-B1)", async () => {
+      const off = { link_preview_options: { is_disabled: true } };
+      const adapter = await started({ token: TOKEN });
+      await adapter.sendText({ ctx, text: "see evil.example/x", plain: true, disableLinkPreview: true });
+      expect(api.sendMessage).toHaveBeenLastCalledWith("1001", "see evil.example/x", off);
+
+      api.sendMessage.mockClear();
+      api.sendMessage.mockRejectedValueOnce(new Error("message to be replied not found"));
+      await adapter.sendText({ ctx: { chatId: "1001", replyToId: "9" }, text: "x", plain: true, disableLinkPreview: true });
+      expect(api.sendMessage).toHaveBeenNthCalledWith(1, "1001", "x", { reply_parameters: { message_id: 9 }, ...off });
+      expect(api.sendMessage).toHaveBeenNthCalledWith(2, "1001", "x", off);
+
+      api.sendMessage.mockClear();
+      await adapter.sendText({ ctx, text: "md", disableLinkPreview: true });
+      expect(api.sendMessage).toHaveBeenLastCalledWith("1001", "md", { parse_mode: "Markdown", ...off });
+
+      api.sendMessage.mockClear();
+      api.sendMessage.mockRejectedValueOnce(new Error("Bad Request: can't parse entities"));
+      await adapter.sendText({ ctx, text: "md_", disableLinkPreview: true });
+      expect(api.sendMessage).toHaveBeenNthCalledWith(2, "1001", "md_", off);
+
+      api.sendMessage.mockClear();
+      api.sendMessage.mockRejectedValueOnce(new Error("message to be replied not found"));
+      await adapter.sendText({ ctx: { chatId: "1001", replyToId: "9" }, text: "r", disableLinkPreview: true });
+      expect(api.sendMessage).toHaveBeenNthCalledWith(2, "1001", "r", { parse_mode: "Markdown", ...off });
+    });
+
+    it("without disableLinkPreview no link_preview_options is sent (unchanged)", async () => {
+      const adapter = await started({ token: TOKEN });
+      await adapter.sendText({ ctx, text: "a", plain: true });
+      await adapter.sendText({ ctx, text: "b" });
+      await adapter.sendText({ ctx, text: "c", disableLinkPreview: false });
+      for (const call of api.sendMessage.mock.calls) expect(call[2]).not.toHaveProperty("link_preview_options");
+    });
+
     it("sendInteractive builds an inline_keyboard", async () => {
       const adapter = await started({ token: TOKEN });
       const sent = await adapter.sendInteractive({

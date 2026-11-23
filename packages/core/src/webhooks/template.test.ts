@@ -116,3 +116,56 @@ describe("defangWebhookLinks", () => {
     expect(out).not.toMatch(/https?:\/\//);
   });
 });
+
+describe("defangWebhookLinks: every host form a chat client could link (HOOK-B1)", () => {
+  // Reviewer proof inputs (HOOK-B1, PoC 4) first, then the rest of the class.
+  const cases: Array<[string, string]> = [
+    ["see evilÁ.com/c2VjcmV0", "see evilÁ[.]com/c2VjcmV0"],
+    ["see пример.рф/c2VjcmV0", "see пример[.]рф/c2VjcmV0"],
+    ["see 例え.jp/c2VjcmV0", "see 例え[.]jp/c2VjcmV0"],
+    ["see 1.2.3.4/x", "see 1[.]2[.]3[.]4/x"],
+    ["see https://evil.com/x", "see https[:]//evil[.]com/x"],
+    // Unicode TLD after an ASCII label, punycode label and punycode TLD.
+    ["evil.рф/a", "evil[.]рф/a"],
+    ["xn--e1afmkfd.xn--p1ai/a", "xn--e1afmkfd[.]xn--p1ai/a"],
+    ["evil.xn--p1ai/a", "evil[.]xn--p1ai/a"],
+    // Ideographic and full-width full stops, which IDNA maps to ".".
+    ["evil。com/a", "evil[.]com/a"],
+    ["evil．com/a", "evil[.]com/a"],
+    ["evil｡com/a", "evil[.]com/a"],
+    // Upper case and a label ending in an underscore.
+    ["EVIL.COM/A", "EVIL[.]COM/A"],
+    ["a_.evil.com", "a_[.]evil[.]com"],
+    // IPv4 with a port, inside a URL, and IPv6 literals bracketed or bare.
+    ["10.0.0.1:8080/x", "10[.]0[.]0[.]1:8080/x"],
+    ["http://192.168.1.10/x", "http[:]//192[.]168[.]1[.]10/x"],
+    ["http://[2001:db8::1]/x", "http[:]//[2001[:]db8[:][:]1]/x"],
+    ["see 2001:db8::1 now", "see 2001[:]db8[:][:]1 now"],
+    ["fe80::1%en0", "fe80[:][:]1%en0"],
+    ["::ffff:1.2.3.4", "[:][:]ffff[:]1[.]2[.]3[.]4"],
+    // Other schemes, with and without "//".
+    ["ftp://evil.com/x", "ftp[:]//evil[.]com/x"],
+    ["tg://resolve?domain=x", "tg[:]//resolve?domain=x"],
+    ["ton://evil/x", "ton[:]//evil/x"],
+    ["mailto:a@evil.com", "mailto[:]a@evil[.]com"],
+    ["tel:+15551234", "tel[:]+15551234"],
+    ["javascript:alert(1)", "javascript[:]alert(1)"],
+    ["data:text/html;base64,QUJD", "data[:]text/html;base64,QUJD"],
+    ["MAILTO:a@evil.com", "MAILTO[:]a@evil[.]com"],
+  ];
+
+  it.each(cases)("%s", (input, expected) => {
+    expect(defangWebhookLinks(input)).toBe(expected);
+  });
+
+  it("leaves ordinary prose readable", () => {
+    expect(defangWebhookLinks("v1.2 ok at 10:30:00, status: done. Next step")).toBe("v1.2 ok at 10:30:00, status: done. Next step");
+  });
+
+  it("is idempotent", () => {
+    for (const [input] of cases) {
+      const once = defangWebhookLinks(input);
+      expect(defangWebhookLinks(once)).toBe(once);
+    }
+  });
+});
