@@ -131,8 +131,8 @@ voice:
     maxCallSeconds: 300
     maxCallsPerDay: 10
     maxMinutesPerDay: 20
-    maxUnverifiedCallsPerDay: 10  # voicemails and calls still at the PIN prompt
-    maxUnverifiedMinutesPerDay: 10
+    maxUnverifiedCallsPerDay: 5  # voicemails and calls still at the PIN prompt
+    maxUnverifiedMinutesPerDay: 5
     maxConcurrentCalls: 1
     maxTurnsPerCall: 30
     maxThinkSeconds: 60

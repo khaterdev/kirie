@@ -68,8 +68,8 @@ export const VoiceConfigSchema = z.object({
      * prompt) have their own daily budget, so a spoofed or unknown caller
      * cannot use up the two caps above. A call joins those caps once its PIN is right.
      */
-    maxUnverifiedCallsPerDay: z.number().int().min(0).default(10),
-    maxUnverifiedMinutesPerDay: z.number().int().min(0).default(10),
+    maxUnverifiedCallsPerDay: z.number().int().min(0).default(5),
+    maxUnverifiedMinutesPerDay: z.number().int().min(0).default(5),
     maxConcurrentCalls: z.number().int().min(1).max(5).default(1),
     maxTurnsPerCall: z.number().int().min(1).default(30),
     maxThinkSeconds: z.number().int().min(10).max(300).default(60),
