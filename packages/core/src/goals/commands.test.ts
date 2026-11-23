@@ -203,6 +203,17 @@ describe("/goal", () => {
     expect(evaluateCheck).not.toHaveBeenCalled();
   });
 
+  it("/goal on describes agent-created goals as goals.agentCreate sets them (CONF-N7)", async () => {
+    enabled = false;
+    expect((await run("/goal on")).text).toContain("still need your tap on Start");
+    cfg = { ...cfg, agentCreate: "allow" };
+    const allow = (await run("/goal on")).text;
+    expect(allow).not.toContain("tap");
+    expect(allow).toContain("start without asking you");
+    cfg = { ...cfg, agentCreate: "deny" };
+    expect((await run("/goal on")).text).toContain("cannot start goals");
+  });
+
   it("/goal on and off persist the runtime override", async () => {
     enabled = false;
     expect((await run("/goal on")).text).toContain("Goals are on");

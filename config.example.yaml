@@ -265,7 +265,7 @@ proactive:
 #   docker:
 #     image: "kirie-sandbox:latest"
 #     workspaceDir: "~/.kirie/sandbox-workspace"
-#     readPaths: []               # host paths mounted read-only
+#     readPaths: []               # extra host paths the host file tools may read in docker mode (not mounted into the container)
 #     readOnlyRoot: true
 #     network: "none"             # "none" or "bridge"
 #     capDrop: ["ALL"]
@@ -349,7 +349,7 @@ proactive:
 #   defaultToolProfile: "summarize"
 #   allowFullProfile: false
 #   onSuspiciousPayload: "downgrade"
-#   secretDelivery: "file"
+#   secretDelivery: "file"        # parsed but not read: secrets are always shown as a 0600 file ("chat" is not built)
 #   maxBodyBytes: 524288
 #   timestampToleranceSeconds: 300
 #   deliveryRetentionDays: 30
@@ -424,6 +424,8 @@ proactive:
 
 # goals:                          # /goal (off; /goal on)
 #   enabled: false
+#   judgeModel: "claude-haiku-4-5" # unset = the utility model (proactive.tier2Model)
+#   workerModel: "claude-sonnet-4-5" # unset = agent.model
 #   maxRounds: 10
 #   maxMinutes: 120
 #   maxCostUsd: 10

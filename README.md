@@ -125,15 +125,15 @@ Everything below ships **off** unless the Default column says otherwise. Each fe
 | Heartbeat control | follows `proactive.enabled` | `proactive.*` | `/heartbeat` (alias `/hb`) |
 | Webhook triggers | off | `webhooks.enabled`, `ingress.publicBaseUrl` | `/webhook on` |
 | Undo file edits | off | `undo.enabled` | `/undo on` (see [docs/undo.md](docs/undo.md)) |
-| Sandboxed shell commands* | off | `sandbox.mode` | `/sandbox` |
+| Sandboxed shell commands | off | `sandbox.mode` | `/sandbox` (see [docs/sandbox.md](docs/sandbox.md)) |
 | Plugins | off | `plugins.enabled` | `/plugins on`, `/plugins enable <name>` |
-| Computer use (desktop control)* | off | `computerUse.enabled` (config, restart) | `/computer on` |
-| Voice calls (Twilio or Plivo) | off | `voice.enabled`, `voice.provider` (config, restart) | `/voice`, `/call` |
+| Computer use (desktop control) | off | `computerUse.enabled` (config, restart) | `/computer on` (see [docs/computer-use-setup.md](docs/computer-use-setup.md)) |
+| Voice calls (Twilio or Plivo) | off | `voice.enabled`, `voice.provider` (config, restart) | `/voice`, `/call`, which exist only once `voice.enabled: true` (see note) |
 | Strict MCP config | off | `agent.strictMcpConfig` (config) | none |
 
-\* Built in a workstream that merges separately; its command and doc arrive with it.
+Voice differs from the rest: `/voice` and `/call` are registered only when `voice.enabled: true` is in the config (restart), so before that `/voice` is not a command and goes to the agent as text. Once it is enabled and the active provider has its credentials, numbers and public URL, voice is active from boot with no `/voice on`; `/voice off` is the runtime switch. See [docs/voice-setup.md](docs/voice-setup.md).
 
-When bound to loopback (the default), the control plane on port 18789 also refuses requests whose `Host` header is not a loopback name (a DNS-rebinding guard); add names to `gateway.extraAllowedHosts` if you need them. Every key, with its default, is in [`config.example.yaml`](config.example.yaml). Feature docs: [approvals](docs/approvals.md), [plugins](docs/plugins.md), [secret scrubbing](docs/secret-scrubbing.md), [undo](docs/undo.md), [voice](docs/voice-setup.md), [webhooks](docs/webhooks.md).
+When bound to loopback (the default), the control plane on port 18789 also refuses requests whose `Host` header is not a loopback name (a DNS-rebinding guard); add names to `gateway.extraAllowedHosts` if you need them. Every key, with its default, is in [`config.example.yaml`](config.example.yaml). Feature docs: [approvals](docs/approvals.md), [computer use](docs/computer-use-setup.md), [plugins](docs/plugins.md), [sandbox](docs/sandbox.md), [secret scrubbing](docs/secret-scrubbing.md), [undo](docs/undo.md), [voice](docs/voice-setup.md), [webhooks](docs/webhooks.md).
 
 ---
 
@@ -471,13 +471,15 @@ Kirie supports Docker-based sandboxing for isolated code execution:
 - **Dockerfile.sandbox** - Minimal Debian with common dev tools
 - **Dockerfile.sandbox-browser** - Playwright Chromium + VNC for browser automation
 
-Configure in `config.yaml`:
+Configure in `config.yaml` (or switch at runtime with `/sandbox docker`):
 
 ```yaml
 sandbox:
-  mode: "docker"
-  scope: "session"     # "shared", "agent", or "session"
+  mode: "docker"       # "off" (default), "native" or "docker"
+  scope: "shared"      # only "shared" is implemented
 ```
+
+Build the image with `scripts/sandbox-setup.sh`. Details, limits and the native (Seatbelt) mode: [docs/sandbox.md](docs/sandbox.md).
 
 ---
 

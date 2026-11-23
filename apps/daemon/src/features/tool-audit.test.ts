@@ -10,8 +10,8 @@
  *   is shadowed by a built-in of the same name;
  * - no tool name in either registry is a mutation the agent must not have.
  *
- * Names are checked by rule, so tools that sandbox and computer use add later
- * are covered without editing this file.
+ * Names are checked by rule, so tools a later feature adds are covered without
+ * editing this file.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";

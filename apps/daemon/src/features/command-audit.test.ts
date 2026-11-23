@@ -10,8 +10,8 @@
  * - the generated /help lists owner commands to the owner and hides them from
  *   anyone else, and `/help <owner command>` answers a non-owner as unknown.
  *
- * Commands are checked by rule, not against a fixed list, so features that are
- * still being filled in (sandbox, computer use) are covered when they land.
+ * Commands are checked by rule, not against a fixed list, so a command added
+ * by a later feature is covered without editing this file.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";

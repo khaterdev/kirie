@@ -59,6 +59,13 @@ export const GOAL_USAGE = [
   "/goal on | /goal off   (off by default)",
 ].join("\n");
 
+/** What /goal on says about goals the agent asks for, by `goals.agentCreate`. */
+const AGENT_GOAL_NOTE: Record<GoalsConfig["agentCreate"], string> = {
+  ask: "Goals the agent asks for still need your tap on Start.",
+  allow: "Goals the agent asks for start without asking you (goals.agentCreate: allow).",
+  deny: "The agent cannot start goals (goals.agentCreate: deny).",
+};
+
 export interface GoalCommandDeps {
   controller: Pick<GoalController, "reviewChecks" | "createGoal" | "get" | "list" | "openGoals" | "stop" | "pause" | "resume">;
   settings: Pick<RuntimeSettings, "set">;
@@ -323,7 +330,7 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
           case "off": {
             const enable = sub === "on";
             deps.settings.set(GOAL_SETTING_KEY, enable, actorOf(ctx));
-            if (enable) return "Goals are on. Start one with /goal <text>. Goals the agent asks for still need your tap on Start.";
+            if (enable) return `Goals are on. Start one with /goal <text>. ${AGENT_GOAL_NOTE[deps.config().agentCreate]}`;
             const running = deps.controller.openGoals().filter((g) => ["running", "checking", "judging"].includes(g.status));
             return running.length > 0
               ? `Goals are off: nothing new starts. ${running.length} goal(s) still running (${running.map((g) => g.id).join(", ")}); /goal stop <id> ends one.`

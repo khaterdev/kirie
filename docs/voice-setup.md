@@ -16,7 +16,11 @@ Kirie can phone you (and allowlisted contacts) and, if you allow it, take calls 
 
 ## Off by default
 
-With the default config nothing voice-related is constructed, registered, mounted or callable. Even with `voice.enabled: true`, voice does nothing until:
+With the default config nothing voice-related is constructed, registered, mounted or callable, and that includes the owner commands: `/voice` and `/call` exist only once `voice.enabled: true` is set in `config.yaml` and the daemon is restarted. Until then `/voice status` is not a command; it goes to the agent as ordinary text, and `/help` does not list it.
+
+Once `voice.enabled: true` and the active provider is ready (the list below), voice is **active from boot**: there is no `/voice on` step. `/voice off` is the runtime switch that turns it off again (and `/voice on` turns it back on).
+
+Even with `voice.enabled: true`, voice does nothing until:
 
 1. The active provider has its credentials (see [Credentials](#credentials)).
 2. `voice.<provider>.fromNumber` is the provider number in E.164 (`+14155550100`).

@@ -49,7 +49,7 @@ const USAGE = [
 ].join("\n");
 
 const HELP_TEXT =
-  "Control what I may run without asking. yolo: I never ask. ask: risky actions (rm -rf, force push, kubectl delete, helm uninstall, reading secrets, sudo) wait for your Approve or Deny, and no answer in 5 minutes means deny. Example: /approvals mode ask, /approvals deny \"terraform destroy*\", /approvals test \"git push -f origin main\"";
+  "Control what I may run without asking. yolo: I never ask. ask: risky actions (rm -rf, force push, kubectl delete, helm uninstall, reading secrets, sudo) wait for your Approve or Deny, and no answer within approvals.timeoutSeconds (5 minutes by default; /approvals status shows it) means deny. Example: /approvals mode ask, /approvals deny \"terraform destroy*\", /approvals test \"git push -f origin main\"";
 
 function actor(ctx: CommandContext): string {
   return `owner:${ctx.message.channel}:${ctx.message.senderId}`;
