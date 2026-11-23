@@ -31,8 +31,10 @@ class FakeAccounts implements ResilienceAccountSource {
   enabledCount(): number {
     return this.ids.length;
   }
-  acquire(opts: { exclude?: ReadonlySet<string> } = {}): AccountAcquireResult {
-    const usable = (id: string): boolean => !this.limited.has(id) && !(opts.exclude?.has(id) ?? false);
+  switches = 0;
+  acquire(opts: { exclude?: ReadonlySet<string>; accept?: (id: string) => boolean } = {}): AccountAcquireResult {
+    const usable = (id: string): boolean =>
+      !this.limited.has(id) && !(opts.exclude?.has(id) ?? false) && (opts.accept?.(id) ?? true);
     const lease = (id: string, exhausted = false): AccountAcquireResult => ({
       accountId: id,
       env: { CLAUDE_CONFIG_DIR: `/home/test/.${id}` },
@@ -43,6 +45,7 @@ class FakeAccounts implements ResilienceAccountSource {
     if (this.rotation || opts.exclude) {
       const next = this.ids.find(usable);
       if (next) {
+        if (next !== this.active) this.switches += 1;
         this.active = next;
         return lease(next);
       }
@@ -163,6 +166,25 @@ describe("TurnResilience", () => {
     expect(sonnet).toMatchObject({ accountId: "b", model: "sonnet" });
     expect(fallback.isBenched("a", "opus")).toBe(true);
     expect(store.getModelLimit("a", "opus")?.limitedUntil).toBe(clock + 3_600_000);
+  });
+
+  it("a model-scoped limit skips accounts benched for that model without switching to them", () => {
+    const accounts = new FakeAccounts(["a", "b", "c"]);
+    fallback.bench("b", "opus", undefined, "usage_limit_model");
+    fallback.bench("c", "opus", undefined, "usage_limit_model");
+    const plan = new TurnResilience({ accounts, models: fallback }).begin({ kind: "chat", primaryModel: "opus" });
+    const next = plan.next(fail("usage_limit_model"))!;
+    expect(next).toMatchObject({ accountId: "a", model: "sonnet" });
+    expect(accounts.switches).toBe(0);
+    expect(accounts.active).toBe("a");
+  });
+
+  it("a blocked lease (no account may be used) is reported, never spawned", () => {
+    const accounts = new FakeAccounts(["a"]);
+    vi.spyOn(accounts, "acquire").mockReturnValue({ accountId: null, env: undefined, exhausted: true, blocked: true });
+    const plan = new TurnResilience({ accounts }).begin({ kind: "chat", primaryModel: "opus" });
+    expect(plan.blockedFailure?.class).toBe("auth");
+    expect(new TurnResilience({ accounts: new FakeAccounts(["a"]) }).begin({ kind: "chat", primaryModel: "opus" }).blockedFailure).toBeNull();
   });
 
   it("maxAttemptsPerTurn bounds the total across accounts and models", () => {

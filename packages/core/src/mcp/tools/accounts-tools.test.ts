@@ -42,7 +42,7 @@ describe("accounts MCP tools", () => {
     await tools.accounts_import!.handler({ config_dir: "~/.claude3" });
     const calls = fetchSpy.mock.calls as unknown as Array<[string, RequestInit]>;
     expect(calls.map((c) => [c[1].method, c[0]])).toEqual([
-      ["GET", "http://127.0.0.1:1/api/accounts/"],
+      ["GET", "http://127.0.0.1:1/api/accounts"],
       ["POST", "http://127.0.0.1:1/api/accounts/claude2/use"],
       ["POST", "http://127.0.0.1:1/api/accounts/import"],
     ]);

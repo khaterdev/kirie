@@ -52,7 +52,8 @@ export const createAccountsTools: FeatureToolFactory = (ctx) => {
       description:
         "List Kirie's Claude accounts: which is active, each one's status (ok, limited until, needs login, disabled), whether rotation is on, the earliest reset, and the model fallback chain with benched models.",
       parameters: { type: "object", properties: {}, required: [] },
-      handler: () => call(baseUrl, "GET", "/"),
+      // "" not "/": the gateway mounts the sub-app at /api/accounts and matches paths strictly.
+      handler: () => call(baseUrl, "GET", ""),
     },
     accounts_discover: {
       description: "List the ~/.claude* config dirs on this machine, whether each looks logged in, and whether it is imported. Spawns nothing and uses no quota.",

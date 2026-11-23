@@ -261,6 +261,48 @@ describe("AccountManager", () => {
     expect(authErr).toHaveBeenCalledWith({ accountId: "main", reason: "identity_changed" });
   });
 
+  it("a signed-out or re-logged account is never handed out, even as the exhausted fallback", async () => {
+    await importThree();
+    writeIdentity(join(home, ".claude.json"), "uuid-someone-else", "other@example.invalid");
+    clock = T0 + IDENTITY_RECHECK_MS + 1;
+    // Rotation off: the active account fails its pin; nothing may be used.
+    expect(manager.acquire()).toMatchObject({ accountId: null, env: undefined, exhausted: true, blocked: true });
+    expect(manager.get("main")?.status).toBe("auth_error");
+    // Rotation on with every other account limited: the limited one resetting first is the fallback.
+    rotation = true;
+    manager.reportFailure("claude2", limit({ resetAtMs: clock + 9 * 3_600_000 }));
+    manager.reportFailure("claude3", limit({ resetAtMs: clock + 2 * 3_600_000 }));
+    expect(manager.acquire()).toMatchObject({ accountId: "claude3", exhausted: true });
+    // All signed out: blocked.
+    manager.reportFailure("claude2", { class: "auth", message: "Not logged in" });
+    manager.reportFailure("claude3", { class: "auth", message: "Not logged in" });
+    expect(manager.acquire()).toMatchObject({ accountId: null, blocked: true });
+  });
+
+  it("a limited fallback whose login changed is not used either", async () => {
+    await importThree();
+    manager.reportFailure("main", limit({ resetAtMs: T0 + 3_600_000 }));
+    writeIdentity(join(home, ".claude.json"), "uuid-someone-else", "other@example.invalid");
+    clock = T0 + IDENTITY_RECHECK_MS + 1;
+    expect(manager.acquire()).toMatchObject({ accountId: null, blocked: true });
+  });
+
+  it("accept skips candidates before any switch (one rotation, one notice)", async () => {
+    await importThree();
+    rotation = true;
+    const rotated = vi.fn();
+    manager.on("rotated", rotated);
+    const lease = manager.acquire({ exclude: new Set(["main"]), accept: (id) => id !== "claude2" });
+    expect(lease.accountId).toBe("claude3");
+    expect(manager.activeAccountId()).toBe("claude3");
+    expect(rotated).toHaveBeenCalledTimes(1);
+    expect(rotated).toHaveBeenCalledWith(expect.objectContaining({ from: "main", to: "claude3" }));
+  });
+
+  it('"all" cannot be an account id', async () => {
+    await expect(manager.importDir("~/.claude2", { actor: "o", id: "all" })).rejects.toThrow(/reserved/);
+  });
+
   it("identity pin: a file caught mid-write is not held against the account", async () => {
     await importThree();
     writeFileSync(join(home, ".claude.json"), '{"oauthAcc');

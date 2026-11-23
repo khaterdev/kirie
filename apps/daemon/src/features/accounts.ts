@@ -138,6 +138,9 @@ export const setupAccounts: FeatureSetup = (ctx) => {
     (options, call) => {
       if (!ENV_CONTRIBUTOR_KINDS.has(call.kind) || options.env || !manager.hasAccounts()) return;
       const lease = manager.acquire();
+      // Fail closed: with every imported account signed out (or its login
+      // changed) the call must not run on whatever login the daemon has.
+      if (lease.blocked) throw new Error("no usable Claude account: every imported account is signed out or its login changed");
       if (lease.env) options.env = lease.env;
     },
     20,

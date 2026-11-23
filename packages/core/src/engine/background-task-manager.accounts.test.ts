@@ -134,7 +134,8 @@ describe("BackgroundTaskManager with account rotation and model fallback", () =>
     const done = await settle(store, task.id);
     expect(done.status).toBe("completed");
     expect(done.result).toBe("done on /b");
-    expect(done.rotation_attempts).toBe(1);
+    // The good turn ended the limit episode.
+    expect(done.rotation_attempts).toBe(0);
     expect(done.account_id).toBe("b");
     expect(sdk.calls.map((c) => (c.options.env as Record<string, string>).CLAUDE_CONFIG_DIR)).toEqual(["/a", "/b"]);
     expect(sdk.calls[1]!.options.resume).toBe("55555555-5555-4555-8555-555555555555");
@@ -153,6 +154,17 @@ describe("BackgroundTaskManager with account rotation and model fallback", () =>
     expect(done.error).toMatch(/\[usage_limit_account\]$/);
     expect(onTaskComplete).not.toHaveBeenCalled();
     expect(onTaskFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it("with no usable account the task fails without spawning", async () => {
+    const accounts = new Accounts(["a"]);
+    vi.spyOn(accounts, "acquire").mockReturnValue({ accountId: null, env: undefined, exhausted: true, blocked: true });
+    start(new TurnResilience({ accounts }));
+    const task = store.create("telegram:dm:1", "research", "work");
+    const done = await settle(store, task.id);
+    expect(done.status).toBe("failed");
+    expect(done.error).toMatch(/\[auth\]$/);
+    expect(sdk.calls).toHaveLength(0);
   });
 
   it("re-queues are capped", async () => {

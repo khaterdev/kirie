@@ -274,6 +274,11 @@ export class AgentEngine implements AgentExecutor {
     // SDK session is resumed under the next account when it can be carried.
     const plan = resilience.begin({ kind: "chat", primaryModel: builtPrompt.model ?? "" });
     const tz = this.config.prompt?.timezone;
+    // No imported account may be used: never spawn on a login the owner did not import.
+    const blocked = plan.blockedFailure;
+    if (blocked) {
+      return { response: "", sessionId: sessionId ?? "", costUsd: 0, numTurns: 0, isError: true, failure: blocked, accountId: null };
+    }
     let prompt = userPrompt;
     let resume = sessionId;
     const carried = (advance: TurnAdvance, sid: string | undefined): string | undefined => {

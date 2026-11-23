@@ -329,6 +329,11 @@ export class BackgroundTaskStore {
     return info.changes > 0;
   }
 
+  /** Start a new limit episode: the next failure gets the full re-queue allowance again. */
+  resetRotationAttempts(id: string): void {
+    this.db.prepare("UPDATE background_tasks SET rotation_attempts = 0 WHERE id = ? AND rotation_attempts > 0").run(id);
+  }
+
   /**
    * Update task with completion result. A task already cancelled, completed
    * or failed keeps its outcome.

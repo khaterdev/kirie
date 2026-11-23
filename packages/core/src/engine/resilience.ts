@@ -34,8 +34,14 @@ export interface AccountLease {
 }
 
 export interface AccountAcquireResult extends AccountLease {
-  /** No usable account: the lease is the active one anyway, so the caller can decide */
+  /** No usable account: the lease is a limited account anyway, so the caller can decide */
   readonly exhausted: boolean;
+  /**
+   * No account may be used at all (every candidate is signed out or its login
+   * changed). The caller must not spawn: env is undefined and must not be
+   * read as "use the daemon's login".
+   */
+  readonly blocked?: boolean;
   /** Earliest time an unusable account becomes usable again */
   readonly earliestResetAt?: number;
 }
@@ -45,8 +51,11 @@ export type TranscriptCarry = "same" | "copied" | "failed";
 /** What the loop needs from the account manager. */
 export interface ResilienceAccountSource {
   hasAccounts(): boolean;
-  /** Turn start: the account to use. May rotate away from an unusable active account when rotation is on. */
-  acquire(opts?: { exclude?: ReadonlySet<string> }): AccountAcquireResult;
+  /**
+   * Turn start: the account to use. May rotate away from an unusable active
+   * account when rotation is on. `accept` skips candidates before any switch.
+   */
+  acquire(opts?: { exclude?: ReadonlySet<string>; accept?: (accountId: string) => boolean }): AccountAcquireResult;
   /** Record an account-wide limit or an auth failure against the account that ran the attempt. */
   reportFailure(accountId: string, failure: FailureInfo): void;
   reportSuccess(accountId: string): void;
@@ -117,6 +126,7 @@ export class TurnPlan {
   private readonly triedPairs = new Set<string>();
   private exhausted: boolean;
   private earliestResetAt: number | undefined;
+  private readonly blocked: boolean;
 
   constructor(
     private readonly accounts: ResilienceAccountSource | null,
@@ -128,6 +138,7 @@ export class TurnPlan {
       ? accounts.acquire()
       : { accountId: null, env: undefined, exhausted: false };
     this.exhausted = lease.exhausted;
+    this.blocked = lease.blocked === true;
     this.earliestResetAt = lease.earliestResetAt;
     this.cur = { accountId: lease.accountId, env: lease.env, model: this.modelFor(lease.accountId) };
     if (lease.accountId !== null) this.triedAccounts.add(lease.accountId);
@@ -137,6 +148,15 @@ export class TurnPlan {
   /** The candidate for the current attempt. */
   get current(): TurnCandidate {
     return this.cur;
+  }
+
+  /**
+   * Set when no imported account may be used (all signed out, or their login
+   * changed). The engine must not spawn and reports this failure instead.
+   */
+  get blockedFailure(): FailureInfo | null {
+    if (!this.blocked) return null;
+    return { class: "auth", message: "no usable Claude account: every imported account is signed out or its login changed" };
   }
 
   /** Number of attempts so far, including the current one. */
@@ -225,20 +245,22 @@ export class TurnPlan {
   private nextAccount(requireModel?: string): TurnCandidate | null {
     const accounts = this.accounts;
     if (!accounts || !accounts.hasAccounts() || !accounts.rotationEnabled()) return null;
-    while (this.rotations < accounts.maxRotationsPerTurn()) {
-      const lease = accounts.acquire({ exclude: this.triedAccounts });
-      if (lease.exhausted || lease.accountId === null || this.triedAccounts.has(lease.accountId)) {
-        this.exhausted = true;
-        this.earliestResetAt = lease.earliestResetAt;
-        return null;
-      }
-      this.rotations += 1;
-      this.triedAccounts.add(lease.accountId);
-      // A model-scoped limit keeps the model while some account can still serve it.
-      if (requireModel && this.models?.isBenched(lease.accountId, requireModel)) continue;
-      return { accountId: lease.accountId, env: lease.env, model: requireModel ?? this.modelFor(lease.accountId) };
+    if (this.rotations >= accounts.maxRotationsPerTurn()) return null;
+    // A model-scoped limit keeps the model while some account can still serve
+    // it; accounts benched for that model are skipped before any switch.
+    const models = this.models;
+    const lease = accounts.acquire({
+      exclude: this.triedAccounts,
+      ...(requireModel && models ? { accept: (id: string) => !models.isBenched(id, requireModel) } : {}),
+    });
+    if (lease.exhausted || lease.blocked || lease.accountId === null || this.triedAccounts.has(lease.accountId)) {
+      this.exhausted = true;
+      this.earliestResetAt = lease.earliestResetAt;
+      return null;
     }
-    return null;
+    this.rotations += 1;
+    this.triedAccounts.add(lease.accountId);
+    return { accountId: lease.accountId, env: lease.env, model: requireModel ?? this.modelFor(lease.accountId) };
   }
 
   private nextModel(prev: TurnCandidate, cls: FailureClass): TurnCandidate | null {

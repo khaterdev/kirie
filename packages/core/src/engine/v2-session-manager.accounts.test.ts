@@ -372,6 +372,19 @@ describe("V2SessionManager with account rotation and model fallback", () => {
     ]);
   });
 
+  it("an account whose login changed is never spawned: the turn returns an auth failure", async () => {
+    rotation = false;
+    await importAccounts("~/.claude");
+    writeIdentity(join(home, ".claude.json"), "uuid-someone-else");
+    // Force the pin to look again.
+    const m = manager as unknown as { identityCheckedAt: Map<string, number> };
+    m.identityCheckedAt.clear();
+    const result = await v2.execute(msg("hello"), owner);
+    expect(result.isError).toBe(true);
+    expect(result.failure?.class).toBe("auth");
+    expect(sdk.calls).toHaveLength(0);
+  });
+
   it("a thrown limit with no account to move to rejects with the classification attached", async () => {
     await importAccounts("~/.claude");
     sdk.limited.add("default");

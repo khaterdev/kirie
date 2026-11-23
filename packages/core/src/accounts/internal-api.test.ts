@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { Hono } from "hono";
 import { AuditTrail } from "../security/audit-trail.js";
 import { RuntimeSettings } from "../config/runtime-settings.js";
 import { AccountsConfigSchema } from "../config/sections/accounts.js";
@@ -129,6 +130,19 @@ describe("accounts internal API", () => {
     expect(actors).toContain("agent:unknown");
     expect((await post("/NOT_AN_ID/use", {})).status).toBe(400);
     expect((await post("/main/enabled", { enabled: "yes" })).status).toBe(400);
+  });
+
+  it("is reachable at /api/accounts when mounted like the gateway does (strict paths)", async () => {
+    const gateway = new Hono();
+    gateway.route("/api/accounts", app);
+    expect((await gateway.request("/api/accounts")).status).toBe(200);
+    expect((await gateway.request("/api/accounts/discover")).status).toBe(200);
+  });
+
+  it("the agent cannot reset every account at once", async () => {
+    await manager.importDir("~/.claude2", { actor: "owner:test", verify: false });
+    expect((await post("/all/reset", {})).status).toBe(400);
+    expect((await post("/nobody/reset", {})).status).toBe(400);
   });
 
   it("has no route that removes an account or changes the fallback chain", async () => {

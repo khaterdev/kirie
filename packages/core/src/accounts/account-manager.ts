@@ -215,7 +215,7 @@ export class AccountManager implements ResilienceAccountSource {
     return this.opts.config().rotation.carrySession;
   }
 
-  acquire(opts: { exclude?: ReadonlySet<string> } = {}): AccountAcquireResult {
+  acquire(opts: { exclude?: ReadonlySet<string>; accept?: (accountId: string) => boolean } = {}): AccountAcquireResult {
     const now = this.now();
     this.recoverExpired(now);
     const enabled = this.store.list().filter((a) => a.enabled);
@@ -223,13 +223,14 @@ export class AccountManager implements ResilienceAccountSource {
 
     const exclude = opts.exclude;
     const isExcluded = (a: ClaudeAccount): boolean => exclude?.has(a.id) ?? false;
-    const usable = (a: ClaudeAccount): boolean => !isExcluded(a) && a.status === "ok" && this.identityOk(a);
+    const accepted = (a: ClaudeAccount): boolean => opts.accept?.(a.id) ?? true;
+    const usable = (a: ClaudeAccount): boolean => !isExcluded(a) && accepted(a) && a.status === "ok" && this.identityOk(a);
     const firstUsable = (): ClaudeAccount | undefined => enabled.find((a) => usable(this.store.get(a.id) ?? a));
 
     const activeId = this.store.getActiveId();
     const active = enabled.find((a) => a.id === activeId);
 
-    if (active && !isExcluded(active)) {
+    if (active && !isExcluded(active) && accepted(active)) {
       if (this.opts.config().rotation.returnToPrimary && this.rotationEnabled()) {
         const primary = firstUsable();
         if (primary && primary.id !== active.id && primary.priority < active.priority) {
@@ -241,13 +242,13 @@ export class AccountManager implements ResilienceAccountSource {
 
     const current = active ? this.store.get(active.id) ?? active : undefined;
     // The active account is gone or disabled: that is not a rotation decision.
-    const mayMove = !current || isExcluded(current) || this.rotationEnabled();
+    const mayMove = !current || isExcluded(current) || !accepted(current) || this.rotationEnabled();
     if (mayMove) {
       const next = firstUsable();
       if (next) {
         const cause: AccountRotationCause = !current
           ? "disabled"
-          : isExcluded(current) && current.status === "ok"
+          : (isExcluded(current) || !accepted(current)) && current.status === "ok"
             ? "model_limit"
             : current.status === "auth_error"
               ? "auth"
@@ -256,11 +257,16 @@ export class AccountManager implements ResilienceAccountSource {
       }
     }
 
-    const fallback = current ?? enabled[0]!;
+    // Nothing usable. A limited account may still be tried (its reset may be a
+    // guess); a signed-out account, or one whose login changed, never is.
     const earliest = this.earliestReset();
     if (!this.exhaustedNotified && this.rotationEnabled()) {
       this.exhaustedNotified = true;
       this.emit("exhausted", { earliest });
+    }
+    const fallback = this.limitedFallback(current, enabled);
+    if (!fallback) {
+      return { accountId: null, env: undefined, exhausted: true, blocked: true, ...(earliest ? { earliestResetAt: earliest.atMs } : {}) };
     }
     return {
       accountId: fallback.id,
@@ -546,6 +552,7 @@ export class AccountManager implements ResilienceAccountSource {
   private pickId(requested: string | undefined, path: string, kind: ClaudeAccount["kind"]): string {
     if (requested !== undefined) {
       if (!ACCOUNT_ID_RE.test(requested)) throw new AccountImportError("account ids are 1 to 32 lower-case letters, digits or dashes");
+      if (requested === "all") throw new AccountImportError('"all" is reserved');
       if (this.store.get(requested)) throw new AccountImportError(`the id ${requested} is taken`);
       return requested;
     }
@@ -580,6 +587,25 @@ export class AccountManager implements ResilienceAccountSource {
       ...(from?.limitType ? { fromLimitType: from.limitType } : {}),
     });
     return this.lease(to);
+  }
+
+  /**
+   * The account an exhausted lease names: the active one when it is merely
+   * limited, else (rotation on) the limited account that resets first. Its
+   * identity is checked like any other use. Null when none qualifies.
+   */
+  private limitedFallback(current: ClaudeAccount | undefined, enabled: readonly ClaudeAccount[]): ClaudeAccount | null {
+    const fresh = (a: ClaudeAccount): ClaudeAccount | null => this.store.get(a.id);
+    const ok = (a: ClaudeAccount | null): a is ClaudeAccount =>
+      !!a && a.enabled && a.status === "limited" && this.identityOk(a) && this.store.get(a.id)?.status === "limited";
+    const cur = current ? fresh(current) : null;
+    if (ok(cur)) return cur;
+    if (cur && !this.rotationEnabled()) return null;
+    const limited = enabled
+      .map(fresh)
+      .filter((a): a is ClaudeAccount => !!a && a.status === "limited")
+      .sort((a, b) => (a.limitedUntil ?? Infinity) - (b.limitedUntil ?? Infinity));
+    return limited.find((a) => ok(a)) ?? null;
   }
 
   private recoverExpired(now: number): void {

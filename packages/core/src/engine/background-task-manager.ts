@@ -452,6 +452,14 @@ export class BackgroundTaskManager {
     const ctx = this.buildContext(task, profile);
     const primaryModel = typeof profile?.options?.model === "string" ? profile.options.model : this.config.model;
     const plan = this.resilience?.begin({ kind: ctx.kind, primaryModel }) ?? null;
+    const blocked = plan?.blockedFailure;
+    if (blocked) {
+      // No imported account may be used: never spawn on a login the owner did not import.
+      log.warn({ taskId: task.id }, "no usable Claude account; failing the task without running it");
+      this.store.markFailed(task.id, formatTaskFailure(blocked));
+      void this.notifyFailed(task.id);
+      return;
+    }
     const accountId = plan?.current.accountId ?? null;
     if (plan) this.store.setAccount(task.id, accountId);
 
@@ -823,6 +831,8 @@ export class BackgroundTaskManager {
 
     // A limit is not the controller's business: restart on the next account or model first.
     if (turn.isError && isHardFailure(turn.failure) && this.tryRequeue(task, running, turn.failure)) return true;
+    // A good turn ends the limit episode: later limits get their own re-queues.
+    if (!turn.isError && running.plan) this.store.resetRotationAttempts(task.id);
 
     const controller = running.controller;
     if (!controller) {

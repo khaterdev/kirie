@@ -161,6 +161,16 @@ describe("accounts feature", () => {
     expect(opts.key).toBe("accounts:rotated:two");
   });
 
+  it("account-env fails closed when every imported account is signed out", async () => {
+    seedAccount("gone");
+    const store = new AccountStore(join(dataDir, "accounts.db"));
+    store.update("gone", { status: "auth_error", lastError: "Not logged in" });
+    store.close();
+    handle = await setupAccounts(ctx);
+    expect(() => apply("oneshot")).toThrow(/no usable Claude account/);
+    expect(apply("chat").env).toBeUndefined();
+  });
+
   it("stop removes the loop from the engines", async () => {
     handle = await setupAccounts(ctx);
     await handle.stop?.();

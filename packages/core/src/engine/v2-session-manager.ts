@@ -32,6 +32,7 @@ import {
   isHardFailure,
   logSdkSignal,
   newTurnSignals,
+  type FailureInfo,
   type TurnSignals,
 } from "./failure.js";
 import type { TurnAdvance, TurnCandidate, TurnResilience } from "./resilience.js";
@@ -196,6 +197,11 @@ export interface V2SessionManagerConfig {
   onUnsolicitedResult?: UnsolicitedResultHandler;
 }
 
+/** The returned failure of a turn that was not run because no account may be used. */
+function blockedResult(failure: FailureInfo, sessionId: string | undefined): ExecutionResult {
+  return { response: "", sessionId: sessionId ?? "", costUsd: 0, numTurns: 0, isError: true, failure, accountId: null };
+}
+
 /** Receives a result that arrived while no turn was waiting for it. */
 export type UnsolicitedResultHandler = (sessionKey: string, result: ExecutionResult) => void;
 
@@ -298,6 +304,9 @@ export class V2SessionManager implements AgentExecutor {
 
     const plan = resilience.begin({ kind: "chat", primaryModel: bootstrap.model ?? this.config.model });
     const tz = this.config.prompt?.timezone;
+    // No imported account may be used: never spawn on a login the owner did not import.
+    const blocked = plan.blockedFailure;
+    if (blocked) return blockedResult(blocked, sessionId);
     let prompt = userPrompt;
     let resumeId = sessionId;
     for (;;) {

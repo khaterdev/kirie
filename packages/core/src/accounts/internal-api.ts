@@ -192,7 +192,8 @@ export function createAccountsInternalApi(deps: AccountsInternalApiDeps): Hono {
     if (denied) return denied;
     const id = idParam(c);
     const b = await body(c);
-    if (!id) return c.json({ error: "invalid id" }, 400);
+    // One named account only: the agent cannot reset every account at once.
+    if (!id || id === "all" || !m.get(id)) return c.json({ error: "invalid id" }, 400);
     try {
       m.reset(id, agentActor(b));
       tell(`The agent cleared the limit or login error of Claude account ${id}.`, `accounts:agent:reset:${id}`);
