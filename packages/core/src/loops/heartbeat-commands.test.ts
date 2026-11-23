@@ -47,7 +47,6 @@ describe("/heartbeat", () => {
   let checklistPath: string;
   let def: CommandDefinition;
   let replies: string[];
-  let toolsNeedRestart: boolean;
   let logs: HeartbeatLogEntry[];
 
   function build(over: Partial<HeartbeatCommandDeps> = {}): void {
@@ -59,7 +58,6 @@ describe("/heartbeat", () => {
       logs: { recent: (n: number) => logs.slice(0, n) },
       countActiveLoops: () => 2,
       countSchedules: () => 4,
-      toolsNeedRestart: () => toolsNeedRestart,
       timezone: "UTC",
       ...over,
     }) as [CommandDefinition];
@@ -88,7 +86,6 @@ describe("/heartbeat", () => {
     engine = fakeEngine();
     checklistPath = join(dir, "HEARTBEAT.md");
     replies = [];
-    toolsNeedRestart = false;
     logs = [];
     build();
   });
@@ -122,13 +119,11 @@ describe("/heartbeat", () => {
     expect(await run("")).toContain("Heartbeat: paused");
   });
 
-  it("on starts the engine, persists, and notes the tools restart when the engine was off at boot", async () => {
+  it("on starts the engine and persists, with no restart note", async () => {
     engine.state.running = false;
-    expect(await run("on")).not.toContain("proactive_status");
-    expect(engine.start).toHaveBeenCalled();
-    toolsNeedRestart = true;
     const out = await run("on");
-    expect(out).toContain("proactive_status and proactive_trigger tools see the heartbeat only after a restart");
+    expect(engine.start).toHaveBeenCalled();
+    expect(out).not.toMatch(/restart \(\/restart\)|proactive_status/);
     // Persisted in a fresh reader (what lifecycle reads at the next boot)
     const reread = new RuntimeSettings(settings.path, { readonly: true });
     expect(reread.get("proactive.enabled", (await import("zod/v3")).z.boolean())).toBe(true);

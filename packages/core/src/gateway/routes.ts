@@ -301,7 +301,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
     }
 
     return c.json({
-      enabled: true,
+      enabled: engine.isRunning,
       running: engine.isRunning,
       signalQueueSize: engine.signalQueueSize,
       lastTriageAt: engine.lastTriageTimestamp,

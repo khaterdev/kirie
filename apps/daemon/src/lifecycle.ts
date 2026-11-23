@@ -691,8 +691,9 @@ export async function startDaemon(): Promise<void> {
 
   // 7b. ProactiveEngine: constructed whenever an owner identity exists, started
   //     only when proactive.enabled is effective (config, or the owner's
-  //     /heartbeat override). Tools and the gateway see it only when it was
-  //     effective at start, as before.
+  //     /heartbeat override). Tools and the gateway always get the engine, so
+  //     `/heartbeat on` reaches them without a restart; their trigger paths
+  //     refuse while it is stopped.
   const proactiveEffective = effectiveSettingFlag(settings, "proactive.enabled", config.proactive.enabled);
   let proactive: ProactiveEngine | null = null;
   const primaryOwner = owners.primary();
@@ -734,7 +735,6 @@ export async function startDaemon(): Promise<void> {
   } else if (config.proactive?.enabled) {
     log.warn("proactive layer enabled but no owner identities configured — skipping");
   }
-  const proactiveForTools = proactiveEffective ? proactive : null;
 
   const featureToolContext = { dbDir: resolve(dataDir), gatewayUrl, env: kirieToolsEnv };
   const { mcpShutdown, tools, scheduleStore, chatHistoryStore } = createMcpRegistry(
@@ -748,7 +748,7 @@ export async function startDaemon(): Promise<void> {
       memoryManager: memoryManager as unknown as McpServerOptions["memoryManager"],
       embeddingProvider,
       onRestart: () => void restartDaemon(),
-      proactiveEngine: proactiveForTools,
+      proactiveEngine: proactive,
       heartbeatLogStore: heartbeatLogStore ?? undefined,
       featureTools: featureToolContext,
     },
@@ -1269,7 +1269,7 @@ export async function startDaemon(): Promise<void> {
         log.info("restart requested via gateway");
         void restartDaemon();
       },
-      proactiveEngine: proactiveForTools,
+      proactiveEngine: proactive,
     },
     internalApi,
   });

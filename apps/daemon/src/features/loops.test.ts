@@ -218,20 +218,14 @@ describe("setupHeartbeatControl", () => {
     expect(effectiveSettingFlag(new RuntimeSettings(boot.path, { readonly: true }), "proactive.enabled", true)).toBe(true);
   });
 
-  it("/heartbeat on after a boot with the heartbeat off says the two tools need a restart", async () => {
+  it("/heartbeat on after a boot with the heartbeat off starts the engine with no restart note", async () => {
     const e = engine(false);
     const h = harness(dataDir, { proactive: e as unknown as DaemonContext["proactive"] }, { proactive: { enabled: false, heartbeatFile: join(dataDir, "HEARTBEAT.md") } });
     await setupHeartbeatControl(h.ctx);
     const [reply] = await send(h.ctx, "/heartbeat on");
     expect(e.start).toHaveBeenCalled();
-    expect(reply).toContain("proactive_status and proactive_trigger tools see the heartbeat only after a restart");
-
-    // Enabled at boot: no note
-    const e2 = engine(true);
-    const h2 = harness(dataDir, { proactive: e2 as unknown as DaemonContext["proactive"] });
-    h2.ctx.settings.delete("proactive.enabled", "test");
-    await setupHeartbeatControl(h2.ctx);
-    expect((await send(h2.ctx, "/heartbeat on"))[0]).not.toContain("proactive_status");
+    expect(reply).toContain("Heartbeat on");
+    expect(reply).not.toMatch(/after a restart|proactive_status/);
   });
 
   it("applies the persisted interval and snooze to the engine at setup", async () => {

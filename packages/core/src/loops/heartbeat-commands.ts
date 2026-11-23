@@ -55,11 +55,6 @@ export interface HeartbeatCommandDeps {
   logs?: Pick<HeartbeatLogStore, "recent"> | null;
   countActiveLoops?: () => number;
   countSchedules?: () => number;
-  /**
-   * True when the engine was off at boot: the agent's proactive_status and
-   * proactive_trigger tools were built without it and see it only after a restart.
-   */
-  toolsNeedRestart?: () => boolean;
   timezone?: string;
   now?: () => number;
 }
@@ -95,7 +90,6 @@ const USAGE = [
 ].join("\n");
 
 const NO_ENGINE = "The heartbeat is not available: no owner identity is configured (security.owner.identities).";
-const TOOLS_RESTART_NOTE = "Note: my proactive_status and proactive_trigger tools see the heartbeat only after a restart (/restart).";
 const TICK_NOTE = "The 10-second tick that delivers schedules, retries and loops keeps running.";
 
 function actor(ctx: CommandContext): string {
@@ -160,9 +154,7 @@ export function createHeartbeatCommands(deps: HeartbeatCommandDeps): CommandDefi
         deps.settings.set(HEARTBEAT_SETTING_ENABLED, true, actor(ctx));
         engine.start();
         const s = engine.status();
-        const lines = [`Heartbeat on: signal checks every tick, triage every ${formatDuration(s.tier2IntervalMinutes * 60_000)}. This stays on across restarts.`];
-        if (deps.toolsNeedRestart?.()) lines.push(TOOLS_RESTART_NOTE);
-        return lines.join("\n");
+        return `Heartbeat on: signal checks every tick, triage every ${formatDuration(s.tier2IntervalMinutes * 60_000)}. This stays on across restarts.`;
       }
 
       case "off": {
@@ -270,11 +262,7 @@ export function createHeartbeatCommands(deps: HeartbeatCommandDeps): CommandDefi
         engine.snooze(null);
         if (deps.config.enabled) engine.start();
         else engine.stop();
-        const lines = [
-          `Heartbeat overrides cleared. Back to the config: ${deps.config.enabled ? "on" : "off"}, triage every ${formatDuration(deps.config.tier2IntervalMinutes * 60_000)}, no snooze.`,
-        ];
-        if (deps.config.enabled && deps.toolsNeedRestart?.()) lines.push(TOOLS_RESTART_NOTE);
-        return lines.join("\n");
+        return `Heartbeat overrides cleared. Back to the config: ${deps.config.enabled ? "on" : "off"}, triage every ${formatDuration(deps.config.tier2IntervalMinutes * 60_000)}, no snooze.`;
       }
 
       default:

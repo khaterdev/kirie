@@ -4,7 +4,6 @@ import {
   applyHeartbeatOverrides,
   createHeartbeatCommands,
   createModuleLogger,
-  effectiveSettingFlag,
   resolveHeartbeatChecklistPath,
 } from "@kirie/core";
 import type { FeatureSetup } from "./types.js";
@@ -18,15 +17,12 @@ const log = createModuleLogger("feature-heartbeat-control");
  * (lifecycle already applied `proactive.enabled` when it decided whether to
  * start it) and registers `/heartbeat` (alias `/hb`).
  *
- * The agent's proactive_status and proactive_trigger tools, and the gateway's
- * /api/proactive routes, receive the engine only when it was enabled at boot
- * (lifecycle.ts). So after a boot with the heartbeat off, `/heartbeat on`
- * starts the engine but those two tools see it only after a restart; the
- * reply says so.
+ * The agent's proactive_status and proactive_trigger tools and the gateway's
+ * /api/proactive routes hold the same engine (lifecycle.ts), so `/heartbeat on`
+ * reaches them at once.
  */
 export const setupHeartbeatControl: FeatureSetup = (ctx) => {
   const proactive = ctx.proactive;
-  const enabledAtBoot = effectiveSettingFlag(ctx.settings, "proactive.enabled", ctx.config.proactive.enabled);
   if (proactive) {
     try {
       applyHeartbeatOverrides(proactive, ctx.settings);
@@ -50,7 +46,6 @@ export const setupHeartbeatControl: FeatureSetup = (ctx) => {
     logs: ctx.heartbeatLogStore,
     countActiveLoops,
     countSchedules: () => ctx.scheduleStore.list().length,
-    toolsNeedRestart: () => !enabledAtBoot,
     timezone: ctx.config.proactive.activeHours.timezone,
   }));
 
