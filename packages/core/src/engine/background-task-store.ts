@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { scrubSecrets } from "../security/secret-scrubber.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "background-tasks.db");
 
@@ -30,6 +31,17 @@ interface BackgroundTaskCommandRow {
   created_at: string;
 }
 
+/**
+ * Free-form task metadata, stored as JSON in `background_tasks.meta`.
+ * `profile` selects a TaskProfile and controller from the daemon's task hooks;
+ * `origin` says what created the task ("goal", "webhook", ...).
+ */
+export interface BackgroundTaskMeta {
+  origin?: string;
+  profile?: string;
+  data?: Record<string, unknown>;
+}
+
 export interface BackgroundTask {
   id: string;
   session_key: string;
@@ -43,6 +55,12 @@ export interface BackgroundTask {
   created_at: string;
   updated_at: string;
   sdk_session_id: string | null;
+  /** Parsed `meta` column. Absent or null for tasks created without metadata. */
+  meta?: BackgroundTaskMeta | null;
+  /** Claude account the task last ran on; null = ambient (PLAN C.1) */
+  account_id?: string | null;
+  /** How often the task was re-queued after a limit or account failure */
+  rotation_attempts?: number;
 }
 
 interface BackgroundTaskRow {
@@ -58,6 +76,21 @@ interface BackgroundTaskRow {
   created_at: string;
   updated_at: string;
   sdk_session_id: string | null;
+  meta?: string | null;
+  account_id?: string | null;
+  rotation_attempts?: number;
+}
+
+function parseMeta(raw: string | null | undefined): BackgroundTaskMeta | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as BackgroundTaskMeta)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -114,28 +147,55 @@ export class BackgroundTaskStore {
       CREATE INDEX IF NOT EXISTS idx_btc_unprocessed
         ON background_task_commands(processed) WHERE processed = 0;
     `);
+
+    // Nullable JSON metadata (profile, origin). Added after the first release,
+    // so existing databases get the column on open.
+    const columns = this.db.prepare("PRAGMA table_info(background_tasks)").all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === "meta")) {
+      this.db.exec("ALTER TABLE background_tasks ADD COLUMN meta TEXT");
+    }
+    // Account binding and rotation count (PLAN C.1).
+    if (!columns.some((c) => c.name === "account_id")) {
+      this.db.exec("ALTER TABLE background_tasks ADD COLUMN account_id TEXT");
+    }
+    if (!columns.some((c) => c.name === "rotation_attempts")) {
+      this.db.exec("ALTER TABLE background_tasks ADD COLUMN rotation_attempts INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   private rowToTask(row: BackgroundTaskRow): BackgroundTask {
     return {
       ...row,
       status: row.status as BackgroundTaskStatus,
+      meta: parseMeta(row.meta),
     };
   }
 
   /**
    * Create a new background task in pending state.
    */
-  create(sessionKey: string, description: string, prompt: string): BackgroundTask {
+  /**
+   * `opts.resumeSessionId` makes the task resume that SDK session when it
+   * starts (e.g. a goal continuing a paused worker), instead of a new one.
+   */
+  create(
+    sessionKey: string,
+    description: string,
+    prompt: string,
+    meta?: BackgroundTaskMeta,
+    opts?: { resumeSessionId?: string },
+  ): BackgroundTask {
     const id = randomUUID();
     const now = new Date().toISOString();
+    const metaJson = meta ? JSON.stringify(meta) : null;
+    const resume = opts?.resumeSessionId ?? null;
 
     this.db
       .prepare(
-        `INSERT INTO background_tasks (id, session_key, description, prompt, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO background_tasks (id, session_key, description, prompt, status, created_at, updated_at, meta, sdk_session_id)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
       )
-      .run(id, sessionKey, description, prompt, now, now);
+      .run(id, sessionKey, description, prompt, now, now, metaJson, resume);
 
     return {
       id,
@@ -149,7 +209,10 @@ export class BackgroundTaskStore {
       num_turns: 0,
       created_at: now,
       updated_at: now,
-      sdk_session_id: null,
+      sdk_session_id: resume,
+      meta: metaJson ? parseMeta(metaJson) : null,
+      account_id: null,
+      rotation_attempts: 0,
     };
   }
 
@@ -226,55 +289,94 @@ export class BackgroundTaskStore {
   }
 
   /**
-   * Update task status to running and set the SDK session ID.
+   * Update task status to running and set the SDK session ID. Only a pending
+   * or running row changes: a message still buffered after the task was
+   * completed, failed or cancelled must not flip it back to running.
+   * Returns true when the row changed.
    */
-  markRunning(id: string, sdkSessionId?: string): void {
-    this.db
+  markRunning(id: string, sdkSessionId?: string): boolean {
+    const info = this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'running', sdk_session_id = ?, updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
       .run(sdkSessionId ?? null, id);
+    return info.changes > 0;
+  }
+
+  /** Record the Claude account a running task was spawned with. */
+  setAccount(id: string, accountId: string | null): void {
+    this.db
+      .prepare("UPDATE background_tasks SET account_id = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(accountId, id);
   }
 
   /**
-   * Update task with completion result.
+   * Put a running task back to pending after a limit or account failure, so
+   * the poller restarts it on the next account or model. The SDK session id is
+   * kept, so the restart resumes the same conversation. Returns false when the
+   * task was not running (cancelled or finished meanwhile).
    */
+  requeueForRotation(id: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE background_tasks
+         SET status = 'pending', rotation_attempts = rotation_attempts + 1, updated_at = datetime('now')
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(id);
+    return info.changes > 0;
+  }
+
+  /** Start a new limit episode: the next failure gets the full re-queue allowance again. */
+  resetRotationAttempts(id: string): void {
+    this.db.prepare("UPDATE background_tasks SET rotation_attempts = 0 WHERE id = ? AND rotation_attempts > 0").run(id);
+  }
+
+  /**
+   * Update task with completion result. A task already cancelled, completed
+   * or failed keeps its outcome.
+   */
+  /** The stored result is scrubbed for secrets (sink "task-result"); the prompt is not. */
   markCompleted(id: string, result: string, costUsd: number, numTurns: number): void {
     this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'completed', result = ?, cost_usd = ?, num_turns = ?, updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
-      .run(result, costUsd, numTurns, id);
+      .run(scrubSecrets(result, { sink: "task-result" }), costUsd, numTurns, id);
   }
 
   /**
-   * Update task with failure info.
+   * Update task with failure info. A task already cancelled, completed or
+   * failed keeps its outcome.
    */
   markFailed(id: string, error: string): void {
     this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'failed', error = ?, updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
-      .run(error, id);
+      .run(scrubSecrets(error, { sink: "task-result" }), id);
   }
 
   /**
-   * Mark a task as cancelled.
+   * Mark a task as cancelled. Only a pending or running task can be cancelled:
+   * a task that already completed or failed keeps its outcome (shutdown used to
+   * relabel finished tasks as cancelled). Returns true when the row changed.
    */
-  markCancelled(id: string): void {
-    this.db
+  markCancelled(id: string): boolean {
+    const info = this.db
       .prepare(
         `UPDATE background_tasks
          SET status = 'cancelled', updated_at = datetime('now')
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('pending', 'running')`,
       )
       .run(id);
+    return info.changes > 0;
   }
 
   // ── Command methods ──────────────────────────────────────────────────────

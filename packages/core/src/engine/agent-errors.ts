@@ -13,6 +13,9 @@
  * misreported as a broken session.
  */
 
+import type { FailureInfo } from "./failure.js";
+import type { AccountsExhaustedFields } from "./resilience.js";
+
 /** What kind of failure the agent executor reported. */
 export type AgentErrorKind =
   /** The account hit a usage/rate/session limit. Retrying cannot help. */
@@ -36,7 +39,11 @@ export interface AgentErrorInfo {
  * Checked first — several of these contain words the session matcher claims.
  */
 const USAGE_LIMIT_PATTERNS = [
+  // The CLI's own shape: "You've hit your <session|weekly|fast|monthly spend> limit".
+  "you've hit your",
+  "you've reached your",
   "session limit",
+  "weekly limit",
   "usage limit",
   "rate limit",
   "rate_limit",
@@ -107,21 +114,66 @@ export function classifyAgentError(err: unknown): AgentErrorInfo {
   return { kind: "unknown" };
 }
 
+const USAGE_LIMIT_NO_RESET = "Usage limit reached on the account. Retrying won't help until it resets.";
+const GENERIC_ERROR = "Sorry, an internal error occurred. Please try again.";
+const SESSION_START_ERROR = "Failed to start AI session. Context has been reset — please try again.";
+
+function usageLimitMessage(resetHint: string | undefined): string {
+  return resetHint
+    ? `Usage limit reached — no capacity until ${resetHint}. Retrying before then won't work; message me after it resets.`
+    : USAGE_LIMIT_NO_RESET;
+}
+
+/** Every imported account is limited (PLAN C.1): name the earliest reset across them. */
+function allAccountsLimitedMessage(count: number, resetHint: string | undefined): string {
+  return resetHint
+    ? `All ${count} Claude accounts have reached their usage limits. The earliest one resets ${resetHint}; message me after that.`
+    : `All ${count} Claude accounts have reached their usage limits. Retrying won't help until one of them resets.`;
+}
+
+function isFailureInfo(info: AgentErrorInfo | FailureInfo): info is FailureInfo {
+  return "class" in info;
+}
+
 /**
  * Render the single sentence the user actually sees.
  *
- * Only the reset hint is ever interpolated from the underlying error; every
- * other byte is a fixed string, so internal details cannot leak here.
+ * Accepts the legacy {@link AgentErrorInfo} or a {@link FailureInfo} from
+ * `classifyFailure`. Only the reset hint is ever interpolated from the
+ * underlying error; every other byte is a fixed string, so internal details
+ * cannot leak here. The hint itself passed `extractResetHint`'s guards or was
+ * formatted from a timestamp.
  */
-export function agentErrorUserMessage(info: AgentErrorInfo): string {
+export function agentErrorUserMessage(info: AgentErrorInfo | FailureInfo): string {
+  if (isFailureInfo(info)) {
+    const exhausted = (info as FailureInfo & AccountsExhaustedFields).accountsExhausted;
+    switch (info.class) {
+      case "usage_limit_account":
+      case "usage_limit_model":
+        if (typeof exhausted === "number" && exhausted >= 2) return allAccountsLimitedMessage(exhausted, info.resetHint);
+        return usageLimitMessage(info.resetHint);
+      case "auth":
+        return "The AI account is signed out or blocked, so I can't answer right now. The owner needs to log in to Claude again; retrying won't help until then.";
+      case "model_unavailable":
+        return "The configured AI model isn't available right now. Retrying won't help until the model setting changes.";
+      case "overloaded":
+        return "The AI service is overloaded or limiting requests right now. Please try again in a few minutes.";
+      case "prompt_too_long":
+        return "This conversation has grown too long for the model. Send /clear to start fresh, then try again.";
+      case "session_start":
+        return SESSION_START_ERROR;
+      case "network":
+      case "unknown":
+        return GENERIC_ERROR;
+    }
+  }
+
   switch (info.kind) {
     case "usage_limit":
-      return info.resetHint
-        ? `Usage limit reached — no capacity until ${info.resetHint}. Retrying before then won't work; message me after it resets.`
-        : "Usage limit reached on the account. Retrying won't help until it resets.";
+      return usageLimitMessage(info.resetHint);
     case "session_start":
-      return "Failed to start AI session. Context has been reset — please try again.";
+      return SESSION_START_ERROR;
     case "unknown":
-      return "Sorry, an internal error occurred. Please try again.";
+      return GENERIC_ERROR;
   }
 }

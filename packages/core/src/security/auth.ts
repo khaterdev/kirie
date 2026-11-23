@@ -108,6 +108,20 @@ export class IdentityResolver {
   }
 
   /**
+   * Add owner identities for one channel at runtime, without touching the
+   * config. Used by voice: the owner's phone numbers resolve to the owner role
+   * so the security gate passes them (PLAN C.14). OwnerDirectory is separate
+   * and does not learn these ids, so owner commands still cannot run from them.
+   */
+  addOwnerIdentities(channel: ChannelName, ids: readonly string[]): void {
+    const clean = ids.map(String).filter((id) => id.length > 0);
+    if (clean.length === 0) return;
+    const set = this.ownerIds.get(channel) ?? new Set<string>();
+    for (const id of clean) set.add(id);
+    this.ownerIds.set(channel, set);
+  }
+
+  /**
    * Quick check: is this sender the owner on this channel?
    */
   isOwner(channel: ChannelName, senderId: string): boolean {

@@ -17,15 +17,6 @@ export interface VoiceResponseOptions {
 }
 
 /**
- * Build a session key for a voice call based on the caller's phone number.
- * Normalizes the phone number to remove formatting.
- */
-export function buildVoiceSessionKey(phone: string): string {
-  const normalized = phone.replace(/[\s\-()]+/g, "").replace(/^00/, "+");
-  return `voice:${normalized}`;
-}
-
-/**
  * Truncate a response to be suitable for voice output.
  * Strips markdown, URLs, and long passages that don't work well in speech.
  */

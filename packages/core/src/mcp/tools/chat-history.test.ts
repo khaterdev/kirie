@@ -199,3 +199,39 @@ describe("createChatHistoryToolHandlers", () => {
     expect(result[0]!.content).toContain("TypeScript");
   });
 });
+
+describe("ChatHistoryStore secret scrubbing and search sanitising", () => {
+  const token = (): string => ["gh", "p_", "Mn8Bv7Cx6Za5Lk4Jh3Gf2Ds1Aq0Wp9Oe8Ir7Ut6"].join("");
+
+  it("append returns the inserted row id", () => {
+    const a = store.append("s", "user", "one");
+    const b = store.append("s", "assistant", "two");
+    expect(b).toBe(a + 1);
+    expect(store.recent("s").map((m) => m.id)).toEqual([a, b]);
+  });
+
+  it("redacts secrets before storing, and FTS cannot find them", () => {
+    store.append("s", "user", `my token is ${token()} please`);
+    const [msg] = store.recent("s");
+    expect(msg!.content).toBe("my token is «redacted:github-token» please");
+    expect(store.search(token())).toEqual([]);
+    expect(store.search(token().slice(4))).toEqual([]);
+    expect(store.search("please")).toHaveLength(1);
+  });
+
+  it("stores text without secrets unchanged", () => {
+    const text = "commit 3f786850e387550fdab836ed7e6dc881de23001b, input_tokens: 1234";
+    store.append("s", "assistant", text);
+    expect(store.recent("s")[0]!.content).toBe(text);
+  });
+
+  it("treats FTS operators in a query as plain words", () => {
+    store.append("s", "user", "alpha beta gamma");
+    expect(() => store.search('alpha AND ( "unbalanced')).not.toThrow();
+    expect(store.search("alpha OR")).toEqual([]);
+    expect(store.search("beta")).toHaveLength(1);
+    expect(store.search("   ")).toEqual([]);
+    const handlers = createChatHistoryToolHandlers(store);
+    expect(() => handlers.chat_history_search.handler({ query: "gamma*) NOT" })).not.toThrow();
+  });
+});

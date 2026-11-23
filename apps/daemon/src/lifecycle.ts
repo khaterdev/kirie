@@ -3,7 +3,6 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { type ChildProcess, spawn } from "node:child_process";
-import pino from "pino";
 import {
   type KirieConfig,
   ConfigWatcher,
@@ -27,15 +26,56 @@ import {
   V2SessionManager,
   HealthMonitor,
   checkClaudeBinary,
+  SdkOptionsPipeline,
+  TurnContextRegistry,
+  installCanUseToolWarningFilter,
+  defaultOneShotCwd,
+  createModuleLogger,
+  configureScrubber,
+  getScrubber,
+  scrubSecrets,
+  setFailureMessageScrubber,
+  CommandRegistry,
+  OwnerDirectory,
+  OwnerPrompts,
+  InteractionRouter,
+  RuntimeSettings,
+  AuditTrail,
+  PromptAddenda,
+  InternalApi,
+  PublicIngress,
+  featureToolNames,
+  effectiveSettingFlag,
+  appendPromptAddenda,
+  ScheduledInjectionQueue,
+  type SecretScrubber,
+  type ChannelName,
 } from "@kirie/core";
 import {
   BackgroundTaskStore,
   BackgroundTaskManager,
-  AutoReplyEngine,
-  registerBuiltinCommands,
   buildBackgroundTaskSystemPrompt,
 } from "@kirie/core";
 import { loadAllSkills, isEligible } from "@kirie/skills";
+import { syncBundledSkills } from "./skill-sync.js";
+import { TaskHooks } from "./task-hooks.js";
+import {
+  FEATURES,
+  runFeatureSetups,
+  startFeatures,
+  stopFeatures,
+  type DaemonContext,
+  type FeatureHandle,
+} from "./features/index.js";
+import { createOwnerNotifier } from "./features/notify.js";
+import { registerCommandMenus } from "./features/menus.js";
+import {
+  daemonScrubbingConfig,
+  freezeScrubbingConfig,
+  registerKnownSecrets,
+  sanitizeErrorForLog,
+} from "./features/scrubbing.js";
+import { featureFailureNotice, type FeatureFailure } from "./features/runner.js";
 import { createTranscriptionProvider } from "@kirie/media";
 import type { McpServerOptions } from "@kirie/core";
 import { AgentRegistry } from "@kirie/core";
@@ -51,7 +91,7 @@ import { SlackAdapter } from "@kirie/channel-slack";
 import { WhatsAppAdapter } from "@kirie/channel-whatsapp";
 import { SignalAdapter } from "@kirie/channel-signal";
 
-const log = pino({ name: "kirie-daemon" });
+const log = createModuleLogger("kirie-daemon");
 
 /**
  * Holds all initialized subsystems so shutdown can cleanly tear them down.
@@ -76,6 +116,15 @@ interface DaemonState {
   kokoroProcess: ChildProcess | null;
   /** Set only when sessionMode is "v2"; holds live sessions that must be closed on shutdown. */
   v2Sessions: V2SessionManager | null;
+  /** The one SDK options seam every query() call site applies (PLAN B.1). */
+  sdkOptions: SdkOptionsPipeline;
+  /** Per-turn origin registry (PLAN B.2). The message pipeline is its writer. */
+  turnContext: TurnContextRegistry;
+  /** Feature handles that started, in FEATURES order (PLAN B.10) */
+  features: FeatureHandle[];
+  ownerPrompts: OwnerPrompts;
+  ingress: PublicIngress;
+  scheduledInjections: ScheduledInjectionQueue;
 }
 
 let state: DaemonState | null = null;
@@ -83,6 +132,8 @@ let shuttingDown = false;
 let restarting = false;
 let signalHandlersRegistered = false;
 let claudeBinaryWatch: NodeJS.Timeout | null = null;
+/** The scrubber is configured once per process; restarts reuse it (enabled is frozen). */
+let scrubberConfigured = false;
 
 /** How often a running daemon re-verifies the SDK's native binary is still on disk. */
 const CLAUDE_BINARY_CHECK_INTERVAL_MS = 60_000;
@@ -90,20 +141,17 @@ const CLAUDE_BINARY_CHECK_INTERVAL_MS = 60_000;
 /**
  * Start the Kirie daemon.
  *
- * Initialization sequence:
- *   1. Load and validate config
- *   2. Create SessionStore (SQLite)
- *   3. Resolve MCP server paths
- *   4. Create AgentEngine with V1 query() + MCP server config
- *   5. Create security components (auth, authz, rate limiter, input guard)
- *   6. Create SecurityGate
- *   7. Set up MCP tool registry
- *   8. Create MessagePipeline and wire message flow
- *   9. Start channels
- *  10. Create and start HeartbeatService
- *  11. Start background task manager
- *  12. Start gateway HTTP server
- *  13. Register signal handlers for graceful shutdown
+ * Initialization sequence (PLAN B.10):
+ *   1. Load and validate config; configure the secret scrubber
+ *   2. Construct everything without starting it: stores, engines, security
+ *      gate, command registry, owner prompts, MCP tools, pipeline,
+ *      heartbeat, background task manager
+ *   3. Run every FeatureSetup in FEATURES order
+ *   4. Start pipeline, channels, heartbeat, background task manager
+ *   5. Call each feature handle's start
+ *   6. Register command menus
+ *   7. Construct and start the gateway (with InternalApi mounts)
+ *   8. Register signal handlers for graceful shutdown
  */
 export async function startDaemon(): Promise<void> {
   log.info("starting Kirie daemon");
@@ -131,7 +179,29 @@ export async function startDaemon(): Promise<void> {
 
   const configWatcher = new ConfigWatcher({ credentialResolver });
   const config = configWatcher.start();
-  log.info("configuration loaded");
+
+  // 1a. Secret scrubber, first thing once the config is known (PLAN B.8).
+  //     `enabled` is frozen at this first call: a reload or restart cannot turn
+  //     it off. Known values are registered before any channel or engine runs.
+  const scrubbingConfig = freezeScrubbingConfig(daemonScrubbingConfig(config));
+  let scrubber: SecretScrubber;
+  if (!scrubberConfigured) {
+    scrubber = configureScrubber(scrubbingConfig);
+    scrubberConfigured = true;
+  } else {
+    scrubber = getScrubber();
+  }
+  setFailureMessageScrubber((text) => scrubSecrets(text));
+  const knownSecrets = registerKnownSecrets(scrubber, scrubbingConfig, {
+    credentials: credentialCache,
+    config,
+    env: process.env,
+    secretsDir: join(homedir(), ".kirie", "secrets"),
+  });
+  log.info({ knownSecrets, scrubbing: scrubber.isEnabled() }, "configuration loaded");
+  if (!scrubber.isEnabled()) {
+    log.warn("secret scrubbing is OFF: replies, logs and stores are not scrubbed");
+  }
 
   // 2. Session store
   const sessionStore = new SessionStore();
@@ -164,16 +234,20 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
+  // The kirie-tools server env. Features add KIRIE_* flags here during setup
+  // (PLAN B.10); the object is read when each session spawns its MCP server.
+  const gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
+  const kirieToolsEnv: Record<string, string> = {
+    KIRIE_DB_DIR: resolve(dataDir),
+    KIRIE_GATEWAY_URL: gatewayUrl,
+    ...(config.browser?.enabled ? { KIRIE_BROWSER_ENABLED: "1" } : {}),
+    ...ttsEnv,
+  };
   const mcpServers: Record<string, McpServerConfig> = {
     "kirie-tools": {
       command: "node",
       args: [stdioServerPath],
-      env: {
-        KIRIE_DB_DIR: resolve(dataDir),
-        KIRIE_GATEWAY_URL: `http://127.0.0.1:${gatewayPort}`,
-        ...(config.browser?.enabled ? { KIRIE_BROWSER_ENABLED: "1" } : {}),
-        ...ttsEnv,
-      },
+      env: kirieToolsEnv,
     },
   };
 
@@ -452,26 +526,8 @@ export async function startDaemon(): Promise<void> {
 
   const agentCwd = config.agent.workspace || dataDir;
   const sdkSkillsDir = resolve(join(agentCwd, ".claude", "skills"));
-  for (const skill of eligibleSkills) {
-    const skillDir = join(sdkSkillsDir, skill.name);
-    mkdirSync(skillDir, { recursive: true });
-
-    // Build Claude Code-compatible frontmatter
-    const fm: string[] = ["---"];
-    fm.push(`name: ${skill.name}`);
-    fm.push(`description: ${skill.description}`);
-    if (skill.invocation?.userInvocable === false) {
-      fm.push("user-invocable: false");
-    }
-    if (skill.invocation?.disableModelInvocation === true) {
-      fm.push("disable-model-invocation: true");
-    }
-    fm.push("---");
-
-    const skillFile = join(skillDir, "SKILL.md");
-    writeFileSync(skillFile, fm.join("\n") + "\n\n" + skill.content, "utf-8");
-  }
-  log.info({ sdkSkillsDir, count: eligibleSkills.length }, "skills written as Claude Code skills");
+  const skillSync = syncBundledSkills({ skills: eligibleSkills, sdkSkillsDir, dataDir });
+  log.info({ sdkSkillsDir, count: skillSync.written.length }, "skills written as Claude Code skills");
 
   // 4b. Create agent registry
   const agentRegistry = new AgentRegistry();
@@ -482,6 +538,26 @@ export async function startDaemon(): Promise<void> {
     log.info({ agents: agentRegistry.list().length }, "agent definitions loaded");
   }
 
+  // 4c. SDK options seam shared by every query() call site, and the per-turn
+  //     context registry. The pipeline sets canUseTool on purpose, so the SDK's
+  //     "canUseTool is shadowed under bypassPermissions" warning is dropped.
+  installCanUseToolWarningFilter();
+  const sdkOptions = new SdkOptionsPipeline({
+    strictMcpConfig: () => (configWatcher.getConfig() ?? config).agent.strictMcpConfig,
+  });
+  const turnContext = new TurnContextRegistry();
+  const promptAddenda = new PromptAddenda();
+  const internalApi = new InternalApi();
+  const ingress = new PublicIngress(config.ingress);
+  const taskHooks = new TaskHooks();
+
+  // Audit trail and owner overrides (PLAN B.6): one file each.
+  const audit = new AuditTrail(join(dataDir, "logs", "audit.jsonl"), {
+    scrub: (text) => scrubSecrets(text, { sink: "audit" }),
+  });
+  audit.rotateIfNeeded();
+  const settings = new RuntimeSettings(join(dataDir, "state", "runtime-settings.json"), { audit });
+
   // 4. Agent engine (uses V1 query() with mcpServers passed directly)
   const agentConfig: AgentEngineConfig = {
     prompt: {
@@ -490,10 +566,13 @@ export async function startDaemon(): Promise<void> {
       model: config.agent.model,
       dataDir,
       timezone: config.proactive?.activeHours?.timezone,
+      addenda: promptAddenda,
+      memoryPolicy: config.learning.memoryPolicy,
     },
     cwd: config.agent.workspace || dataDir,
     allowedTools,
     mcpServers,
+    sdkOptions,
   };
   // The V1 engine is always constructed: background tasks and the proactive
   // layer use it directly for one-shot work regardless of sessionMode.
@@ -512,6 +591,7 @@ export async function startDaemon(): Promise<void> {
           mcpServers,
           idleTimeoutMs: config.agent.sessionIdleTimeoutMs,
           maxSessions: config.agent.maxSessions,
+          sdkOptions,
         })
       : agentEngine;
 
@@ -573,6 +653,28 @@ export async function startDaemon(): Promise<void> {
   const channelRegistry = new ChannelRegistry();
   registerChannelAdapters(channelRegistry, config);
 
+  // 7-. Owner identity, button routing, owner prompts and the command registry
+  //     (PLAN B.4, B.5). Router first: OwnerPrompts registers its namespace on it.
+  const owners = new OwnerDirectory(config.security.owner.identities);
+  const interactionRouter = new InteractionRouter({ channelRegistry, owners, audit });
+  const ownerPrompts = new OwnerPrompts({
+    router: interactionRouter,
+    channelRegistry,
+    owners,
+    audit,
+    maxPending: config.commands.maxPendingPrompts,
+    scrub: (text) => scrubSecrets(text, { sink: "prompt-card" }),
+  });
+  const commands = new CommandRegistry({
+    owners,
+    selfUsername: (channel) => channelRegistry.getById(channel)?.getSelf?.()?.username,
+    prompts: ownerPrompts,
+    audit,
+    scrub: (text) => scrubSecrets(text, { sink: "channel" }),
+    unknownCommand: config.commands.unknownCommand,
+  });
+  const notifyOwner = createOwnerNotifier({ owners, channelRegistry });
+
   // Late-binding reference so ProactiveEngine closures can access heartbeat after it's created
   const heartbeatRef: { instance: HeartbeatService | null } = { instance: null };
 
@@ -588,60 +690,54 @@ export async function startDaemon(): Promise<void> {
     log.info("heartbeat log store initialized");
   }
 
-  // 7b. Create ProactiveEngine (before MCP registry so tools can reference it)
+  // 7b. ProactiveEngine: constructed whenever an owner identity exists, started
+  //     only when proactive.enabled is effective (config, or the owner's
+  //     /heartbeat override). Tools and the gateway always get the engine, so
+  //     `/heartbeat on` reaches them without a restart; their trigger paths
+  //     refuse while it is stopped.
+  const proactiveEffective = effectiveSettingFlag(settings, "proactive.enabled", config.proactive.enabled);
   let proactive: ProactiveEngine | null = null;
-  if (config.proactive?.enabled) {
-    const ownerIds = config.security.owner.identities;
-    let defaultChannel = "telegram" as import("@kirie/core").ChannelName;
-    let defaultChatId = "";
-
-    if (ownerIds.telegram.length > 0) {
-      defaultChannel = "telegram";
-      defaultChatId = String(ownerIds.telegram[0]);
-    } else if (ownerIds.discord.length > 0) {
-      defaultChannel = "discord";
-      defaultChatId = String(ownerIds.discord[0]);
-    } else if (ownerIds.slack.length > 0) {
-      defaultChannel = "slack";
-      defaultChatId = String(ownerIds.slack[0]);
-    }
-
-    if (defaultChatId) {
-      proactive = new ProactiveEngine({
-        config: config.proactive,
-        channelRegistry,
-        sessionStore,
-        defaultChannel,
-        defaultChatId,
-        getRunningTasks: () => {
-          try {
-            const tasks = backgroundTaskStore.listByStatus("running");
-            return tasks.map((t) => ({
+  const primaryOwner = owners.primary();
+  if (primaryOwner) {
+    proactive = new ProactiveEngine({
+      config: config.proactive,
+      channelRegistry,
+      sessionStore,
+      defaultChannel: primaryOwner.channel,
+      defaultChatId: primaryOwner.chatId,
+      getRunningTasks: () => {
+        try {
+          const tasks = backgroundTaskStore.listByStatus("running");
+          // Goal workers run long on purpose; they are not stuck tasks.
+          return tasks
+            .filter((t) => t.meta?.origin !== "goal")
+            .map((t) => ({
               id: t.id,
               description: t.description,
               startedAt: new Date(t.created_at).getTime(),
               status: t.status,
             }));
-          } catch {
-            return [];
-          }
-        },
-        getFailedDeliveryCount: () => {
-          // Heartbeat not created yet at this point, but the callback is
-          // called later when ticks fire, by which time heartbeat exists.
-          return heartbeatRef.instance?.pendingRetryCount ?? 0;
-        },
-        createBackgroundTask: (sessionKey: string, description: string, prompt: string) => {
-          backgroundTaskStore.create(sessionKey, description, prompt);
-        },
-        heartbeatLogStore: heartbeatLogStore ?? undefined,
-      });
-      log.info("proactive engine created");
-    } else {
-      log.warn("proactive layer enabled but no owner identities configured — skipping");
-    }
+        } catch {
+          return [];
+        }
+      },
+      getFailedDeliveryCount: () => {
+        // Heartbeat not created yet at this point, but the callback is
+        // called later when ticks fire, by which time heartbeat exists.
+        return heartbeatRef.instance?.pendingRetryCount ?? 0;
+      },
+      createBackgroundTask: (sessionKey: string, description: string, prompt: string) => {
+        backgroundTaskStore.create(sessionKey, description, prompt);
+      },
+      heartbeatLogStore: heartbeatLogStore ?? undefined,
+      triage: { sdkOptions, cwd: defaultOneShotCwd(dataDir) },
+    });
+    log.info({ enabled: proactiveEffective }, "proactive engine created");
+  } else if (config.proactive?.enabled) {
+    log.warn("proactive layer enabled but no owner identities configured — skipping");
   }
 
+  const featureToolContext = { dbDir: resolve(dataDir), gatewayUrl, env: kirieToolsEnv };
   const { mcpShutdown, tools, scheduleStore, chatHistoryStore } = createMcpRegistry(
     channelRegistry,
     {
@@ -655,6 +751,7 @@ export async function startDaemon(): Promise<void> {
       onRestart: () => void restartDaemon(),
       proactiveEngine: proactive,
       heartbeatLogStore: heartbeatLogStore ?? undefined,
+      featureTools: featureToolContext,
     },
   );
   log.info({ toolCount: tools.size }, "MCP tools registered");
@@ -662,12 +759,6 @@ export async function startDaemon(): Promise<void> {
   // Wire the daemon's background task store into the schedule store so that
   // deleting a payload-delivery cron auto-cancels its spawned background tasks.
   scheduleStore.setBackgroundTaskStore(backgroundTaskStore);
-
-  // 8. Auto-reply engine (fast command responses, bypasses agent)
-  const autoReply = new AutoReplyEngine();
-  // Register basic commands now; stop/stopall/clear added after pipeline is created
-  registerBuiltinCommands(autoReply, { channelRegistry, sessionStore });
-  log.info("auto-reply engine initialized");
 
   // 8b. Transcription provider (for auto-transcribing voice/audio media)
   let transcriptionProvider: import("@kirie/media").TranscriptionProvider | undefined;
@@ -710,7 +801,8 @@ export async function startDaemon(): Promise<void> {
     }
   }
 
-  // 9. Message pipeline
+  // 9. Message pipeline. Slash commands go through the registry (owner check
+  //    in one place); the pipeline writes the per-turn origin.
   const pipeline = new MessagePipeline({
     channelRegistry,
     securityGate,
@@ -718,80 +810,36 @@ export async function startDaemon(): Promise<void> {
     agentEngine: pipelineExecutor,
     chatHistoryStore,
     backgroundTaskStore,
-    autoReply,
+    commands,
+    turnContext,
+    owners,
     usageTracker,
     model: config.agent.model,
     transcriptionProvider,
   });
 
-  // 9. Start channels
-  pipeline.start();
-  const channelErrors = await channelRegistry.startAll();
-  for (const [id, err] of channelErrors) {
-    log.error({ channel: id, error: err.message }, "failed to start channel");
+  // A persistent session can produce a result after its turn already returned
+  // (an async subagent finishing). Deliver it to the chat instead of dropping it.
+  if (pipelineExecutor instanceof V2SessionManager) {
+    pipelineExecutor.setUnsolicitedResultHandler((sessionKey, result) => {
+      void pipeline.deliverUnsolicitedResult(sessionKey, result);
+    });
   }
 
-  const running = channelRegistry.getRunning();
-  log.info({ channels: running }, "channels started");
+  // 10. HeartbeatService (constructed now, started in phase 3)
+  // A "post-to-main" schedule never interrupts a user turn: it waits for the
+  // chat to be idle, retried on heartbeat ticks (DECISIONS 16).
+  const scheduledInjections = new ScheduledInjectionQueue({
+    inject: (event) => pipeline.injectScheduleMessage({
+      channel: event.channel,
+      chatId: event.chatId,
+      text: event.message,
+      senderId: event.chatId, // the owner's DM; the turn origin is still "schedule"
+      senderName: "Schedule",
+    }),
+    notifyOwner: (text) => notifyOwner(text),
+  });
 
-  // 9a. Channel health monitor — self-healing for channels stuck in `error`.
-  // Adapters connect exactly once; without this a transient DNS failure at boot
-  // leaves a channel dead until someone restarts it by hand.
-  const healthConf = config.channels.health;
-  let healthMonitor: HealthMonitor | null = null;
-  if (healthConf.enabled) {
-    healthMonitor = new HealthMonitor({
-      checkIntervalMs: healthConf.checkIntervalMs,
-      maxRecoveryAttempts: healthConf.maxRecoveryAttempts,
-      recoveryBaseBackoffMs: healthConf.baseBackoffMs,
-      recoveryMaxBackoffMs: healthConf.maxBackoffMs,
-    });
-
-    for (const adapter of channelRegistry.getAll().values()) {
-      healthMonitor.addAdapter(adapter);
-    }
-
-    healthMonitor.setRecoveryHandler(async (id) => {
-      // Clear any half-started state first — registry.start() is a no-op while
-      // the registry still believes the channel is running.
-      if (channelRegistry.isRunning(id)) {
-        await channelRegistry.stop(id);
-      }
-      await channelRegistry.start(id);
-    });
-
-    healthMonitor.onRecovery((event) => {
-      if (event.ok) {
-        log.warn(
-          { channel: event.channelId, attempt: event.attempt },
-          "channel recovered by health monitor",
-        );
-      } else {
-        log.error(
-          {
-            channel: event.channelId,
-            attempt: event.attempt,
-            error: event.error,
-            nextAttemptInMs: Math.round(event.nextBackoffMs),
-            exhausted: event.exhausted,
-          },
-          event.exhausted
-            ? "channel recovery exhausted — giving up"
-            : "channel recovery attempt failed",
-        );
-      }
-    });
-
-    healthMonitor.start();
-    log.info(
-      { intervalMs: healthConf.checkIntervalMs, channels: channelRegistry.size },
-      "channel health monitor started",
-    );
-  } else {
-    log.warn("channel health monitor disabled — offline channels will not self-heal");
-  }
-
-  // 10. HeartbeatService
   const heartbeat = new HeartbeatService({
     sessionStore,
     channelRegistry,
@@ -805,13 +853,7 @@ export async function startDaemon(): Promise<void> {
 
       if (delivery === "post-to-main") {
         // Route through the message pipeline so the agent processes it
-        await pipeline.injectScheduleMessage({
-          channel: event.channel,
-          chatId: event.chatId,
-          text: event.message,
-          senderId: event.chatId, // Use chatId as senderId (owner's DM)
-          senderName: "Schedule",
-        });
+        await scheduledInjections.deliver(event);
         return;
       }
 
@@ -852,8 +894,6 @@ export async function startDaemon(): Promise<void> {
   scheduleStore.on("fire", (event: ScheduleFireEvent) => {
     heartbeat.enqueueScheduleEvent(event);
   });
-
-  heartbeat.start();
   heartbeatRef.instance = heartbeat;
 
   // Wire heartbeat retry queue into the message pipeline and proactive engine
@@ -863,7 +903,12 @@ export async function startDaemon(): Promise<void> {
   if (proactive) {
     proactive.setHeartbeat(heartbeat);
   }
-  log.info("heartbeat service started (wired to pipeline + proactive for retry)");
+
+  // Waiting scheduled messages retry on ticks; the audit trail rotates daily.
+  heartbeat.on("tick", (event: HeartbeatTickEvent) => {
+    void scheduledInjections.onTick();
+    if (event.tickNumber % 8640 === 0) audit.rotateIfNeeded();
+  });
 
   // 10b. Wire heartbeat logging + proactive engine to heartbeat ticks
   let lastTickNumber = 0;
@@ -1008,19 +1053,16 @@ export async function startDaemon(): Promise<void> {
     });
   }
 
-  if (proactive) {
-    proactive.start();
-    log.info("proactive intelligence layer started");
-  }
-
-  // 11. Background task manager (uses V1 query() with mcpServers)
-  // Build the same system prompt the main agent gets, plus background-task-specific instructions
-  const backgroundTaskSystemPrompt = buildBackgroundTaskSystemPrompt({
+  // 11. Background task manager (uses V1 query() with mcpServers).
+  // Build the same system prompt the main agent gets, plus background-task-specific
+  // instructions. Feature addenda are appended each time a task starts.
+  const backgroundTaskBasePrompt = buildBackgroundTaskSystemPrompt({
     customInstructions: config.agent.customInstructions,
     maxTurns: config.agent.backgroundTaskMaxTurns ?? 200,
     model: config.agent.model,
     dataDir,
     timezone: config.proactive?.activeHours?.timezone,
+    memoryPolicy: config.learning.memoryPolicy,
   });
 
   const backgroundTaskManager = new BackgroundTaskManager(backgroundTaskStore, {
@@ -1028,44 +1070,185 @@ export async function startDaemon(): Promise<void> {
     mcpServers,
     allowedTools,
     cwd: config.agent.workspace || dataDir,
-    systemPrompt: backgroundTaskSystemPrompt,
+    get systemPrompt() {
+      return appendPromptAddenda(backgroundTaskBasePrompt, promptAddenda, { kind: "background", ownerDm: false });
+    },
     maxTurns: config.agent.backgroundTaskMaxTurns ?? 200,
     onTaskComplete: async (task) => {
-      // Push completed task result proactively to the originating channel
-      await pipeline.pushBackgroundTaskResult(task);
+      // A feature that owns this task profile reports it; otherwise push the
+      // completed task result proactively to the originating channel.
+      const handler = taskHooks.completionHandlerFor(task);
+      if (handler) await handler(task);
+      else await pipeline.pushBackgroundTaskResult(task);
     },
+    onTaskFailed: async (task) => {
+      // A limit or account failure is a failure, not a "completed" result
+      const handler = taskHooks.failureHandlerFor(task);
+      if (handler) await handler(task);
+      else await pipeline.pushBackgroundTaskFailure(task);
+    },
+    controllerFor: (task) => taskHooks.controllerFor(task),
+    profileFor: (task) => taskHooks.profileFor(task),
+    sdkOptions,
   });
+
+  // ── Phase 1 of the feature modules (PLAN B.10): everything is constructed,
+  //    nothing feature-related is running yet.
+  const v2Sessions = pipelineExecutor instanceof V2SessionManager ? pipelineExecutor : null;
+  const featureFailures: FeatureFailure[] = [];
+  const daemonContext: DaemonContext = {
+    config,
+    dataDir,
+    agentCwd,
+    commands,
+    owners,
+    ownerPrompts,
+    settings,
+    audit,
+    scrubber,
+    sdkOptions,
+    turnContext,
+    promptAddenda,
+    internalApi,
+    ingress,
+    taskHooks,
+    channelRegistry,
+    identityResolver,
+    credentialStore,
+    sessionStore,
+    pipeline,
+    heartbeat,
+    proactive,
+    heartbeatLogStore,
+    backgroundTaskStore,
+    backgroundTaskManager,
+    scheduleStore,
+    chatHistoryStore,
+    memoryManager: (memoryManager as unknown as McpServerOptions["memoryManager"]) ?? null,
+    embeddingProvider: embeddingProvider ?? null,
+    agentEngine,
+    v2Sessions,
+    usageDashboard,
+    mcpServers,
+    kirieToolsEnv,
+    notifyOwner,
+    restart: () => void restartDaemon(),
+  };
+  const featureHandles = await runFeatureSetups(FEATURES, daemonContext, {
+    onFailure: (f) => featureFailures.push(f),
+  });
+
+  // Feature MCP tools join the allow list (the engines read this array at spawn).
+  for (const name of featureToolNames(featureToolContext)) {
+    const full = `mcp__kirie-tools__${name}`;
+    if (!allowedTools.includes(full)) allowedTools.push(full);
+  }
+
+  // ── Phase 3: start the core subsystems in today's relative order.
+  // Every adapter gets button routing; menus are registered on every start.
+  for (const adapter of channelRegistry.getAll().values()) interactionRouter.attach(adapter);
+  channelRegistry.on("registered", (id: ChannelName) => {
+    const adapter = channelRegistry.getById(id);
+    if (adapter) interactionRouter.attach(adapter);
+  });
+  const registerMenusFor = (id: ChannelName) => {
+    if (!config.commands.registerMenu) return;
+    const adapter = channelRegistry.getById(id);
+    if (adapter) void registerCommandMenus(adapter, commands, config.security.owner.identities);
+  };
+
+  // 9. Start channels
+  pipeline.start();
+  const channelErrors = await channelRegistry.startAll();
+  for (const [id, err] of channelErrors) {
+    log.error({ channel: id, error: err.message }, "failed to start channel");
+  }
+
+  const running = channelRegistry.getRunning();
+  log.info({ channels: running }, "channels started");
+
+  // 9a. Channel health monitor — self-healing for channels stuck in `error`.
+  // Adapters connect exactly once; without this a transient DNS failure at boot
+  // leaves a channel dead until someone restarts it by hand.
+  const healthConf = config.channels.health;
+  let healthMonitor: HealthMonitor | null = null;
+  if (healthConf.enabled) {
+    healthMonitor = new HealthMonitor({
+      checkIntervalMs: healthConf.checkIntervalMs,
+      maxRecoveryAttempts: healthConf.maxRecoveryAttempts,
+      recoveryBaseBackoffMs: healthConf.baseBackoffMs,
+      recoveryMaxBackoffMs: healthConf.maxBackoffMs,
+    });
+
+    for (const adapter of channelRegistry.getAll().values()) {
+      healthMonitor.addAdapter(adapter);
+    }
+
+    healthMonitor.setRecoveryHandler(async (id) => {
+      // Clear any half-started state first — registry.start() is a no-op while
+      // the registry still believes the channel is running.
+      if (channelRegistry.isRunning(id)) {
+        await channelRegistry.stop(id);
+      }
+      await channelRegistry.start(id);
+    });
+
+    healthMonitor.onRecovery((event) => {
+      if (event.ok) {
+        log.warn(
+          { channel: event.channelId, attempt: event.attempt },
+          "channel recovered by health monitor",
+        );
+      } else {
+        log.error(
+          {
+            channel: event.channelId,
+            attempt: event.attempt,
+            error: event.error,
+            nextAttemptInMs: Math.round(event.nextBackoffMs),
+            exhausted: event.exhausted,
+          },
+          event.exhausted
+            ? "channel recovery exhausted — giving up"
+            : "channel recovery attempt failed",
+        );
+      }
+    });
+
+    healthMonitor.start();
+    log.info(
+      { intervalMs: healthConf.checkIntervalMs, channels: channelRegistry.size },
+      "channel health monitor started",
+    );
+  } else {
+    log.warn("channel health monitor disabled — offline channels will not self-heal");
+  }
+
+  heartbeat.start();
+  log.info("heartbeat service started (wired to pipeline + proactive for retry)");
+
+  if (proactive && proactiveEffective) {
+    proactive.start();
+    log.info("proactive intelligence layer started");
+  }
 
   backgroundTaskManager.resumeOnStartup();
   backgroundTaskManager.start();
   log.info("background task manager started");
 
-  // Register stop/stopall/clear/restart/context/usage commands now that pipeline + backgroundTaskManager exist
-  registerBuiltinCommands(autoReply, {
-    channelRegistry,
-    sessionStore,
-    pipeline,
-    backgroundTaskManager,
-    onRestart: () => void restartDaemon(),
-    chatHistoryStore,
-    usageDashboard,
+  // ── Phase 4: feature timers, listeners and network.
+  const startedFeatures = await startFeatures(featureHandles, {
+    onFailure: (f) => featureFailures.push(f),
   });
+  const failureNotice = featureFailureNotice(featureFailures);
+  if (failureNotice) void notifyOwner(failureNotice);
 
-  // Register slash commands with channels that support it (e.g. Telegram setMyCommands)
-  // Done after all commands are registered so /context, /usage etc. are included.
-  const botCommands = autoReply.listCommands().map((c) => ({
-    command: c.name.replace(/^\//, ""),
-    description: c.description,
-  }));
-  for (const [, adapter] of channelRegistry.getAll()) {
-    if (typeof adapter.registerCommands === "function") {
-      void adapter.registerCommands(botCommands).catch((err: unknown) => {
-        log.warn({ channel: adapter.id, err }, "failed to register slash commands");
-      });
-    }
-  }
+  // ── Phase 5: command menus for the channels already running (the "started"
+  //    listener covers channels that connect later).
+  for (const id of channelRegistry.getRunning()) registerMenusFor(id);
+  channelRegistry.on("started", registerMenusFor);
 
-  // 12. Gateway server
+  // ── Phase 6: gateway server, with the feature routes mounted under /api/<name>.
   const gateway = new GatewayServer({
     config: config.gateway,
     deps: {
@@ -1088,6 +1271,7 @@ export async function startDaemon(): Promise<void> {
       },
       proactiveEngine: proactive,
     },
+    internalApi,
   });
 
   const port = await gateway.start();
@@ -1122,7 +1306,13 @@ export async function startDaemon(): Promise<void> {
     proactive,
     heartbeatLogStore,
     kokoroProcess,
-    v2Sessions: pipelineExecutor instanceof V2SessionManager ? pipelineExecutor : null,
+    v2Sessions,
+    sdkOptions,
+    turnContext,
+    features: startedFeatures,
+    ownerPrompts,
+    ingress,
+    scheduledInjections,
   };
 
   // 14. Signal handlers (registered once to avoid stacking on restart)
@@ -1152,10 +1342,10 @@ export async function startDaemon(): Promise<void> {
       // During restart, errors from stale connections are expected (e.g. Telegram
       // long-polling overlap). Log but don't crash — startDaemon() will recover.
       if (restarting) {
-        log.warn({ err }, "uncaught exception during restart (non-fatal)");
+        log.warn({ err: sanitizeErrorForLog(err) }, "uncaught exception during restart (non-fatal)");
         return;
       }
-      log.fatal({ err }, "uncaught exception — shutting down");
+      log.fatal({ err: sanitizeErrorForLog(err) }, "uncaught exception — shutting down");
       void stopDaemon().finally(() => process.exit(1));
     });
 
@@ -1175,11 +1365,14 @@ export async function startDaemon(): Promise<void> {
           return;
         }
       }
+      // Never log the raw reason: a grammY HttpError carries the bot token in
+      // its request URL. Only { name, message } is logged, and the log line
+      // itself is scrubbed.
       if (restarting) {
-        log.warn({ reason }, "unhandled rejection during restart (non-fatal)");
+        log.warn({ reason: sanitizeErrorForLog(reason) }, "unhandled rejection during restart (non-fatal)");
         return;
       }
-      log.fatal({ reason }, "unhandled promise rejection — shutting down");
+      log.fatal({ reason: sanitizeErrorForLog(reason) }, "unhandled promise rejection — shutting down");
       void stopDaemon().finally(() => process.exit(1));
     });
   }
@@ -1203,6 +1396,7 @@ export async function startDaemon(): Promise<void> {
  * Gracefully stop the Kirie daemon.
  *
  * Shutdown sequence:
+ *   0. Stop feature modules (reverse order), cancel owner prompts, stop ingress
  *   1. Stop background task manager
  *   2. Stop heartbeat service
  *   3. Stop accepting new messages (pipeline)
@@ -1233,7 +1427,22 @@ export async function stopDaemon(): Promise<void> {
     heartbeatLogStore: hbLogStore,
     kokoroProcess: kokoroProc,
     v2Sessions,
+    features,
+    ownerPrompts,
+    ingress,
+    scheduledInjections,
   } = state;
+
+  // 00. Feature modules first, in reverse order (PLAN B.10), then pending
+  //     owner prompts resolve to their safe default, then the public listener.
+  await stopFeatures(features);
+  ownerPrompts.cancelAll("shutdown");
+  scheduledInjections.stop();
+  try {
+    await ingress.stop();
+  } catch (err) {
+    log.error({ err }, "error stopping the ingress listener");
+  }
 
   // 0a. Kill Kokoro daemon process
   if (kokoroProc && !kokoroProc.killed) {
@@ -1520,6 +1729,7 @@ function createMcpRegistry(
     onRestart?: () => void;
     proactiveEngine?: ProactiveEngine | null;
     heartbeatLogStore?: HeartbeatLogStore;
+    featureTools?: McpServerOptions["featureTools"];
   },
 ) {
   const result = createMcpToolRegistry({
@@ -1531,6 +1741,7 @@ function createMcpRegistry(
     onRestart: opts?.onRestart,
     proactiveEngine: opts?.proactiveEngine,
     heartbeatLogStore: opts?.heartbeatLogStore,
+    featureTools: opts?.featureTools,
   });
 
   // Create an in-process SDK MCP server for potential V1 in-process fallback

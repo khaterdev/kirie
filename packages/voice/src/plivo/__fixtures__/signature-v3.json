@@ -1,0 +1,118 @@
+{
+  "source": "plivo-sdk",
+  "sdk": "plivo (npm) 4.79.0, dist/utils/v3Security.js",
+  "method": "Each signature was computed by the SDK's own construct_post_url and get_signature_v3 and accepted by its exported validateV3Signature. Generated 2026-11-23 in a scratch directory outside the repo; the SDK is not a dependency. The auth token is synthetic.",
+  "entries": [
+    {
+      "name": "body params, no URL query",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/turn/0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "params": {
+        "CallUUID": "11111111-2222-3333-4444-555555555555",
+        "From": "201001234567",
+        "To": "14155550100",
+        "Speech": "what is on my calendar today",
+        "SpeechConfidenceScore": "0.91",
+        "InputType": "speech"
+      },
+      "nonce": "05429567804466091622",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/turn/0f1e2d3c4b5a69788796a5b4c3d2e1f0?CallUUID11111111-2222-3333-4444-555555555555From201001234567InputTypespeechSpeechwhat is on my calendar todaySpeechConfidenceScore0.91To14155550100",
+      "signature": "zzCVQdwBT4viv3pibeLYqLLyS3VesVbzDCxaC2nyFY0="
+    },
+    {
+      "name": "body params with a URL query (the '.' separator case)",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/inbound?b=2&a=1",
+      "params": {
+        "CallUUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "From": "201001234567",
+        "To": "14155550100",
+        "Direction": "inbound",
+        "Event": "StartApp",
+        "CallStatus": "in-progress"
+      },
+      "nonce": "12345678901234567890",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/inbound?a=1&b=2.CallStatusin-progressCallUUIDaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeeDirectioninboundEventStartAppFrom201001234567To14155550100",
+      "signature": "Fw0z8Wl8Y8hm3R6C6J3kxd8oCCWExbUiZk1xJtu9D60="
+    },
+    {
+      "name": "no body params, URL query",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/wait/abcdef?x=1",
+      "params": {},
+      "nonce": "99999999999999999999",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/wait/abcdef?x=1",
+      "signature": "/OM/J/dPh3YRmPebeu4vun2aL8bjs96IDaVc2FiCd4s="
+    },
+    {
+      "name": "no body params, no URL query",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/status",
+      "params": {},
+      "nonce": "00000000000000000001",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/status",
+      "signature": "r2JLkd1+oXpcna9lP0KXRF0/j68xLctNwG3pPzURG7E="
+    },
+    {
+      "name": "multi-valued body param",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/pin/abcdef",
+      "params": {
+        "CallUUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "Digits": [
+          "1",
+          "5",
+          "9"
+        ]
+      },
+      "nonce": "31415926535897932384",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/pin/abcdef?CallUUIDaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeeDigits1Digits5Digits9",
+      "signature": "MGeFJTSe0pTzBvC6srumLLJDT0ifeWHvRLPuVGOd4bI="
+    },
+    {
+      "name": "non-ASCII body value",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/turn/abcdef",
+      "params": {
+        "CallUUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "Speech": "café crème, مرحبا"
+      },
+      "nonce": "27182818284590452353",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/turn/abcdef?CallUUIDaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeeSpeechcafé crème, مرحبا",
+      "signature": "Heye8kA32+7a6bdHQSVAT6b2owI2+eLyx0PlXPoF230="
+    },
+    {
+      "name": "URL with an explicit port",
+      "method": "POST",
+      "url": "https://kirie.example.com:8443/voice/plivo/status",
+      "params": {
+        "CallUUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "CallStatus": "completed",
+        "Duration": "42",
+        "Event": "Hangup"
+      },
+      "nonce": "16180339887498948482",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com:8443/voice/plivo/status?CallStatuscompletedCallUUIDaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeeDuration42EventHangup",
+      "signature": "WGSSnSWkRhwoXDdD7RyCzbPoDsDmoqqcOmi2m/7TWuY="
+    },
+    {
+      "name": "percent-encoded URL query with body params",
+      "method": "POST",
+      "url": "https://kirie.example.com/voice/plivo/outbound/abcdef?note=caf%C3%A9%20au%20lait&z=last",
+      "params": {
+        "CallUUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+      },
+      "nonce": "14142135623730950488",
+      "authToken": "fake-plivo-auth-token-for-tests-only",
+      "base": "https://kirie.example.com/voice/plivo/outbound/abcdef?note=café au lait&z=last.CallUUIDaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "signature": "YjWtvgbhfwfkJwhroc+RXqruN3eWOrHXJW0y/rsuVgw="
+    }
+  ]
+}

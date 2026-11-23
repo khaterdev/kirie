@@ -3,6 +3,8 @@
  * Uses key format: daily:YYYY-MM-DD
  */
 
+import { scrubForMemory, secretRedactionNotice } from "./memory.js";
+
 interface MemoryStoreLike {
   recall(key: string): { content: string; tags: string[] } | null;
   store(key: string, content: string, tags?: string[]): void;
@@ -47,7 +49,7 @@ export function createDailyNoteToolHandlers(
         const date = params.date as string | undefined;
         const key = date ? `daily:${date}` : todayKey();
         const dateStr = key.replace("daily:", "");
-        const content = params.content as string;
+        const { text: content, count: redacted } = scrubForMemory(params.content as string);
 
         const existing = memoryStore.recall(key);
         const timestamp = new Date().toLocaleTimeString("en-US", {
@@ -66,7 +68,9 @@ export function createDailyNoteToolHandlers(
           memoryStore.store(key, entry, ["daily-note"]);
         }
 
-        return { key, updated: true };
+        return redacted > 0
+          ? { key, updated: true, notice: secretRedactionNotice(redacted) }
+          : { key, updated: true };
       },
     },
 

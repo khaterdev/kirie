@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { MemoryStore, createMemoryToolHandlers } from "./memory.js";
+import { MemoryStore, createMemoryToolHandlers, type MemoryManagerLike } from "./memory.js";
 
 const TEST_DIR = `/tmp/kirie-memory-test-${process.pid}`;
 const TEST_DB = join(TEST_DIR, "memory.db");
@@ -170,5 +170,70 @@ describe("createMemoryToolHandlers", () => {
     store.store("del-test", "content");
     const result = handlers.memory_delete.handler({ key: "del-test" });
     expect(result.deleted).toBe(true);
+  });
+});
+
+describe("secret scrubbing (memory sink)", () => {
+  // Synthetic tokens assembled at run time.
+  const token = (): string => ["gh", "p_", "Qw7Er6Ty5Ui4Op3As2Df1Gh0Jk9Lz8Xc7Vb6Nm"].join("");
+  const body = (): string => token().slice(4);
+  const MARK = "«redacted:github-token»";
+
+  it("redacts content before it is stored and indexed", () => {
+    const entry = store.store("api:notes", `use ${token()} for the CI`);
+    expect(entry.content).toBe(`use ${MARK} for the CI`);
+    expect(store.recall("api:notes")!.content).not.toContain(body());
+    expect(store.search(token())).toEqual([]);
+    expect(store.search(body())).toEqual([]);
+    expect(store.search("CI")).toHaveLength(1);
+  });
+
+  it("redacts secrets in tags", () => {
+    const entry = store.store("tagged", "plain", [`t:${token()}`]);
+    expect(entry.tags).toEqual([`t:${MARK}`]);
+  });
+
+  it("rejects a key that looks like a secret", () => {
+    expect(() => store.store(token(), "x")).toThrow(/looks like it contains a secret/);
+    expect(store.list()).toEqual([]);
+  });
+
+  it("stores text without secrets unchanged", () => {
+    const text = "SHA 3f786850e387550fdab836ed7e6dc881de23001b, max_tokens=4096, uuid 550e8400-e29b-41d4-a716-446655440000";
+    expect(store.store("plain", text).content).toBe(text);
+  });
+
+  it("memory_store adds a notice when something was redacted", () => {
+    const handlers = createMemoryToolHandlers(store);
+    const result = handlers.memory_store.handler({ key: "k", content: `PASSWORD=Zx9Cv8Bn7Mq6 and ${token()}` }) as { content: string; notice?: string };
+    expect(result.content).not.toContain(body());
+    expect(result.notice).toBe("2 secret(s) were redacted before storing. Store secrets with: kirie credentials set <key> <value>");
+    const clean = handlers.memory_store.handler({ key: "k2", content: "nothing secret" }) as { notice?: string };
+    expect(clean.notice).toBeUndefined();
+  });
+
+  it("memory_store passes scrubbed text to the MemoryManager", async () => {
+    const manager = {
+      store: vi.fn(async (key: string, content: string, tags?: string[]) => {
+        store.store(key, content, tags);
+      }),
+      storeDocument: vi.fn(async () => ({ chunks: 2, skipped: 0 })),
+    } as unknown as MemoryManagerLike;
+    const handlers = createMemoryToolHandlers(store, manager);
+    const result = await handlers.memory_store.handler({ key: "m", content: `x ${token()}` });
+    expect((manager.store as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe(`x ${MARK}`);
+    expect(result.notice).toMatch(/^1 secret/);
+
+    const doc = await handlers.memory_store_document.handler({ key: "d", content: `doc ${token()}` });
+    expect((manager.storeDocument as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe(`doc ${MARK}`);
+    expect(doc.notice).toMatch(/^1 secret/);
+  });
+
+  it("memory_store_document fallback stores scrubbed text with a notice", () => {
+    const handlers = createMemoryToolHandlers(store);
+    const result = handlers.memory_store_document.handler({ key: "doc", content: `doc ${token()}` }) as { chunks: number; notice?: string };
+    expect(result.chunks).toBe(1);
+    expect(result.notice).toMatch(/^1 secret/);
+    expect(store.recall("doc")!.content).toBe(`doc ${MARK}`);
   });
 });

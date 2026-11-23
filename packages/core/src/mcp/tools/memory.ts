@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { getScrubber, scrubSecretsWithCount } from "../../security/secret-scrubber.js";
 
 /**
  * Compute a SHA-256 hex digest of the given content string.
@@ -12,6 +13,16 @@ function hashContent(content: string): string {
 }
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "memory.db");
+
+/** Appended to a memory tool's result when content was redacted before storing. */
+export function secretRedactionNotice(count: number): string {
+  return `${count} secret(s) were redacted before storing. Store secrets with: kirie credentials set <key> <value>`;
+}
+
+/** Scrub content for the memory sink; returns the text to store and how many secrets were removed. */
+export function scrubForMemory(content: string): { text: string; count: number } {
+  return scrubSecretsWithCount(content, { sink: "memory" });
+}
 
 /**
  * Sanitize a user query for FTS5 MATCH by wrapping each whitespace-separated
@@ -123,7 +134,17 @@ export class MemoryStore {
     };
   }
 
-  store(key: string, content: string, tags?: string[]): MemoryEntry {
+  /**
+   * Store a memory. Content and tags are scrubbed for secrets here, so no caller in either
+   * process (tools, MemoryManager, file watcher) can persist one. A key that itself looks like
+   * a secret is rejected.
+   */
+  store(key: string, rawContent: string, rawTags?: string[]): MemoryEntry {
+    if (getScrubber().scrubWithCount(key, { sink: "memory" }).count > 0) {
+      throw new Error("Memory key looks like it contains a secret. Use a descriptive key; store secrets with: kirie credentials set <key> <value>");
+    }
+    const content = scrubForMemory(rawContent).text;
+    const tags = rawTags?.map((t) => scrubForMemory(t).text);
     const tagsJson = JSON.stringify(tags ?? []);
     const now = new Date().toISOString();
     const newHash = hashContent(content);
@@ -288,11 +309,14 @@ export function createMemoryToolHandlers(store: MemoryStore, memoryManager?: Mem
         },
         required: ["key", "content"] as const,
       },
-      handler(params: { key: string; content: string; tags?: string[] }): MemoryEntry | Promise<MemoryEntry> {
+      handler(params: { key: string; content: string; tags?: string[] }): (MemoryEntry & { notice?: string }) | Promise<MemoryEntry & { notice?: string }> {
+        const { text, count } = scrubForMemory(params.content);
+        const withNotice = (entry: MemoryEntry): MemoryEntry & { notice?: string } =>
+          count > 0 ? { ...entry, notice: secretRedactionNotice(count) } : entry;
         if (memoryManager) {
-          return memoryManager.store(params.key, params.content, params.tags).then(() => store.recall(params.key)!);
+          return memoryManager.store(params.key, text, params.tags).then(() => withNotice(store.recall(params.key)!));
         }
-        return store.store(params.key, params.content, params.tags);
+        return withNotice(store.store(params.key, text, params.tags));
       },
     },
 
@@ -313,19 +337,22 @@ export function createMemoryToolHandlers(store: MemoryStore, memoryManager?: Mem
         },
         required: ["key", "content"] as const,
       },
-      handler(params: { key: string; content: string; chunkTokens?: number; chunkOverlap?: number; tags?: string[] }): Promise<{ chunks: number; skipped: number }> | { chunks: number; skipped: number } {
+      handler(params: { key: string; content: string; chunkTokens?: number; chunkOverlap?: number; tags?: string[] }): Promise<{ chunks: number; skipped: number; notice?: string }> | { chunks: number; skipped: number; notice?: string } {
+        const { text, count } = scrubForMemory(params.content);
+        const withNotice = (r: { chunks: number; skipped: number }) =>
+          count > 0 ? { ...r, notice: secretRedactionNotice(count) } : r;
         if (memoryManager) {
-          return memoryManager.storeDocument(params.key, params.content, {
+          return memoryManager.storeDocument(params.key, text, {
             chunking: {
               tokens: params.chunkTokens ?? 512,
               overlap: params.chunkOverlap ?? 64,
             },
             tags: params.tags,
-          });
+          }).then(withNotice);
         }
         // Fallback: store as a single entry when no memory manager is available
-        store.store(params.key, params.content, params.tags);
-        return { chunks: 1, skipped: 0 };
+        store.store(params.key, text, params.tags);
+        return withNotice({ chunks: 1, skipped: 0 });
       },
     },
 

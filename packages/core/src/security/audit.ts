@@ -625,6 +625,67 @@ export function detectSyncedFolders(
 }
 
 /**
+ * Sandbox findings (W3-SBX, PLAN C.10). Reads config only: a `/sandbox`
+ * runtime override is not visible here.
+ */
+export function collectSandboxFindings(sandbox: KirieConfig["sandbox"]): AuditFinding[] {
+  const findings: AuditFinding[] = [];
+  if (sandbox.mode === "off") {
+    findings.push({
+      category: "attack-surface",
+      severity: "info",
+      message: "Sandbox disabled — shell commands run directly on this Mac",
+      remediation: "Run /sandbox native (macOS sandbox, keeps host tools) or /sandbox docker (Docker container) for untrusted work",
+    });
+  }
+  if (sandbox.mode === "native") {
+    if (sandbox.native.allowUnsandboxed) {
+      findings.push({
+        category: "attack-surface",
+        severity: "warning",
+        message: "Native sandbox allows unsandboxed commands (sandbox.native.allowUnsandboxed: true) — the model can opt out of the sandbox per command",
+        remediation: "Set sandbox.native.allowUnsandboxed to false",
+      });
+    }
+    if (sandbox.native.excludedCommands.length > 0) {
+      findings.push({
+        category: "attack-surface",
+        severity: "info",
+        message: `Native sandbox runs ${sandbox.native.excludedCommands.length} command pattern(s) outside the sandbox (sandbox.native.excludedCommands)`,
+        remediation: "Keep sandbox.native.excludedCommands as short as possible",
+      });
+    }
+    if (sandbox.native.allowUnixSockets.some((s) => /docker\.sock/i.test(s))) {
+      findings.push({
+        category: "attack-surface",
+        severity: "warning",
+        message: "Native sandbox allows the Docker socket — a sandboxed command can start a container with the host filesystem mounted",
+        remediation: "Remove docker.sock from sandbox.native.allowUnixSockets",
+      });
+    }
+  }
+  if (sandbox.mode === "docker") {
+    if (sandbox.docker.network === "bridge") {
+      findings.push({
+        category: "attack-surface",
+        severity: "info",
+        message: "Docker sandbox has network access (sandbox.docker.network: bridge); the approval gate keeps its network rules for sandboxed commands",
+        remediation: "Use sandbox.docker.network: none unless commands need the network",
+      });
+    }
+    if (!sandbox.docker.readOnlyRoot || !sandbox.docker.capDrop.includes("ALL")) {
+      findings.push({
+        category: "attack-surface",
+        severity: "info",
+        message: "sandbox.docker.readOnlyRoot false or a capDrop without ALL is ignored — the container always runs read-only with every capability dropped",
+        remediation: "Remove the setting from config.yaml",
+      });
+    }
+  }
+  return findings;
+}
+
+/**
  * Analyse config for broad attack surface: open group policy,
  * disabled sandbox, etc.
  */
@@ -640,14 +701,34 @@ export function collectAttackSurface(config: KirieConfig): AuditFinding[] {
     });
   }
 
-  if (config.sandbox.mode === "off") {
+  const approvals = config.approvals;
+  if (approvals && !approvals.enabled) {
     findings.push({
       category: "attack-surface",
-      severity: "info",
-      message: "Sandbox disabled — agent tools run without isolation",
-      remediation: "Enable Docker sandbox for production",
+      severity: "warning",
+      message: "Approval gate disabled (approvals.enabled: false) — no tool call is checked, not even catastrophic commands",
+      remediation: "Set approvals.enabled to true",
     });
+  } else if (approvals) {
+    if (approvals.mode === "yolo") {
+      findings.push({
+        category: "attack-surface",
+        severity: "info",
+        message: "Approval gate in yolo mode — risky commands run without asking (only the hardline list and the deny list block)",
+        remediation: "Run /approvals mode ask, then /approvals test a few everyday commands",
+      });
+    }
+    if (!approvals.hardline) {
+      findings.push({
+        category: "attack-surface",
+        severity: "warning",
+        message: "Approval hardline list is off — catastrophic commands (rm -rf /, disk formatting, fork bombs) are not blocked",
+        remediation: "Set approvals.hardline to true",
+      });
+    }
   }
+
+  findings.push(...collectSandboxFindings(config.sandbox));
 
   return findings;
 }

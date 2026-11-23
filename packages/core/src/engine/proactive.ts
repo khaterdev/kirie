@@ -13,7 +13,6 @@
  */
 
 import { EventEmitter } from "node:events";
-import pino from "pino";
 import type { ProactiveConfig } from "../config/schema.js";
 import type { HeartbeatTickEvent, HeartbeatService } from "./heartbeat.js";
 import type {
@@ -24,14 +23,15 @@ import type {
 } from "./signals.js";
 import { createDefaultDetectors } from "./signals.js";
 import type { TriageDecision } from "./triage.js";
-import { TriageRunner } from "./triage.js";
+import { TriageRunner, type TriageRunnerOptions } from "./triage.js";
 import { NotificationManager } from "./notifications.js";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { SessionStore } from "./session-store.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { HeartbeatLogStore } from "../mcp/tools/heartbeat-logs.js";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "proactive" });
+const log = createModuleLogger("proactive");
 
 // ---------------------------------------------------------------------------
 // Events
@@ -64,6 +64,8 @@ export interface ProactiveEngineDeps {
   createBackgroundTask?: (sessionKey: string, description: string, prompt: string) => void;
   /** Optional HeartbeatLogStore for triage context injection */
   heartbeatLogStore?: HeartbeatLogStore;
+  /** Optional wiring for the triage model call (SDK options seam, working directory) */
+  triage?: TriageRunnerOptions;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +115,11 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
   /** Tick number of the most recent heartbeat, reused when revalidating signals. */
   private lastTickNumber = 0;
 
-  /** Tier 2 interval in milliseconds */
-  private readonly tier2IntervalMs: number;
+  /** Tier 2 interval in milliseconds (the owner can change it with /heartbeat every) */
+  private tier2IntervalMs: number;
+
+  /** Epoch ms until which non-critical notifications are held (/heartbeat snooze). 0 = not snoozed. */
+  private snoozedUntilMs = 0;
 
   /** Callbacks for detector context */
   private readonly getRunningTasks?: () => RunningTaskInfo[];
@@ -141,7 +146,7 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
     this.detectors = createDefaultDetectors(deps.config);
 
     // Initialize triage runner (with optional heartbeat log store for context injection)
-    this.triageRunner = new TriageRunner(deps.config, deps.heartbeatLogStore);
+    this.triageRunner = new TriageRunner(deps.config, deps.heartbeatLogStore, deps.triage);
 
     // Initialize notification manager
     this.notificationManager = new NotificationManager(deps.channelRegistry, {
@@ -355,8 +360,16 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
     decision: TriageDecision,
     signals: Signal[],
   ): Promise<void> {
+    const signal = decision.signalId ? signals.find((s) => s.id === decision.signalId) : undefined;
+    const held = this.isSnoozed() && signal?.severity !== "critical";
     switch (decision.action) {
       case "notify-now": {
+        if (decision.message && held) {
+          // Snoozed: the notification waits in the digest instead of going out now.
+          this.queueDecisionForDigest(decision, signal);
+          log.info({ signalId: decision.signalId }, "snoozed: notify-now queued for the digest");
+          break;
+        }
         if (decision.message) {
           const deduKey = this.getDecisionDeduKey(decision, signals);
           const cooldownMs = (this.config.notificationCooldownMinutes ?? 60) * 60 * 1000;
@@ -379,29 +392,15 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
       }
 
       case "queue-digest": {
-        // Find the signal this decision applies to
-        const signal = decision.signalId
-          ? signals.find((s) => s.id === decision.signalId)
-          : undefined;
-
-        if (signal) {
-          this.notificationManager.queueForDigest(signal);
-        } else if (decision.message) {
-          // Create a synthetic signal for the digest
-          this.notificationManager.queueForDigest({
-            id: `triage-${Date.now()}`,
-            type: "triage-item",
-            severity: "info",
-            title: decision.message,
-            details: "",
-            timestamp: Date.now(),
-            source: "triage",
-          });
-        }
+        this.queueDecisionForDigest(decision, signal);
         break;
       }
 
       case "escalate": {
+        if (held) {
+          log.info({ signalId: decision.signalId }, "snoozed: escalation skipped");
+          break;
+        }
         if (this.createBackgroundTask) {
           const deduKey = this.getDecisionDeduKey(decision, signals);
           const cooldownMs = (this.config.notificationCooldownMinutes ?? 60) * 60 * 1000;
@@ -433,6 +432,23 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
       default:
         // No action needed
         break;
+    }
+  }
+
+  /** Queue a decision's signal, or a synthetic one built from its message, for the digest. */
+  private queueDecisionForDigest(decision: TriageDecision, signal: Signal | undefined): void {
+    if (signal) {
+      this.notificationManager.queueForDigest(signal);
+    } else if (decision.message) {
+      this.notificationManager.queueForDigest({
+        id: `triage-${Date.now()}`,
+        type: "triage-item",
+        severity: "info",
+        title: decision.message,
+        details: "",
+        timestamp: Date.now(),
+        source: "triage",
+      });
     }
   }
 
@@ -545,4 +561,76 @@ export class ProactiveEngine extends EventEmitter<ProactiveEngineEvents> {
   getConfig(): ProactiveConfig {
     return this.config;
   }
+
+  /** Current triage interval in minutes */
+  get tier2IntervalMinutes(): number {
+    return this.tier2IntervalMs / 60_000;
+  }
+
+  /**
+   * Change the triage interval. The next triage is due `minutes` after the
+   * last one (so a shorter interval can make it due at the next tick).
+   * Bounds are the caller's job (/heartbeat every enforces 5 to 1440).
+   */
+  setTier2IntervalMinutes(minutes: number): void {
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+      throw new RangeError(`invalid triage interval: ${minutes}`);
+    }
+    this.tier2IntervalMs = Math.round(minutes * 60_000);
+    log.info({ tier2IntervalMin: minutes }, "triage interval changed");
+  }
+
+  /**
+   * Hold non-critical notifications until `untilMs` (epoch ms): notify-now
+   * decisions go to the digest and escalations are skipped. Decisions about a
+   * critical signal still go out. `null` or a past time ends the snooze.
+   */
+  snooze(untilMs: number | null): void {
+    this.snoozedUntilMs = untilMs !== null && Number.isFinite(untilMs) && untilMs > Date.now() ? untilMs : 0;
+    log.info({ snoozedUntil: this.snoozedUntilMs || null }, this.snoozedUntilMs ? "notifications snoozed" : "snooze ended");
+  }
+
+  /** Epoch ms the snooze ends, or 0 when not snoozed (an expired snooze reads 0). */
+  get snoozedUntil(): number {
+    return this.isSnoozed() ? this.snoozedUntilMs : 0;
+  }
+
+  isSnoozed(now: number = Date.now()): boolean {
+    return this.snoozedUntilMs > now;
+  }
+
+  /** Whether a triage cycle is running now */
+  get isTriageInProgress(): boolean {
+    return this.triageInProgress;
+  }
+
+  /** What proactive_status reports, plus the interval and snooze. */
+  status(): ProactiveEngineStatus {
+    return {
+      running: this.running,
+      signalQueueSize: this.signalQueue.length,
+      lastTriageAt: this.lastTriageAt,
+      nextTriageAt: this.nextTriageAt,
+      digestQueueSize: this.notificationManager.digestQueueSize,
+      dedupCacheSize: this.dedupCache.size,
+      notifiedTypesCacheSize: this.notifiedTypes.size,
+      tier2IntervalMinutes: this.tier2IntervalMinutes,
+      snoozedUntil: this.snoozedUntil,
+      triageInProgress: this.triageInProgress,
+    };
+  }
+}
+
+export interface ProactiveEngineStatus {
+  running: boolean;
+  signalQueueSize: number;
+  lastTriageAt: number;
+  nextTriageAt: number;
+  digestQueueSize: number;
+  dedupCacheSize: number;
+  notifiedTypesCacheSize: number;
+  tier2IntervalMinutes: number;
+  /** 0 when not snoozed */
+  snoozedUntil: number;
+  triageInProgress: boolean;
 }

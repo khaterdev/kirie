@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   query,
   type Query,
@@ -7,7 +8,7 @@ import {
   type SDKResultMessage,
   type McpServerConfig,
 } from "@anthropic-ai/claude-agent-sdk";
-import pino from "pino";
+import { createModuleLogger } from "../logging/logger.js";
 import type { SessionStore } from "./session-store.js";
 import {
   wrapUserMessage,
@@ -23,8 +24,27 @@ import {
   type SenderIdentity,
 } from "./prompt-builder.js";
 import { makeSessionKey } from "../routing/session-key.js";
+import {
+  attachFailure,
+  classifyFailure,
+  failureOf,
+  feedTurnSignals,
+  isHardFailure,
+  logSdkSignal,
+  newTurnSignals,
+  type FailureInfo,
+  type TurnSignals,
+} from "./failure.js";
+import type { TurnAdvance, TurnCandidate, TurnResilience } from "./resilience.js";
+import { mergeStaticEnv } from "../accounts/account-env.js";
+import {
+  chatCallContext,
+  type SdkCallContext,
+  type SdkOptionsPipeline,
+  type SdkTurnEndResult,
+} from "./sdk-options.js";
 
-const log = pino({ name: "v2-session-manager" });
+const log = createModuleLogger("v2-session-manager");
 
 /**
  * A deferred promise that can be resolved/rejected externally.
@@ -58,22 +78,26 @@ class UserMessageQueue implements AsyncIterable<SDKUserMessage> {
   private waiter: ((result: IteratorResult<SDKUserMessage>) => void) | null = null;
   private closed = false;
 
-  push(text: string): void {
+  /** Queue a user message and return the uuid stamped on it. */
+  push(text: string): string {
     if (this.closed) throw new Error("cannot send on a closed session");
 
+    const uuid = randomUUID();
     const message: SDKUserMessage = {
       type: "user",
       message: { role: "user", content: text },
       parent_tool_use_id: null,
+      uuid,
     };
 
     const waiter = this.waiter;
     if (waiter) {
       this.waiter = null;
       waiter({ value: message, done: false });
-      return;
+      return uuid;
     }
     this.pending.push(message);
+    return uuid;
   }
 
   /** Ends the input stream, which lets the subprocess shut down cleanly. */
@@ -122,6 +146,16 @@ interface ManagedSession {
   textParts: string[];
   /** Set when the caller closed the session mid-turn via the onQuery handle. */
   aborted: boolean;
+  /** Context this session's options were built with (fixed for its lifetime). */
+  ctx: SdkCallContext;
+  /** Failure signals gathered since the last result. */
+  signals: TurnSignals;
+  /** uuid of the user message whose turn is in flight. */
+  currentUuid: string | undefined;
+  /** Claude account the subprocess was spawned with (null = ambient). Fixed for its lifetime */
+  accountId: string | null;
+  /** Model the session currently runs (changed with setModel by the fallback chain) */
+  model: string;
 }
 
 /**
@@ -153,7 +187,23 @@ export interface V2SessionManagerConfig {
   maxSessions?: number;
   /** Optional environment variables to pass to subprocesses */
   env?: Record<string, string>;
+  /** Shared SDK options seam (hooks, gates, contributors, stream observers) */
+  sdkOptions?: SdkOptionsPipeline;
+  /**
+   * Called for a `result` that arrives with no turn pending, e.g. the final
+   * answer of an async subagent after the turn already returned
+   * "waiting for the agent". Can also be set later with setUnsolicitedResultHandler.
+   */
+  onUnsolicitedResult?: UnsolicitedResultHandler;
 }
+
+/** The returned failure of a turn that was not run because no account may be used. */
+function blockedResult(failure: FailureInfo, sessionId: string | undefined): ExecutionResult {
+  return { response: "", sessionId: sessionId ?? "", costUsd: 0, numTurns: 0, isError: true, failure, accountId: null };
+}
+
+/** Receives a result that arrived while no turn was waiting for it. */
+export type UnsolicitedResultHandler = (sessionKey: string, result: ExecutionResult) => void;
 
 /**
  * Per-session values derived from the first message on that session.
@@ -166,6 +216,8 @@ interface SessionBootstrap {
   systemPrompt?: Options["systemPrompt"];
   model?: string;
   maxTurns?: number;
+  /** Call context for the SDK options seam, from the message that opens the session. */
+  ctx: SdkCallContext;
 }
 
 /**
@@ -188,15 +240,27 @@ export class V2SessionManager implements AgentExecutor {
   private readonly idleTimeoutMs: number;
   private readonly maxSessions: number;
   private idleCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private unsolicitedHandler: UnsolicitedResultHandler | null;
+  /** Account rotation and model fallback (PLAN C.1, C.2). Null: today's behaviour */
+  private resilience: TurnResilience | null = null;
 
   constructor(sessionStore: SessionStore, config: V2SessionManagerConfig) {
     this.sessionStore = sessionStore;
     this.config = config;
+    this.unsolicitedHandler = config.onUnsolicitedResult ?? null;
     this.idleTimeoutMs = config.idleTimeoutMs ?? 10 * 60 * 1000; // 10 minutes
     this.maxSessions = config.maxSessions ?? 20;
 
     // Periodically check for idle sessions
     this.idleCheckInterval = setInterval(() => this.closeIdleSessions(), 60_000);
+  }
+
+  /**
+   * Install (or remove) account rotation and model fallback. Without it every
+   * session spawns with the daemon's env and the configured model, as before.
+   */
+  setResilience(resilience: TurnResilience | null): void {
+    this.resilience = resilience;
   }
 
   /**
@@ -207,6 +271,12 @@ export class V2SessionManager implements AgentExecutor {
    *
    * If the result is an error (e.g. from a stale session ID that can't be
    * resumed), automatically retries once with a fresh session.
+   *
+   * With resilience installed, a limit or account failure moves to the next
+   * account or model (PLAN C.1, C.2) between attempts: the idle session is
+   * closed and fully gone before it is resumed under the next account, or its
+   * model is changed in place with setModel. A session with a turn in flight
+   * is never closed for a rotation.
    */
   async execute(
     message: IncomingMessage,
@@ -229,9 +299,116 @@ export class V2SessionManager implements AgentExecutor {
       this.config.prompt?.timezone,
     );
 
-    const result = await this.sendAndWait(sessionKey, userPrompt, bootstrap, sessionId, onQuery);
+    const resilience = this.resilience;
+    if (!resilience) return this.attempt(sessionKey, userPrompt, bootstrap, sessionId, onQuery);
+
+    const plan = resilience.begin({ kind: "chat", primaryModel: bootstrap.model ?? this.config.model });
+    const tz = this.config.prompt?.timezone;
+    // No imported account may be used: never spawn on a login the owner did not import.
+    const blocked = plan.blockedFailure;
+    if (blocked) return blockedResult(blocked, sessionId);
+    let prompt = userPrompt;
+    let resumeId = sessionId;
+    for (;;) {
+      const candidate = plan.current;
+      let result: ExecutionResult;
+      try {
+        await this.prepareSession(sessionKey, candidate);
+        result = await this.attempt(sessionKey, prompt, bootstrap, resumeId, onQuery, candidate);
+      } catch (err) {
+        const failure = failureOf(err);
+        const advance = isHardFailure(failure) ? plan.next(failure) : null;
+        if (!advance) {
+          if (failure) attachFailure(err, plan.finalFailure(failure, tz));
+          throw err;
+        }
+        this.logAdvance(sessionKey, advance);
+        prompt = `${advance.note}\n${userPrompt}`;
+        resumeId = undefined;
+        continue;
+      }
+
+      if (result.isError && !result.wasAborted && isHardFailure(result.failure)) {
+        const advance = plan.next(result.failure);
+        if (!advance) return { ...result, failure: plan.finalFailure(result.failure, tz) };
+        this.logAdvance(sessionKey, advance);
+        prompt = `${advance.note}\n${userPrompt}`;
+        resumeId = undefined;
+        continue;
+      }
+      if (!result.isError && !result.wasAborted) {
+        const notices = plan.succeeded();
+        if (notices.length > 0) return { ...result, notices };
+      }
+      return result;
+    }
+  }
+
+  private logAdvance(sessionKey: string, advance: TurnAdvance): void {
+    log.warn(
+      {
+        sessionKey,
+        failureClass: advance.reason,
+        fromAccount: advance.previous.accountId,
+        toAccount: advance.accountId,
+        fromModel: advance.previous.model,
+        toModel: advance.model,
+      },
+      advance.changedAccount ? "retrying the turn on the next Claude account" : "retrying the turn on the next model",
+    );
+  }
+
+  /**
+   * Before an attempt: a live idle session bound to another account is closed
+   * and waited for, so the resume on the new account never shares a
+   * transcript with a live process; a model change on the same account is
+   * applied in place with setModel. A busy session is left alone.
+   */
+  private async prepareSession(sessionKey: string, candidate: TurnCandidate): Promise<void> {
+    const managed = this.sessions.get(sessionKey);
+    if (!managed || managed.pendingResult || managed.aborted) return;
+    if (managed.accountId !== candidate.accountId) {
+      log.info(
+        { sessionKey, fromAccount: managed.accountId, toAccount: candidate.accountId },
+        "closing the idle session to resume it on another account",
+      );
+      await this.closeAndWait(sessionKey, 5_000);
+      return;
+    }
+    if (managed.model !== candidate.model) {
+      try {
+        await managed.stream.setModel(candidate.model);
+        managed.model = candidate.model;
+        log.info({ sessionKey, model: candidate.model }, "session model changed");
+      } catch (err) {
+        log.warn({ sessionKey, err: err instanceof Error ? err.message : String(err) }, "setModel failed; restarting the session on the new model");
+        await this.closeAndWait(sessionKey, 5_000);
+      }
+    }
+  }
+
+  /** One attempt: today's execute, including the fresh-session retry for an unclassified error. */
+  private async attempt(
+    sessionKey: string,
+    userPrompt: string,
+    bootstrap: SessionBootstrap,
+    sessionId: string | undefined,
+    onQuery: ((q: Query) => void) | undefined,
+    candidate?: TurnCandidate,
+  ): Promise<ExecutionResult> {
+    const result = await this.sendAndWait(sessionKey, userPrompt, bootstrap, sessionId, onQuery, candidate);
 
     if (result.isError) {
+      // A usage limit, auth failure, unavailable model or overload is not a
+      // stale session. Wiping the mapping and retrying fresh would hit the same
+      // wall and lose the conversation, so the session and mapping are kept.
+      if (isHardFailure(result.failure)) {
+        log.warn(
+          { sessionKey, failureClass: result.failure.class },
+          "session returned a limit/account error; keeping the session, not retrying fresh",
+        );
+        return result;
+      }
       log.warn(
         { sessionKey, response: result.response.slice(0, 200) },
         "session returned error result, retrying with fresh session",
@@ -239,7 +416,7 @@ export class V2SessionManager implements AgentExecutor {
       this.cleanupSession(sessionKey);
       this.sessionStore.delete(sessionKey);
 
-      return this.sendAndWait(sessionKey, userPrompt, bootstrap, undefined, onQuery);
+      return this.sendAndWait(sessionKey, userPrompt, bootstrap, undefined, onQuery, candidate);
     }
 
     return result;
@@ -249,8 +426,16 @@ export class V2SessionManager implements AgentExecutor {
    * Build the values that are fixed for the lifetime of a session.
    */
   private buildBootstrap(message: IncomingMessage, sender: SenderIdentity): SessionBootstrap {
+    const ctx = chatCallContext({
+      sessionKey: makeSessionKey({ channel: message.channel, chatType: message.chatType, chatId: message.chatId }),
+      channel: message.channel,
+      chatType: message.chatType,
+      senderRole: sender.role,
+      cwd: this.config.workspacePath,
+    });
+
     if (!this.config.prompt) {
-      return { model: this.config.model, maxTurns: this.config.maxTurns };
+      return { model: this.config.model, maxTurns: this.config.maxTurns, ctx };
     }
 
     const channel: ChannelContext = {
@@ -265,6 +450,7 @@ export class V2SessionManager implements AgentExecutor {
       systemPrompt: built.systemPrompt,
       model: built.model ?? this.config.model,
       maxTurns: built.maxTurns ?? this.config.maxTurns,
+      ctx,
     };
   }
 
@@ -278,8 +464,9 @@ export class V2SessionManager implements AgentExecutor {
     bootstrap: SessionBootstrap,
     resumeSessionId?: string,
     onQuery?: (q: Query) => void,
+    candidate?: TurnCandidate,
   ): Promise<ExecutionResult> {
-    const managed = this.getOrCreate(sessionKey, bootstrap, resumeSessionId);
+    const managed = this.getOrCreate(sessionKey, bootstrap, resumeSessionId, candidate);
     managed.lastActivity = Date.now();
     this.resetIdleTimer(managed);
 
@@ -291,7 +478,8 @@ export class V2SessionManager implements AgentExecutor {
     managed.pendingResult = deferred;
 
     try {
-      managed.input.push(userMessage);
+      const uuid = managed.input.push(userMessage);
+      this.beginTurn(managed, uuid);
     } catch (err) {
       managed.pendingResult = null;
       // Session is dead (input stream already closed) — recreate it.
@@ -299,13 +487,14 @@ export class V2SessionManager implements AgentExecutor {
       this.cleanupSession(sessionKey);
       this.sessionStore.delete(sessionKey);
 
-      const fresh = this.createNewSession(sessionKey, bootstrap);
+      const fresh = this.createNewSession(sessionKey, bootstrap, candidate);
       onQuery?.(this.abortHandle(fresh));
       const freshDeferred = createDeferred<ExecutionResult>();
       fresh.pendingResult = freshDeferred;
 
       try {
-        fresh.input.push(userMessage);
+        const uuid = fresh.input.push(userMessage);
+        this.beginTurn(fresh, uuid);
         return await freshDeferred.promise;
       } catch (retryErr) {
         fresh.pendingResult = null;
@@ -341,6 +530,8 @@ export class V2SessionManager implements AgentExecutor {
       }
 
       if (managed.pendingResult) {
+        const uuid = managed.currentUuid;
+        this.endTurn(managed, { isError: false, wasAborted: true, costUsd: 0, numTurns: 0 });
         managed.pendingResult.resolve({
           response: managed.textParts.join(""),
           sessionId: managed.sdkSessionId ?? "",
@@ -348,6 +539,8 @@ export class V2SessionManager implements AgentExecutor {
           numTurns: 0,
           isError: false,
           wasAborted: true,
+          accountId: managed.accountId,
+          ...(uuid ? { userMessageUuid: uuid } : {}),
         });
         managed.pendingResult = null;
       }
@@ -372,6 +565,7 @@ export class V2SessionManager implements AgentExecutor {
     sessionKey: string,
     bootstrap: SessionBootstrap,
     resumeSessionId?: string,
+    candidate?: TurnCandidate,
   ): ManagedSession {
     const existing = this.sessions.get(sessionKey);
     if (existing) {
@@ -379,10 +573,21 @@ export class V2SessionManager implements AgentExecutor {
     }
 
     // Resume the caller's session ID if given, else whatever we persisted
-    const savedSessionId = resumeSessionId ?? this.sessionStore.get(sessionKey);
+    let savedSessionId = resumeSessionId ?? this.sessionStore.get(sessionKey);
+    if (savedSessionId && candidate && this.resilience) {
+      // The session row records the account the transcript was written under.
+      const from = this.sessionStore.getAccountId(sessionKey) ?? null;
+      if (!this.resilience.resumableAcross(from, candidate.accountId, savedSessionId)) {
+        log.warn(
+          { sessionKey, fromAccount: from, toAccount: candidate.accountId },
+          "session cannot be carried to the new account; starting fresh (recent history is in the prompt)",
+        );
+        savedSessionId = null;
+      }
+    }
     if (savedSessionId) {
       try {
-        return this.startSession(sessionKey, savedSessionId, bootstrap);
+        return this.startSession(sessionKey, savedSessionId, bootstrap, candidate);
       } catch (err) {
         log.warn({ sessionKey, savedSessionId, err }, "failed to resume session, creating new");
       }
@@ -393,15 +598,15 @@ export class V2SessionManager implements AgentExecutor {
       this.evictOldestSession();
     }
 
-    return this.createNewSession(sessionKey, bootstrap);
+    return this.createNewSession(sessionKey, bootstrap, candidate);
   }
 
   /**
    * Create a brand new session.
    */
-  private createNewSession(sessionKey: string, bootstrap: SessionBootstrap): ManagedSession {
+  private createNewSession(sessionKey: string, bootstrap: SessionBootstrap, candidate?: TurnCandidate): ManagedSession {
     log.info({ sessionKey }, "creating new session");
-    return this.startSession(sessionKey, null, bootstrap);
+    return this.startSession(sessionKey, null, bootstrap, candidate);
   }
 
   /**
@@ -411,16 +616,16 @@ export class V2SessionManager implements AgentExecutor {
     sessionKey: string,
     resumeSessionId: string | null,
     bootstrap: SessionBootstrap,
+    candidate?: TurnCandidate,
   ): ManagedSession {
     if (resumeSessionId) {
-      log.info({ sessionKey, sdkSessionId: resumeSessionId }, "resuming session");
+      log.info({ sessionKey, sdkSessionId: resumeSessionId, accountId: candidate?.accountId ?? null }, "resuming session");
     }
 
     const input = new UserMessageQueue();
-    const stream = query({
-      prompt: input,
-      options: this.createOptions(resumeSessionId, bootstrap),
-    });
+    const options = this.createOptions(resumeSessionId, bootstrap, candidate);
+    this.config.sdkOptions?.apply(options, bootstrap.ctx);
+    const stream = query({ prompt: input, options });
 
     const managed: ManagedSession = {
       stream,
@@ -433,6 +638,11 @@ export class V2SessionManager implements AgentExecutor {
       lastActivity: Date.now(),
       textParts: [],
       aborted: false,
+      ctx: bootstrap.ctx,
+      signals: newTurnSignals(),
+      currentUuid: undefined,
+      accountId: candidate?.accountId ?? null,
+      model: options.model ?? this.config.model,
     };
 
     managed.streamConsumer = this.startStreamConsumer(managed);
@@ -448,9 +658,9 @@ export class V2SessionManager implements AgentExecutor {
    * and systemPrompt directly, so there is no need to stage them through
    * .claude/settings.json or CLAUDE.md in the workspace.
    */
-  private createOptions(resumeSessionId: string | null, bootstrap: SessionBootstrap): Options {
+  private createOptions(resumeSessionId: string | null, bootstrap: SessionBootstrap, candidate?: TurnCandidate): Options {
     const options: Options = {
-      model: bootstrap.model ?? this.config.model,
+      model: candidate?.model ?? bootstrap.model ?? this.config.model,
       permissionMode: this.config.permissionMode ?? "bypassPermissions",
       cwd: this.config.workspacePath,
       // Matches the one-shot path: without this the SDK discovers no
@@ -463,7 +673,8 @@ export class V2SessionManager implements AgentExecutor {
     if (this.config.mcpServers) options.mcpServers = this.config.mcpServers;
     if (bootstrap.systemPrompt) options.systemPrompt = bootstrap.systemPrompt;
     if (bootstrap.maxTurns != null) options.maxTurns = bootstrap.maxTurns;
-    if (this.config.env) options.env = { ...process.env, ...this.config.env } as Record<string, string>;
+    if (candidate?.env) options.env = mergeStaticEnv(candidate.env, this.config.env);
+    else if (this.config.env) options.env = { ...process.env, ...this.config.env } as Record<string, string>;
     if (resumeSessionId) options.resume = resumeSessionId;
 
     return options;
@@ -476,9 +687,14 @@ export class V2SessionManager implements AgentExecutor {
    */
   private async startStreamConsumer(managed: ManagedSession): Promise<void> {
     const textParts = managed.textParts;
+    const sdkOptions = this.config.sdkOptions;
 
     try {
       for await (const msg of managed.stream) {
+        sdkOptions?.observe({ type: "message", ctx: managed.ctx, message: msg });
+        feedTurnSignals(managed.signals, msg);
+        logSdkSignal(log, managed.ctx.label, msg);
+
         switch (msg.type) {
           case "assistant": {
             for (const block of msg.message.content) {
@@ -489,7 +705,7 @@ export class V2SessionManager implements AgentExecutor {
 
             if (msg.session_id) {
               managed.sdkSessionId = msg.session_id;
-              this.sessionStore.set(managed.sessionKey, msg.session_id);
+              this.sessionStore.set(managed.sessionKey, msg.session_id, this.accountBinding(managed));
             }
             break;
           }
@@ -507,22 +723,47 @@ export class V2SessionManager implements AgentExecutor {
 
             if (sessionId) {
               managed.sdkSessionId = sessionId;
-              this.sessionStore.set(managed.sessionKey, sessionId);
+              this.sessionStore.set(managed.sessionKey, sessionId, this.accountBinding(managed));
             }
+
+            // Classify the error text only, never the model's own words.
+            const errorText = resultMsg.subtype === "success" ? resultMsg.result : resultMsg.errors.join("\n");
+            const failure = resultMsg.is_error
+              ? classifyFailure({ text: errorText, signals: managed.signals })
+              : null;
+            const model = managed.signals.model;
+            const uuid = managed.currentUuid;
+            const result: ExecutionResult = {
+              response,
+              sessionId,
+              costUsd: resultMsg.total_cost_usd,
+              numTurns: resultMsg.num_turns,
+              isError: resultMsg.is_error,
+              ...(failure ? { failure } : {}),
+              ...(model ? { model } : {}),
+              accountId: managed.accountId,
+              ...(uuid ? { userMessageUuid: uuid } : {}),
+            };
+
+            // An aborted turn already emitted its turn_end; a late result for it is not a new turn.
+            if (!managed.aborted) this.endTurn(managed, {
+              isError: resultMsg.is_error,
+              wasAborted: false,
+              costUsd: resultMsg.total_cost_usd,
+              numTurns: resultMsg.num_turns,
+              ...(model ? { model } : {}),
+            });
 
             if (managed.pendingResult) {
-              managed.pendingResult.resolve({
-                response,
-                sessionId,
-                costUsd: resultMsg.total_cost_usd,
-                numTurns: resultMsg.num_turns,
-                isError: resultMsg.is_error,
-              });
+              managed.pendingResult.resolve(result);
               managed.pendingResult = null;
+            } else {
+              this.deliverUnsolicited(managed, result);
             }
 
-            // Clear collected text for the next message on this session
+            // Clear collected text and signals for the next message on this session
             textParts.length = 0;
+            managed.signals = newTurnSignals();
 
             // Idle time counts from the end of the turn, not from the send
             managed.lastActivity = Date.now();
@@ -542,6 +783,9 @@ export class V2SessionManager implements AgentExecutor {
       }
 
       if (managed.pendingResult) {
+        const failure = classifyFailure({ error: err, signals: managed.signals });
+        if (failure) attachFailure(err, failure);
+        this.endTurn(managed, { isError: true, wasAborted: false, costUsd: 0, numTurns: 0 });
         managed.pendingResult.reject(err);
         managed.pendingResult = null;
       }
@@ -552,6 +796,7 @@ export class V2SessionManager implements AgentExecutor {
       // result — the subprocess exited unexpectedly (startup failure, missing
       // executable, permissions). Reject so the caller doesn't hang forever.
       if (managed.pendingResult) {
+        this.endTurn(managed, { isError: true, wasAborted: false, costUsd: 0, numTurns: 0 });
         managed.pendingResult.reject(
           new Error("Session stream ended without producing a result"),
         );
@@ -567,6 +812,61 @@ export class V2SessionManager implements AgentExecutor {
         clearTimeout(managed.idleTimer);
       }
     }
+  }
+
+  /** Start a turn: reset its signals and emit turn_start. */
+  private beginTurn(managed: ManagedSession, uuid: string): void {
+    managed.currentUuid = uuid;
+    managed.signals = newTurnSignals();
+    this.config.sdkOptions?.observe({
+      type: "turn_start",
+      ctx: managed.ctx,
+      userMessageUuid: uuid,
+      ...(managed.sdkSessionId ? { sdkSessionId: managed.sdkSessionId } : {}),
+      accountId: managed.accountId,
+    });
+  }
+
+  /** The account to record on the session row: only once accounts are in play. */
+  private accountBinding(managed: ManagedSession): string | null | undefined {
+    return this.resilience ? managed.accountId : undefined;
+  }
+
+  /**
+   * Emit turn_end. A result with no turn pending (unsolicited) is reported
+   * with no userMessageUuid.
+   */
+  private endTurn(managed: ManagedSession, result: SdkTurnEndResult): void {
+    const uuid = managed.pendingResult ? managed.currentUuid : undefined;
+    this.config.sdkOptions?.observe({
+      type: "turn_end",
+      ctx: managed.ctx,
+      ...(uuid ? { userMessageUuid: uuid } : {}),
+      ...(managed.sdkSessionId ? { sdkSessionId: managed.sdkSessionId } : {}),
+      accountId: managed.accountId,
+      result,
+    });
+    if (managed.pendingResult) managed.currentUuid = undefined;
+  }
+
+  /** Hand a result that no turn was waiting for to the registered handler. */
+  private deliverUnsolicited(managed: ManagedSession, result: ExecutionResult): void {
+    if (managed.aborted) return;
+    log.info(
+      { sessionKey: managed.sessionKey, isError: result.isError, hasText: result.response.length > 0 },
+      "result arrived with no turn pending (unsolicited)",
+    );
+    if (!this.unsolicitedHandler) return;
+    try {
+      this.unsolicitedHandler(managed.sessionKey, result);
+    } catch (err) {
+      log.error({ sessionKey: managed.sessionKey, err }, "unsolicited result handler threw");
+    }
+  }
+
+  /** Set (or clear) the receiver of results that arrive with no turn pending. */
+  setUnsolicitedResultHandler(handler: UnsolicitedResultHandler | null): void {
+    this.unsolicitedHandler = handler;
   }
 
   /**
@@ -610,9 +910,13 @@ export class V2SessionManager implements AgentExecutor {
     }
 
     if (managed.pendingResult) {
+      this.endTurn(managed, { isError: false, wasAborted: true, costUsd: 0, numTurns: 0 });
       managed.pendingResult.reject(new Error("Session closed"));
       managed.pendingResult = null;
     }
+    // A closed session is done: a result still in flight is neither a new
+    // turn nor an unsolicited answer for the chat.
+    managed.aborted = true;
 
     // Ending the input stream lets the subprocess exit on its own; interrupt()
     // covers the case where it is mid-turn and would otherwise keep running.
@@ -630,16 +934,61 @@ export class V2SessionManager implements AgentExecutor {
   }
 
   /**
-   * Close all sessions that have been idle past the timeout.
+   * Close every session with no turn in flight that has been idle for longer
+   * than `olderThanMs` (default: the idle timeout). Pass 0 to close every
+   * session that is not busy, e.g. so the next turn starts with new options.
+   * Returns the number of sessions closed.
    */
-  private closeIdleSessions(): void {
+  closeIdleSessions(olderThanMs: number = this.idleTimeoutMs): number {
     const now = Date.now();
-    for (const [key, managed] of this.sessions) {
-      if (now - managed.lastActivity > this.idleTimeoutMs && !managed.pendingResult) {
-        log.info({ sessionKey: key }, "closing idle session (periodic check)");
+    let closed = 0;
+    for (const [key, managed] of [...this.sessions]) {
+      if (now - managed.lastActivity >= olderThanMs && !managed.pendingResult) {
+        log.info({ sessionKey: key }, "closing idle session");
         this.cleanupSession(key);
+        closed++;
       }
     }
+    return closed;
+  }
+
+  /**
+   * Close a session and wait until its subprocess stream has ended, so a
+   * caller can safely resume the same SDK session in a new process. After
+   * `timeoutMs` the query is force-closed. A turn still in flight is rejected.
+   */
+  async closeAndWait(sessionKey: string, timeoutMs = 10_000): Promise<void> {
+    const managed = this.sessions.get(sessionKey);
+    if (!managed) return;
+
+    const consumer = managed.streamConsumer;
+    this.cleanupSession(sessionKey);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      consumer.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), timeoutMs);
+      }),
+    ]).finally(() => clearTimeout(timer));
+
+    if (timedOut) {
+      log.warn({ sessionKey, timeoutMs }, "session did not exit in time; force-closing");
+      managed.stream.close();
+      await consumer;
+    }
+  }
+
+  /** The live Query of a session with no turn in flight, for control requests. */
+  getIdleQuery(sessionKey: string): Query | undefined {
+    const managed = this.sessions.get(sessionKey);
+    if (!managed || managed.pendingResult || managed.aborted) return undefined;
+    return managed.stream;
+  }
+
+  /** True while a turn is in flight on this session. */
+  isBusy(sessionKey: string): boolean {
+    return !!this.sessions.get(sessionKey)?.pendingResult;
   }
 
   /**

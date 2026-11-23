@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
 import { BackgroundTaskStore } from "./background-task-store.js";
 
 describe("BackgroundTaskStore", () => {
@@ -198,6 +199,65 @@ describe("BackgroundTaskStore", () => {
       expect(fetched!.status).toBe("completed");
       expect(fetched!.result).toBe("Done");
       store2.close();
+    });
+  });
+
+  describe("meta", () => {
+    it("stores meta on create and returns it parsed from every read", () => {
+      const meta = { origin: "goal", profile: "goal", data: { goalId: "g-1", round: 2 } };
+      const task = store.create("telegram:dm:1", "Goal", "work", meta);
+      expect(task.meta).toEqual(meta);
+      expect(store.get(task.id)!.meta).toEqual(meta);
+      expect(store.listByStatus("pending")[0]!.meta).toEqual(meta);
+      expect(store.list("telegram:dm:1")[0]!.meta).toEqual(meta);
+    });
+
+    it("a task without meta reads back meta null", () => {
+      const task = store.create("telegram:dm:1", "Plain", "work");
+      expect(task.meta).toBeNull();
+      expect(store.get(task.id)!.meta).toBeNull();
+    });
+
+    it("adds the meta column to a database created before it existed", () => {
+      const path = join(tempDir, "old.db");
+      const db = new Database(path);
+      db.exec(`CREATE TABLE background_tasks (
+        id TEXT PRIMARY KEY, session_key TEXT NOT NULL, description TEXT NOT NULL, prompt TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', result TEXT, error TEXT, cost_usd REAL NOT NULL DEFAULT 0,
+        num_turns INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')), sdk_session_id TEXT)`);
+      db.prepare("INSERT INTO background_tasks (id, session_key, description, prompt, status) VALUES ('old-1', 'k', 'd', 'p', 'running')").run();
+      db.close();
+
+      const migrated = new BackgroundTaskStore(path);
+      expect(migrated.get("old-1")).toMatchObject({ id: "old-1", status: "running", meta: null });
+      const fresh = migrated.create("k", "new", "p", { profile: "webhook" });
+      expect(migrated.get(fresh.id)!.meta).toEqual({ profile: "webhook" });
+      migrated.close();
+      // Opening again does not try to add the column twice.
+      new BackgroundTaskStore(path).close();
+    });
+  });
+
+  describe("markCancelled guard", () => {
+    it("cancels only pending or running tasks", () => {
+      const pending = store.create("k", "a", "p");
+      expect(store.markCancelled(pending.id)).toBe(true);
+      expect(store.get(pending.id)!.status).toBe("cancelled");
+
+      const running = store.create("k", "b", "p");
+      store.markRunning(running.id, "s");
+      expect(store.markCancelled(running.id)).toBe(true);
+
+      const completed = store.create("k", "c", "p");
+      store.markCompleted(completed.id, "done", 0.1, 2);
+      expect(store.markCancelled(completed.id)).toBe(false);
+      expect(store.get(completed.id)!.status).toBe("completed");
+
+      const failed = store.create("k", "d", "p");
+      store.markFailed(failed.id, "boom");
+      expect(store.markCancelled(failed.id)).toBe(false);
+      expect(store.get(failed.id)!.status).toBe("failed");
     });
   });
 });

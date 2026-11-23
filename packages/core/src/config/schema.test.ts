@@ -267,7 +267,7 @@ describe("KirieConfigSchema (root)", () => {
     expect(result.channels.telegram.enabled).toBe(false);
     expect(result.memory.enabled).toBe(true);
     expect(result.gateway.port).toBe(18789);
-    expect(result.plugins).toEqual([]);
+    expect(result.plugins.enabled).toBe(false);
   });
 
   it("accepts a full config matching config.example.yaml", () => {
@@ -295,14 +295,14 @@ describe("KirieConfigSchema (root)", () => {
     expect(result.security.rateLimit.perUser.maxRequests).toBe(30);
   });
 
-  it("accepts plugin entries", () => {
+  it("accepts the legacy plugin array and neutralises it to plugins off", () => {
     const result = KirieConfigSchema.parse({
       plugins: [
-        { package: "@kirie/plugin-weather", enabled: true, config: { apiKey: "abc" } },
+        { package: "@kirie/plugin-weather", enabled: true, config: { units: "metric" } },
       ],
     });
-    expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0]!.package).toBe("@kirie/plugin-weather");
+    expect(result.plugins.enabled).toBe(false);
+    expect(result.plugins.dir).toBe("~/.kirie/plugins");
   });
 });
 

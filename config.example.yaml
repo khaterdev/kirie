@@ -13,6 +13,15 @@ agent:
   # sessionMode: "v2"
   # sessionIdleTimeoutMs: 600000   # v2 only: close a session after 10 min idle
   # maxSessions: 20                # v2 only: live sessions before evicting oldest idle
+  # strictMcpConfig: false         # true: load only Kirie's MCP servers (no user-scope servers or claude.ai connectors)
+  # fallback:                      # Retry a failed turn on another model (off by default)
+  #   enabled: false
+  #   models: []                   # e.g. ["claude-sonnet-5-5", "claude-haiku-5-5"], at most 4
+  #   sdkNative: true
+  #   on: ["model_unavailable", "overloaded", "usage_limit_model"]   # failure classes that advance to the next model
+  #   cooldownMinutes: 30
+  #   maxAttemptsPerTurn: 4
+  #   notify: true
 
 security:
   owner:
@@ -31,6 +40,32 @@ security:
     perGroup:
       maxRequests: 60
       windowMs: 60000
+  # scrubbing:                    # Secret scrubbing. On by default; read once at start
+  #   enabled: true               # there is no command to turn it off at runtime
+  #   sinks:                      # where text is scrubbed before it is sent or stored
+  #     channels: true
+  #     logs: true
+  #     memory: true
+  #     chatHistory: true
+  #     taskResults: true
+  #     heartbeatLogs: true
+  #     http: true
+  #     webhookPayloads: true
+  #     pluginEvents: true
+  #     toolOutputToModel: false  # also scrub tool output before the model reads it
+  #   knownSecrets:               # exact values registered from these sources
+  #     credentialStore: true
+  #     config: true
+  #     env: true
+  #     secretsDir: true          # ~/.kirie/secrets/*.env
+  #     minLength: 12
+  #   disabledRules: []           # e.g. ["secret-assignment"]
+  #   # Patterns must be bounded: every quantifier {n} or {n,m} with m <= 256, no * or +,
+  #   # no {n,}, no quantified groups, at most one variable-length quantifier, no
+  #   # backreferences; custom patterns start with 2+ literal characters.
+  #   customPatterns: []          # e.g. [{ name: "acme", pattern: "acme_[a-z0-9]{32}" }]
+  #   allowPatterns: []
+  #   mask: "label"               # "label" or "partial"
 
 channels:
   telegram:
@@ -85,6 +120,7 @@ gateway:
   port: 18789
   bind: "loopback"                # "loopback" (localhost only) or "all" (remote access)
   # bearerToken: "$credential:gateway.bearer_token"  # Required when bind is "all"
+  # extraAllowedHosts: []         # Host headers accepted besides 127.0.0.1/localhost/[::1]:<port>
 
 browser:
   enabled: false                  # Playwright-based browser automation (auto-installs Chromium)
@@ -101,6 +137,7 @@ proactive:
   dailyDigestTime: "09:00"        # HH:MM in 24h format
   notificationCooldownMinutes: 60 # Suppress repeat notifications for same signal type
   heartbeatFile: "~/.kirie/HEARTBEAT.md"  # Checklist the triage LLM evaluates
+  # maxChecklistBytes: 8192       # Largest checklist the triage reads
   heartbeatLogging:
     enabled: true
     levels:                       # Minimum log level per tier
@@ -147,26 +184,61 @@ proactive:
 
 # logging:
 #   level: "info"                 # "debug", "info", "warn", "error"
-#   redactSensitive: "tools"      # "off", "tools", "all"
+#   redactSensitive: "tools"      # Deprecated: "off" turns off log scrubbing only (security.scrubbing.sinks.logs)
 #   telemetry:
 #     enabled: false
 #     exporter: "otlp"            # "console", "otlp", "jaeger"
 #     endpoint: "http://localhost:4318"
 
-# voice:
+# voice:                         # Phone calls (off; needs ingress.publicBaseUrl and credentials)
 #   enabled: false
-#   provider: "twilio"
-#   twilio:
+#   provider: "twilio"            # "twilio" or "plivo"; /voice provider switches at runtime
+#   twilio:                       # secrets may come from ~/.kirie/secrets/voice.env (0600) instead
 #     accountSid: "$credential:twilio.account_sid"
 #     authToken: "$credential:twilio.auth_token"
-#     fromNumber: "+1234567890"
-#   maxConcurrentCalls: 3
-#   tts:
-#     provider: "openai"          # "openai", "elevenlabs", "edge"
-#     voice: "alloy"
-#   stt:
-#     provider: "openai"          # "openai", "groq"
-#     model: "whisper-1"
+#     fromNumber: "+15550000000"
+#     voice: "Polly.Joanna-Neural"
+#     apiBaseUrl: "https://api.twilio.com"
+#   plivo:
+#     authId: "$credential:plivo.auth_id"
+#     authToken: "$credential:plivo.auth_token"
+#     fromNumber: "+15550000001"
+#     voice: "WOMAN"
+#     apiBaseUrl: "https://api.plivo.com"
+#   ownerNumbers: []              # E.164 numbers that are you
+#   contacts: {}                  # alias -> E.164 number, the outbound allowlist
+#   inbound:
+#     mode: "reject"              # "reject", "voicemail", "agent"
+#     unknownCallers: "reject"    # callers other than you: "reject" or "voicemail"
+#     requirePin: true
+#     pin: "$credential:voice.pin"
+#     maxPinAttempts: 3
+#     pinLockoutMinutes: 30
+#     greeting: "Hi, it's Kirie. Go ahead."
+#     voicemailGreeting: "This is the owner's assistant. Please leave a short message."
+#   outbound:
+#     enabled: false
+#     agentCalls: "ask"           # "off", "ask", "allow"
+#     approvalTimeoutSeconds: 120 # how long an agent call waits for your Approve
+#     ringTimeoutSeconds: 30
+#     machineDetection: false
+#     announce: "Hello. This is Kirie, an AI assistant calling on behalf of its owner."
+#   limits:
+#     maxCallSeconds: 300
+#     maxCallsPerDay: 10
+#     maxMinutesPerDay: 20
+#     maxUnverifiedCallsPerDay: 5  # voicemails and calls at the PIN prompt, counted apart
+#     maxUnverifiedMinutesPerDay: 5
+#     maxConcurrentCalls: 1
+#     maxTurnsPerCall: 30
+#     maxThinkSeconds: 60         # then the answer comes on Telegram instead
+#     maxSpeechChars: 1200
+#   speech:
+#     language: "en-US"
+#     speechTimeoutSeconds: 3
+#     hints: []                   # words the speech recogniser should expect
+#   agent:
+#     toolProfile: "chat"         # "chat" or "full"
 
 # mediaUnderstanding:
 #   audio:
@@ -181,20 +253,28 @@ proactive:
 #   port: 18793
 #   canvasDir: "~/.kirie/canvas"
 
-# sandbox:
-#   mode: "off"                   # "off", "docker"
-#   scope: "agent"                # "shared", "agent", "session"
-#   workspaceAccess: "rw"         # "rw", "none"
+# sandbox:                       # Where shell commands run (off = on the host, as today)
+#   mode: "off"                   # "off", "native", "docker"
+#   scope: "shared"               # only "shared" is implemented
+#   native:
+#     allowWrite: []
+#     allowedDomains: []          # empty = network unrestricted
+#     allowUnixSockets: []
+#     excludedCommands: []
+#     allowUnsandboxed: false
 #   docker:
 #     image: "kirie-sandbox:latest"
+#     workspaceDir: "~/.kirie/sandbox-workspace"
+#     readPaths: []               # extra host paths the host file tools may read in docker mode (not mounted into the container)
 #     readOnlyRoot: true
-#     network: "none"             # "none", "bridge", "host"
+#     network: "none"             # "none" or "bridge"
 #     capDrop: ["ALL"]
-#     memory: "512m"
-#     cpus: 1
-#   prune:
-#     idleHours: 24
-#     maxAgeDays: 7
+#     memory: "1g"
+#     cpus: 2
+#     pidsLimit: 256
+#     tmpfsSizeMb: 256
+#     execTimeoutSeconds: 120
+#     stopOnShutdown: true
 
 # tools:
 #   agentToAgent:
@@ -226,7 +306,193 @@ proactive:
 #       - scope: "peer"
 #         channel: "telegram"
 
-# plugins:
-#   - package: "./my-plugin"
-#     enabled: true
-#     config: {}
+# plugins:                       # Plugins (off). Each plugin is approved with /plugins enable
+#   enabled: false
+#   dir: "~/.kirie/plugins"
+#   allow: []                     # optional outer bound; empty = whatever you approved
+#   config: {}                    # per-plugin settings (never secrets: plugins can log them)
+#   requireHashPin: true
+#   hookTimeoutMs: 2000
+#   loadTimeoutMs: 10000
+#   maxConsecutiveFailures: 5     # then the plugin is disabled
+#   maxQueuedEventsPerPlugin: 100
+#   scrubEventPayloads: true
+
+# ── Hermes-parity features (all off unless noted; owner commands toggle them) ─
+
+# commands:                       # Slash commands
+#   unknownCommand: "agent"       # "agent" (pass unknown /name to the agent) or "reply"
+#   registerMenu: true
+#   promptTimeoutSeconds: 300
+#   maxPendingPrompts: 10
+
+# accounts:                       # Claude account rotation (/accounts, /rotation)
+#   rotation:
+#     enabled: false
+#     returnToPrimary: false
+#     maxRotationsPerTurn: 3
+#     defaultCooldownMinutes: 60
+#     notify: true
+#     carrySession: true
+#   importRoots: []
+#   verifyOnImport: true
+#   agentTools: "manage"          # "off", "read", "manage"
+
+# ingress:                        # Public listener for webhooks and voice (127.0.0.1 only)
+#   port: 18787                   # bound only while webhooks or voice are on
+#   publicBaseUrl: "https://hooks.example.com"   # your tunnel hostname
+#   trustedIpHeader: "cf-connecting-ip"
+
+# webhooks:                       # Webhook triggers (/webhook)
+#   enabled: false
+#   defaultAction: "notify"       # "notify" or "task"
+#   defaultToolProfile: "summarize"
+#   allowFullProfile: false
+#   onSuspiciousPayload: "downgrade"
+#   secretDelivery: "file"        # parsed but not read: secrets are always shown as a 0600 file ("chat" is not built)
+#   maxBodyBytes: 524288
+#   timestampToleranceSeconds: 300
+#   deliveryRetentionDays: 30
+#   rateLimit:
+#     perIpPerMinute: 60
+#     globalPerMinute: 300
+#     perHookPerMinute: 10
+#     perHookPerDay: 100
+#   maxConcurrentTasks: 2
+#   maxQueuedTasks: 20
+#   maxFieldChars: 500            # per payload field shown to the agent
+#   maxPayloadChars: 8000
+#   authFailureAlertThreshold: 20 # failed signatures before you are told
+
+# learning:                       # Self-learning proposals (/learn, /proposals)
+#   enabled: false
+#   memoryPolicy: "direct"        # "direct" (today) or "propose" (memory writes become proposals)
+#   skillWriteGuard: "enforce"    # "enforce", "audit", "off"
+#   maxPending: 20
+#   expiryDays: 14
+#   scope: "owner-dm"             # reflection reads only your DM
+#   minTurns: 8                   # unreflected turns before a reflection
+#   idleMinutes: 20
+#   complexTurnThreshold: 15
+#   maxInputChars: 60000
+#   maxReflectionsPerDay: 12
+#   maxCostUsdPerDay: 0.5
+#   maxProposalsPerDay: 6
+#   rejectMemoryDays: 30          # a rejected proposal is not filed again for this long
+#   dedupeThreshold: 0.92
+#   digestIntervalMinutes: 180
+#   memoryMdMaxBytes: 16384
+#   allowUntrustedSkillProposals: false
+#   allowRemoteEmbeddings: false
+#   # Tools that bring no outside content into a turn. Any other tool makes the
+#   # turn "mixed" (fails closed: Bash, Read, web and browser tools all count).
+#   trustedTools: ["Skill", "TodoWrite", "Write", "Edit", "MultiEdit", "NotebookEdit",
+#     "mcp__kirie-tools__learning_propose", "mcp__kirie-tools__proposals_list",
+#     "mcp__kirie-tools__memory_store", "mcp__kirie-tools__daily_note_append"]
+#   # Tools whose output always makes a turn untrusted, even when also trusted.
+#   untrustedTools: ["WebFetch", "WebSearch", "mcp__kirie-tools__web_fetch", "mcp__kirie-tools__web_search",
+#     "mcp__kirie-tools__browser", "mcp__kirie-tools__image", "mcp__playwright__*", "mcp__*"]
+
+# curator:                        # Skill cleanup (/curator)
+#   enabled: false
+#   intervalHours: 168
+#   staleAfterDays: 30
+#   archiveAfterDays: 90
+#   preferredHour: 4              # local hour for the scheduled run
+#   minIdleMinutes: 30
+#   duplicateThreshold: 0.9
+#   pruneBundled: false           # allow archiving unused bundled skills
+#   includeUserSkills: false      # report on ~/.claude/skills (never modified)
+#   llm: false                    # optional model pass for merge suggestions
+#   maxProposalsPerRun: 8
+
+# userModel:                      # Local model of you (/profile)
+#   enabled: false
+#   inject: true
+#   injectBackground: false
+#   requireApproval: false
+#   promptBudgetChars: 1500
+#   minNewMessages: 30
+#   minHoursBetweenRuns: 12
+#   batchMaxChars: 40000
+#   maxBatchesPerRun: 4
+#   maxCostUsdPerDay: 0.3
+#   memoryPrefixes: ["owner:", "person:", "rule:"]   # reserved, not read
+#   excludeCategories: ["health", "sexuality", "religion", "politics", "ethnicity", "legal_status",
+#     "finances", "government_id", "credentials", "home_address", "third_party_private"]
+#   allowRemoteEmbeddings: false
+
+# goals:                          # /goal (off; /goal on)
+#   enabled: false
+#   judgeModel: "claude-haiku-4-5" # unset = the utility model (proactive.tier2Model)
+#   workerModel: "claude-sonnet-4-5" # unset = agent.model
+#   maxRounds: 10
+#   maxMinutes: 120
+#   maxCostUsd: 10
+#   agentCreate: "ask"            # "ask", "allow", "deny"
+#   maxConcurrent: 1
+#   maxChecks: 5                  # --check commands per goal
+#   checkTimeoutSeconds: 300
+#   progressMinIntervalSeconds: 60
+#   resumeOnRestart: true
+
+# loops:                          # /loop (off; /loop on)
+#   enabled: false
+#   minIntervalSeconds: 60
+#   maxActive: 5
+#   quietSentinel: "NO_REPLY"
+#   agentCreate: "ask"
+#   maxIntervalSeconds: 86400
+#   defaultMaxRuns: 100
+#   defaultExpiryHours: 72
+#   backoffFactor: 2              # an unchanged reply multiplies the interval
+#   backoffMaxMultiplier: 8
+
+# approvals:                      # What the agent may run without asking (/approvals)
+#   enabled: true
+#   mode: "yolo"                  # "yolo" (today) or "ask"
+#   askScope: "dangerous"         # "dangerous" or "all"
+#   hardline: true                # always deny catastrophic commands; false restores today's behaviour
+#   allow: []
+#   deny: []
+#   timeoutSeconds: 300
+#   unattended: "ask"             # background, goals, payload schedules: "ask" or "deny"
+#   inlineCode: "ask"             # "ask", "heuristic", "allow"
+#   maxPending: 5
+#   redenyWindowSeconds: 600
+#   maxDenialsPerTurn: 3
+#   mcpAsk: []                    # extra tool-name globs that ask in ask mode
+#   protectedWritePaths: []       # added to the built-in lists
+#   protectedReadPaths: []
+#   disabledRules: []             # built-in dangerous rule ids, e.g. ["git.destroy"]
+
+# undo:                           # File checkpoints and /undo (see docs/undo.md)
+#   enabled: false
+#   backgroundTasks: true         # also checkpoint background tasks
+#   maxTurnsPerSession: 50
+#   retentionDays: 14
+#   confirmTimeoutSeconds: 120
+#   maxTurnsPerUndo: 5
+
+# computerUse:                    # Desktop control through cua-driver (/computer)
+#   enabled: false
+#   approval: "per-app"           # "per-app", "per-action", "armed-only"
+#   screenshots: "window"         # "off", "window", "desktop"
+#   armMinutes: 15
+#   maxArmMinutes: 60
+#   driverPath: "~/.local/bin/cua-driver"   # never searched on PATH
+#   appPath: "/Applications/CuaDriver.app"
+#   requireSignedDriver: true
+#   approvalTimeoutSeconds: 120
+#   tools:
+#     allow: []
+#     deny: []
+#   allowedApps: []               # bundle ids; empty = any app not denied
+#   deniedApps: ["com.apple.systempreferences", "com.apple.keychainaccess", "com.apple.Passwords",
+#     "com.1password.1password", "com.agilebits.onepassword7", "com.bitwarden.desktop"]
+#   observeOnlyApps: ["com.apple.Safari", "com.google.Chrome", "org.mozilla.firefox",
+#     "company.thebrowser.Browser", "com.brave.Browser", "com.microsoft.edgemac"]
+#   noTypingApps: ["com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable",
+#     "com.mitchellh.ghostty", "com.microsoft.VSCode", "com.apple.dt.Xcode"]
+#   blockedHotkeys: ["cmd+shift+q", "cmd+opt+shift+q", "ctrl+cmd+q", "cmd+shift+delete",
+#     "cmd+opt+shift+delete", "cmd+opt+esc", "cmd+opt+delete"]

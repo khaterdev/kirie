@@ -145,3 +145,28 @@ describe("createDailyNoteToolHandlers", () => {
     });
   });
 });
+
+describe("daily_note_append secret scrubbing", () => {
+  const token = (): string => ["gh", "p_", "Pl9Ok8Ij7Uh6Yg5Tf4Rd3Es2Wa1Qz0Xs9Cd8Vf7"].join("");
+
+  it("stores the note with the secret redacted and returns a notice", async () => {
+    const memoryStore = { recall: vi.fn().mockReturnValue(null), store: vi.fn() };
+    const handlers = createDailyNoteToolHandlers(memoryStore);
+    const result = await handlers.daily_note_append.handler({ content: `deploy key ${token()}`, date: "2026-11-23" });
+    const stored = memoryStore.store.mock.calls[0]![1] as string;
+    expect(stored).toContain("deploy key «redacted:github-token»");
+    expect(stored).not.toContain(token());
+    expect(result).toEqual({
+      key: "daily:2026-11-23",
+      updated: true,
+      notice: "1 secret(s) were redacted before storing. Store secrets with: kirie credentials set <key> <value>",
+    });
+  });
+
+  it("returns no notice for clean notes", async () => {
+    const memoryStore = { recall: vi.fn().mockReturnValue(null), store: vi.fn() };
+    const handlers = createDailyNoteToolHandlers(memoryStore);
+    const result = await handlers.daily_note_append.handler({ content: "Started the project", date: "2026-11-23" });
+    expect(result).toEqual({ key: "daily:2026-11-23", updated: true });
+  });
+});

@@ -1,4 +1,21 @@
 import type { ChannelRegistry } from "../../channels/registry.js";
+import { scrubSecrets } from "../../security/secret-scrubber.js";
+
+/** This tool calls bot.api directly (bypassing the adapter's outbound filter), so it scrubs itself. */
+const scrubOut = (text: string): string => scrubSecrets(text, { sink: "channel" });
+
+/** Scrub the visible `text` of inline keyboard buttons; callback data and URLs are left alone. */
+function scrubButtonRows(rows: unknown): unknown {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map((row: unknown) =>
+    Array.isArray(row)
+      ? row.map((b: unknown) =>
+          b && typeof b === "object" && typeof (b as { text?: unknown }).text === "string"
+            ? { ...(b as Record<string, unknown>), text: scrubOut((b as { text: string }).text) }
+            : b)
+      : row,
+  );
+}
 
 /**
  * Telegram-specific action tool that provides deep access to Grammy bot functionality.
@@ -119,14 +136,14 @@ export function createTelegramActionToolHandlers(channelRegistry: ChannelRegistr
                 if (!opts.reply_parameters) {
                   return { error: "replyTo is required when using quoteText" };
                 }
-                (opts.reply_parameters as Record<string, unknown>).quote = params.quoteText;
+                (opts.reply_parameters as Record<string, unknown>).quote = scrubOut(params.quoteText as string);
               }
 
               // Parse inline keyboard buttons
               if (params.buttons) {
                 try {
-                  const buttonRows = JSON.parse(params.buttons as string);
-                  opts.reply_markup = { inline_keyboard: buttonRows };
+                  const buttonRows: unknown = JSON.parse(params.buttons as string);
+                  opts.reply_markup = { inline_keyboard: scrubButtonRows(buttonRows) };
                 } catch {
                   return { error: "Invalid buttons JSON" };
                 }
@@ -136,7 +153,7 @@ export function createTelegramActionToolHandlers(channelRegistry: ChannelRegistr
 
               const sent = await bot.api.sendMessage(
                 params.chatId as string,
-                params.content as string,
+                scrubOut(params.content as string),
                 opts,
               );
               return { messageId: String(sent.message_id), timestamp: sent.date * 1000 };
@@ -150,8 +167,8 @@ export function createTelegramActionToolHandlers(channelRegistry: ChannelRegistr
 
               if (params.buttons) {
                 try {
-                  const buttonRows = JSON.parse(params.buttons as string);
-                  opts.reply_markup = { inline_keyboard: buttonRows };
+                  const buttonRows: unknown = JSON.parse(params.buttons as string);
+                  opts.reply_markup = { inline_keyboard: scrubButtonRows(buttonRows) };
                 } catch {
                   return { error: "Invalid buttons JSON" };
                 }
@@ -160,7 +177,7 @@ export function createTelegramActionToolHandlers(channelRegistry: ChannelRegistr
               await bot.api.editMessageText(
                 params.chatId as string,
                 Number(params.messageId),
-                params.content as string,
+                scrubOut(params.content as string),
                 opts,
               );
               return { success: true };
@@ -227,7 +244,7 @@ export function createTelegramActionToolHandlers(channelRegistry: ChannelRegistr
               return { error: `Unknown Telegram action: ${action}` };
           }
         } catch (err) {
-          return { error: `Telegram action failed: ${err instanceof Error ? err.message : String(err)}` };
+          return { error: scrubOut(`Telegram action failed: ${err instanceof Error ? err.message : String(err)}`) };
         }
       },
     },

@@ -15,6 +15,14 @@ export * from "./engine/v2-session-manager.js";
 export * from "./engine/workspace-manager.js";
 export * from "./engine/background-task-store.js";
 export * from "./engine/background-task-manager.js";
+// Engine seam, turn context, failure classification, no-tools runner (PLAN B.1 to B.3)
+export * from "./engine/sdk-options.js";
+export * from "./engine/turn-context.js";
+export * from "./engine/failure.js";
+export * from "./engine/reset-time.js";
+export * from "./engine/oneshot.js";
+export * from "./engine/agent-errors.js";
+export * from "./engine/prompt-addenda.js";
 // prompt-builder: ChannelContext renamed to PromptChannelContext to avoid collision with adapter.ts
 export {
   type ChannelContext as PromptChannelContext,
@@ -51,6 +59,7 @@ export * from "./config/backup.js";
 export * from "./security/gate.js";
 export * from "./routing/resolve-route.js";
 export * from "./routing/pipeline.js";
+export * from "./routing/scheduled-injection.js";
 // session-key: ChatType re-exported from normalizer already
 export {
   type SessionKeyParts,
@@ -61,14 +70,23 @@ export {
 } from "./routing/session-key.js";
 export * from "./gateway/server.js";
 export * from "./gateway/routes.js";
+export * from "./gateway/internal-api.js";
+export * from "./ingress/index.js";
 export * from "./mcp/server.js";
+export * from "./mcp/feature-tools.js";
 export { MemoryStore, type MemoryManagerLike } from "./mcp/tools/memory.js";
+export { ScheduleStore } from "./mcp/tools/schedule.js";
 export * from "./auto-reply/auto-reply.js";
 export { registerBuiltinCommands } from "./auto-reply/commands.js";
-export * from "./hooks/types.js";
-export * from "./hooks/registry.js";
-export * from "./plugins/types.js";
-export * from "./plugins/loader.js";
+// Command registry, owner identity and prompts, runtime settings, audit trail (PLAN B.4 to B.6)
+export * from "./commands/index.js";
+export * from "./commands/builtin/core.js";
+export * from "./interaction/index.js";
+export * from "./config/runtime-settings.js";
+export * from "./security/audit-trail.js";
+// Secret scrubber (PLAN B.8)
+export * from "./security/secret-scrubber.js";
+export * from "./security/secret-patterns.js";
 export * from "./engine/agent-registry.js";
 export * from "./engine/media-output-parser.js";
 export * from "./engine/a2a-policy.js";
@@ -89,10 +107,6 @@ export * from "./routing/labels.js";
 // Config doctor
 export * from "./config/doctor.js";
 
-// Sandbox
-export * from "./sandbox/types.js";
-export * from "./sandbox/docker.js";
-export * from "./sandbox/manager.js";
 
 // Memory file watcher
 export { MemoryFileWatcher, type FileWatcherOptions } from "./memory/file-watcher.js";
@@ -106,3 +120,18 @@ export { checkPlaywrightStatus, ensurePlaywrightInstalled } from "./mcp/tools/br
 export { createProactiveToolHandlers } from "./mcp/tools/proactive-tools.js";
 export { HeartbeatLogStore, createHeartbeatLogToolHandlers } from "./mcp/tools/heartbeat-logs.js";
 export type { HeartbeatLogEntry, HeartbeatLogInput, HeartbeatLogTier, HeartbeatLogLevel, HeartbeatLogMinLevels } from "./mcp/tools/heartbeat-logs.js";
+
+// Feature directories (PLAN B.10 seam 5). Each feature exports from its own
+// index.ts; nobody edits this file after W1B.
+export * from "./accounts/index.js";
+export * from "./approvals/index.js";
+export * from "./sandbox/index.js";
+export * from "./undo/index.js";
+export * from "./learning/index.js";
+export * from "./goals/index.js";
+export * from "./loops/index.js";
+export * from "./webhooks/index.js";
+export * from "./plugins/index.js";
+export * from "./hooks/index.js";
+export * from "./computer-use/index.js";
+export * from "./security/secrets-index.js";

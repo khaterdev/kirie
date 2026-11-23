@@ -1,3 +1,4 @@
+// Not used by the webhook call path (PLAN C.14).
 import type { TTSProvider, TTSOptions, Voice } from "./types.js";
 
 const OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];

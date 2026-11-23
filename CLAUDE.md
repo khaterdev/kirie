@@ -72,6 +72,12 @@ Workspace packages: `packages/*`, `apps/*`, `channels/*` (defined in `pnpm-works
 - **ChannelRegistry** — Manages adapter lifecycle (connect/disconnect/health)
 - **AgentRegistry** — Multi-agent support with per-agent skill/tool bindings
 - **HeartbeatService** — 10-second tick driving the proactive intelligence layer
+- **CommandRegistry** (`packages/core/src/commands/`) — Slash commands; dispatch checks the owner centrally (fail closed), only real channel messages can be commands (injected text never is), `/help` and the Telegram menu are generated and hide owner commands from others
+- **OwnerPrompts** (`packages/core/src/interaction/`) — The one "ask the owner" primitive: Approve/Deny or option buttons in the owner's DM via `InteractionRouter`, with codes for `/approve`, `/deny`, `/answer`
+- **SdkOptionsPipeline** (`packages/core/src/engine/sdk-options.ts`) — The single seam every `query()` call passes through: contributors adjust options, tool gates (approvals, skill-write guard, task profiles) decide each tool call, stream observers see every SDK message
+- **SecretScrubber** (`packages/core/src/security/secret-scrubber.ts`) — Redacts known secret values and patterns before text reaches channels, logs, stores, embeddings and plugins; per-sink switches under `security.scrubbing`
+- **PublicIngress** (`packages/core/src/ingress/`) — The public listener for webhooks and voice (`ingress.port`, 18787), bound only while a feature has something mounted; the control plane never serves public routes. `InternalApi` mounts loopback-only routes under the gateway's `/api/<name>`
+- **Feature modules** (`apps/daemon/src/features/`) — One `FeatureSetup` per feature, listed in `FEATURES`; each registers its commands, gates, prompt addenda and routes on a `DaemonContext` in setup and starts timers in `start`. Feature MCP tools live in `mcp/tools/<name>-tools.ts`, collected for both registries by `FEATURE_TOOL_FACTORIES`
 
 ### Proactive Intelligence Layer
 

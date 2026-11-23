@@ -3,6 +3,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { scrubSecrets } from "../../security/secret-scrubber.js";
+import { sanitizeFTS5Query } from "./memory.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "chat-history.db");
 
@@ -15,6 +17,8 @@ export interface ChatHistoryEntry {
   content: string;
   channel: string;
   created_at: string;
+  /** 1 when the user forwarded this text from someone else; null otherwise (and for rows stored before the flag existed) */
+  forwarded?: number | null;
 }
 
 interface ChatHistoryRow {
@@ -26,6 +30,7 @@ interface ChatHistoryRow {
   content: string;
   channel: string;
   created_at: string;
+  forwarded: number | null;
 }
 
 export interface EmbeddingProvider {
@@ -80,6 +85,18 @@ export class ChatHistoryStore {
       CREATE INDEX IF NOT EXISTS idx_messages_session_key ON messages(session_key, created_at);
     `);
 
+    // Additive, nullable: databases from before the forwarded flag gain the column, old rows stay null.
+    // The MCP stdio process opens the same file, so another process may add it first.
+    const hasForwarded = (): boolean =>
+      (this.db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).some((c) => c.name === "forwarded");
+    if (!hasForwarded()) {
+      try {
+        this.db.exec("ALTER TABLE messages ADD COLUMN forwarded INTEGER");
+      } catch (err) {
+        if (!hasForwarded()) throw err;
+      }
+    }
+
     // FTS virtual table for full-text search
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
@@ -123,20 +140,27 @@ export class ChatHistoryStore {
     };
   }
 
+  /**
+   * Append a message and return its row id. The content is scrubbed for secrets before it is
+   * stored (and before it is embedded); the live turn still sees the original text.
+   */
   append(
     sessionKey: string,
     role: "user" | "assistant",
-    content: string,
+    rawContent: string,
     opts?: {
       senderName?: string;
       senderId?: string;
       channel?: string;
+      /** The user forwarded this text from someone else */
+      forwarded?: boolean;
     },
-  ): void {
+  ): number {
+    const content = scrubSecrets(rawContent, { sink: "chat-history" });
     const result = this.db
       .prepare(
-        `INSERT INTO messages (session_key, role, sender_name, sender_id, content, channel)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (session_key, role, sender_name, sender_id, content, channel, forwarded)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         sessionKey,
@@ -145,13 +169,15 @@ export class ChatHistoryStore {
         opts?.senderId ?? null,
         content,
         opts?.channel ?? "unknown",
+        opts?.forwarded ? 1 : null,
       );
 
+    const msgId = Number(result.lastInsertRowid);
     // Fire-and-forget: embed the message asynchronously for semantic search
     if (this.embeddingProvider && this.embeddingProvider.model !== "noop") {
-      const msgId = Number(result.lastInsertRowid);
       void this.embedMessage(msgId, content);
     }
+    return msgId;
   }
 
   private async embedMessage(messageId: number, content: string): Promise<void> {
@@ -187,14 +213,20 @@ export class ChatHistoryStore {
     return rows.map((row) => this.rowToEntry(row));
   }
 
+  /**
+   * Full-text search. The query is treated as plain words (each token quoted), the same as
+   * memory search, so FTS5 operators in user or agent text cannot cause syntax errors.
+   */
   search(
-    query: string,
+    rawQuery: string,
     opts?: {
       sessionKey?: string;
       limit?: number;
     },
   ): ChatHistoryEntry[] {
     const limit = opts?.limit ?? 20;
+    const query = sanitizeFTS5Query(rawQuery);
+    if (!query) return [];
 
     if (opts?.sessionKey) {
       const rows = this.db
@@ -243,7 +275,7 @@ export class ChatHistoryStore {
     // Load all message vectors
     const rows = this.db.prepare(
       `SELECT mv.message_id, mv.embedding, m.session_key, m.role, m.sender_name,
-              m.sender_id, m.content, m.channel, m.created_at
+              m.sender_id, m.content, m.channel, m.created_at, m.forwarded
        FROM message_vectors mv
        JOIN messages m ON m.id = mv.message_id`
     ).all() as Array<{
@@ -256,6 +288,7 @@ export class ChatHistoryStore {
       content: string;
       channel: string;
       created_at: string;
+      forwarded: number | null;
     }>;
 
     // Score and rank
@@ -280,6 +313,7 @@ export class ChatHistoryStore {
       content: r.content,
       channel: r.channel,
       created_at: r.created_at,
+      forwarded: r.forwarded,
     }));
   }
 

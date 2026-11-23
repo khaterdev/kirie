@@ -9,7 +9,7 @@ import { MemoryStore, createMemoryToolHandlers, type MemoryManagerLike } from ".
 import { ScheduleStore, createScheduleToolHandlers } from "./tools/schedule.js";
 import { createAgentsToolHandlers } from "./tools/agents-tool.js";
 import type { AgentRegistry } from "../engine/agent-registry.js";
-export type { ScheduleFireEvent, ScheduleDeliveryMode, ScheduleEntry, WebhookEntry, WebhookFireEvent, ActiveHoursConfig } from "./tools/schedule.js";
+export type { ScheduleFireEvent, ScheduleDeliveryMode, ScheduleEntry, ActiveHoursConfig } from "./tools/schedule.js";
 export { isWithinActiveHours } from "./tools/schedule.js";
 import { createMessagingToolHandlers } from "./tools/messaging.js";
 import { ChatHistoryStore, createChatHistoryToolHandlers } from "./tools/chat-history.js";
@@ -35,12 +35,14 @@ import type { SessionStore } from "../engine/session-store.js";
 import { createBroadcastToolHandlers, createLabelToolHandlers } from "./tools/broadcast-labels.js";
 import { LabelStore } from "../routing/labels.js";
 import type { BroadcastTarget } from "../routing/broadcast.js";
-import { createVoiceCallToolHandlers, type VoiceCallToolOptions } from "./tools/voice-call.js";
 import { createNodesToolHandlers, type NodesToolOptions } from "./tools/nodes-tool.js";
 import { createProactiveToolHandlers } from "./tools/proactive-tools.js";
 import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
 import { createTTSToolHandlers } from "./tools/tts-tool.js";
 import type { ProactiveEngine } from "../engine/proactive.js";
+import { registerFeatureTools, type FeatureToolContext } from "./feature-tools.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export interface McpToolDefinition {
   description: string;
@@ -70,8 +72,6 @@ export interface McpServerOptions {
   broadcastGroups?: Record<string, { targets: BroadcastTarget[] }>;
   /** Optional label store database (shares scheduleDbPath by default) */
   labelDbPath?: string;
-  /** Optional voice call tool options */
-  voiceCallOptions?: VoiceCallToolOptions;
   /** Optional nodes tool options (gateway URL + token for companion device nodes) */
   nodesOptions?: NodesToolOptions;
   /** Optional embedding provider for chat history semantic search */
@@ -88,6 +88,8 @@ export interface McpServerOptions {
   heartbeatLogRetention?: { tier1?: number; tier2?: number; tier3?: number; heartbeat?: number };
   /** Optional pre-created HeartbeatLogStore (avoids creating a duplicate) */
   heartbeatLogStore?: HeartbeatLogStore;
+  /** Context for the feature tool factories (PLAN B.10 seam 4). Default: ~/.kirie and process.env */
+  featureTools?: FeatureToolContext;
 }
 
 /**
@@ -234,13 +236,6 @@ export function createMcpToolRegistry(options: McpServerOptions): {
     tools.set(name, def as unknown as McpToolDefinition);
   }
 
-  // Register voice call tools (optional, depends on voice config)
-  if (options.voiceCallOptions) {
-    const voiceCallHandlers = createVoiceCallToolHandlers(options.voiceCallOptions);
-    for (const [name, def] of Object.entries(voiceCallHandlers)) {
-      tools.set(name, def as unknown as McpToolDefinition);
-    }
-  }
 
   // Register nodes tool (need gateway URL for companion device nodes)
   if (options.nodesOptions) {
@@ -273,6 +268,13 @@ export function createMcpToolRegistry(options: McpServerOptions): {
   for (const [name, def] of Object.entries(ttsHandlers)) {
     tools.set(name, def as unknown as McpToolDefinition);
   }
+
+  // Feature tools (PLAN B.13). The stdio server registers the same set.
+  registerFeatureTools((handlers) => {
+    for (const [name, def] of Object.entries(handlers)) {
+      if (!tools.has(name)) tools.set(name, def);
+    }
+  }, options.featureTools ?? { dbDir: join(homedir(), ".kirie"), env: process.env });
 
   // Auto-reindex: backfill vector embeddings for any records missing them
   if (options.memoryManager) {

@@ -3,7 +3,13 @@
  * Provides a uniform contract for lifecycle management and message I/O.
  */
 
-import type { ChannelName, MessageListener, MediaType, UnifiedMedia } from "./normalizer.js";
+import type {
+  ChannelName,
+  InteractionListener,
+  MessageListener,
+  MediaType,
+  UnifiedMedia,
+} from "./normalizer.js";
 
 // ---------------------------------------------------------------------------
 // Capability flags
@@ -33,6 +39,8 @@ export interface ChannelCapabilities {
   readonly voiceMessages: boolean;
   /** Maximum text length before chunking (0 = unlimited) */
   readonly maxTextLength: number;
+  /** Can send inline buttons and report presses (sendInteractive + onInteraction) */
+  readonly interactiveButtons?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +81,63 @@ export interface ChannelContext {
 export interface SendTextParams {
   readonly ctx: ChannelContext;
   readonly text: string;
+  /** Send as plain text: no Markdown or other parse mode */
+  readonly plain?: boolean;
+  /**
+   * Ask the platform not to fetch a preview of links in the text (Telegram:
+   * `link_preview_options.is_disabled`). For untrusted or model-written text
+   * whose links must never be fetched. Adapters without previews ignore it.
+   */
+  readonly disableLinkPreview?: boolean;
+}
+
+/**
+ * One inline button. Exactly one of `data` (a callback, at most 64 bytes)
+ * or `url` (opens a link) must be set.
+ */
+export interface InlineButton {
+  readonly label: string;
+  readonly data?: string;
+  readonly url?: string;
+}
+
+/** Parameters for sending a message that carries inline buttons */
+export interface SendInteractiveParams {
+  readonly ctx: ChannelContext;
+  readonly text: string;
+  /** Rows of buttons */
+  readonly buttons: readonly (readonly InlineButton[])[];
+  /** Send as plain text: no Markdown or other parse mode */
+  readonly plain?: boolean;
+}
+
+/** Parameters for changing a message sent with sendInteractive */
+export interface UpdateInteractiveParams {
+  readonly ctx: ChannelContext;
+  readonly messageId: string;
+  /** New text. Omit to change only the buttons */
+  readonly text?: string;
+  /**
+   * New buttons. `null` removes the keyboard. When omitted together with a
+   * new `text`, the platform may drop the keyboard (Telegram does).
+   */
+  readonly buttons?: readonly (readonly InlineButton[])[] | null;
+  readonly plain?: boolean;
+}
+
+/** Parameters for acknowledging a button press */
+export interface AckInteractionParams {
+  readonly interactionId: string;
+  /** Short notice shown to the presser */
+  readonly text?: string;
+  /** Show the notice as a modal alert instead of a toast */
+  readonly alert?: boolean;
+}
+
+/** Options for registerCommands */
+export interface RegisterCommandsOptions {
+  /** Register the menu for this chat only (Telegram scope { type: "chat" }). Default: the default scope */
+  readonly chatId?: string;
 }
 
 /** Parameters for sending a typing indicator */
@@ -255,7 +320,31 @@ export interface ChannelAdapter {
 
   /**
    * Register slash commands with the platform (e.g. Telegram's setMyCommands).
-   * Called after startup with the list of available commands.
+   * Called after startup with the list of available commands. With
+   * `opts.chatId` the menu applies to that chat only.
    */
-  registerCommands?(commands: Array<{ command: string; description: string }>): Promise<void>;
+  registerCommands?(
+    commands: Array<{ command: string; description: string }>,
+    opts?: RegisterCommandsOptions,
+  ): Promise<void>;
+
+  // --- Interactive buttons (check `capabilities.interactiveButtons`) ---
+
+  /** Send a message with inline buttons. Returns the receipt of the message that carries the buttons. */
+  sendInteractive?(params: SendInteractiveParams): Promise<SentMessage>;
+
+  /** Edit the text and/or buttons of a message sent with sendInteractive. */
+  updateInteractive?(params: UpdateInteractiveParams): Promise<void>;
+
+  /**
+   * Register a listener for button presses.
+   * Multiple listeners may be registered; all will be called.
+   */
+  onInteraction?(listener: InteractionListener): void;
+
+  /** Acknowledge a button press (stops the client's spinner). Never throws. */
+  ackInteraction?(params: AckInteractionParams): Promise<void>;
+
+  /** The bot's own account on this platform, once started. */
+  getSelf?(): { id: string; username?: string } | null;
 }

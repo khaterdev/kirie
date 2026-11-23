@@ -5,6 +5,12 @@
 
 import type { ChannelAdapter } from "./adapter.js";
 import type { ChannelName } from "./normalizer.js";
+import { scrubSecrets, SCRUB_WITHHELD } from "../security/secret-scrubber.js";
+
+/** Rewrites outbound text before it reaches a platform. Must not throw (a throw withholds the text). */
+export type ChannelOutboundFilter = (text: string) => string;
+
+const defaultOutboundFilter: ChannelOutboundFilter = (text) => scrubSecrets(text, { sink: "channel" });
 
 /** Events emitted by the registry */
 export interface ChannelRegistryEvents {
@@ -18,10 +24,65 @@ export interface ChannelRegistryEvents {
 type RegistryListener<K extends keyof ChannelRegistryEvents> = ChannelRegistryEvents[K];
 
 interface ManagedChannel {
+  /** The adapter as registered. Used for lifecycle calls. */
   adapter: ChannelAdapter;
+  /** What getById/getAll hand out: outbound text passes through the filter. */
+  proxy: ChannelAdapter;
   abortController: AbortController | null;
   running: boolean;
 }
+
+/**
+ * Methods whose text arguments are filtered. Every other property is forwarded unchanged
+ * (code such as telegram-actions.ts reaches into `adapter.bot`).
+ */
+type ParamRewriter = (params: Record<string, unknown>, filter: ChannelOutboundFilter) => Record<string, unknown>;
+
+function filterText(value: unknown, filter: ChannelOutboundFilter): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return filter(value);
+  } catch {
+    return SCRUB_WITHHELD;
+  }
+}
+
+function rewriteCaption(media: unknown, filter: ChannelOutboundFilter): unknown {
+  if (!media || typeof media !== "object" || !("caption" in media)) return media;
+  return { ...(media as Record<string, unknown>), caption: filterText((media as { caption?: unknown }).caption, filter) };
+}
+
+/** Button rows: filter the visible label fields and link urls, never the callback data. */
+function rewriteButtons(rows: unknown, filter: ChannelOutboundFilter): unknown {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map((row: unknown) =>
+    Array.isArray(row)
+      ? row.map((button: unknown) => {
+          if (!button || typeof button !== "object") return button;
+          const out: Record<string, unknown> = { ...(button as Record<string, unknown>) };
+          if (typeof out.label === "string") out.label = filterText(out.label, filter);
+          if (typeof out.text === "string") out.text = filterText(out.text, filter);
+          if (typeof out.url === "string") out.url = filterText(out.url, filter);
+          return out;
+        })
+      : row,
+  );
+}
+
+const withText: ParamRewriter = (p, f) => ("text" in p ? { ...p, text: filterText(p.text, f) } : p);
+
+const OUTBOUND_REWRITERS: Readonly<Record<string, ParamRewriter>> = {
+  sendText: withText,
+  editMessage: withText,
+  sendMedia: (p, f) => ({ ...p, media: rewriteCaption(p.media, f) }),
+  sendMediaBatch: (p, f) => ({
+    ...p,
+    media: Array.isArray(p.media) ? p.media.map((m: unknown) => rewriteCaption(m, f)) : p.media,
+  }),
+  sendInteractive: (p, f) => ({ ...withText(p, f), ...("buttons" in p ? { buttons: rewriteButtons(p.buttons, f) } : {}) }),
+  updateInteractive: (p, f) => ({ ...withText(p, f), ...("buttons" in p ? { buttons: rewriteButtons(p.buttons, f) } : {}) }),
+  ackInteraction: withText,
+};
 
 /**
  * Central registry for all channel adapters.
@@ -36,6 +97,47 @@ interface ManagedChannel {
 export class ChannelRegistry {
   private readonly channels = new Map<ChannelName, ManagedChannel>();
   private readonly listeners = new Map<keyof ChannelRegistryEvents, Set<RegistryListener<keyof ChannelRegistryEvents>>>();
+  private outboundFilter: ChannelOutboundFilter = defaultOutboundFilter;
+
+  /**
+   * Replace the filter applied to outbound text (sendText, editMessage, media captions,
+   * sendInteractive and updateInteractive text and button labels, ackInteraction text). The default is the secret scrubber with sink
+   * "channel". Applies to already registered adapters too: the filter is read per call.
+   */
+  setOutboundFilter(filter: ChannelOutboundFilter): void {
+    this.outboundFilter = filter;
+  }
+
+  private createProxy(adapter: ChannelAdapter): ChannelAdapter {
+    const bound = new Map<PropertyKey, unknown>();
+    return new Proxy(adapter, {
+      get: (target, prop) => {
+        const value: unknown = Reflect.get(target, prop, target);
+        if (typeof value !== "function") return value;
+        // Proxy invariant: a frozen own property must be returned as is.
+        const own = Object.getOwnPropertyDescriptor(target, prop);
+        if (own && !own.configurable && !own.writable) return value;
+        const cached = bound.get(prop);
+        if (cached && (cached as { original?: unknown }).original === value) return cached;
+        const rewriter = typeof prop === "string" ? OUTBOUND_REWRITERS[prop] : undefined;
+        const fn = value as (...args: unknown[]) => unknown;
+        const wrapped = rewriter
+          ? (...args: unknown[]) => {
+              const [params, ...rest] = args;
+              const next = params && typeof params === "object"
+                ? rewriter(params as Record<string, unknown>, this.outboundFilter)
+                : params;
+              return fn.call(target, next, ...rest);
+            }
+          : (...args: unknown[]) => fn.apply(target, args);
+        Object.defineProperty(wrapped, "original", { value });
+        bound.set(prop, wrapped);
+        return wrapped;
+      },
+      // Writes go to the real adapter, so setters that use #private fields keep working.
+      set: (target, prop, value) => Reflect.set(target, prop, value, target),
+    });
+  }
 
   /**
    * Register a channel adapter.
@@ -47,6 +149,7 @@ export class ChannelRegistry {
     }
     this.channels.set(adapter.id, {
       adapter,
+      proxy: this.createProxy(adapter),
       abortController: null,
       running: false,
     });
@@ -163,16 +266,16 @@ export class ChannelRegistry {
     return errors;
   }
 
-  /** Get an adapter by its ID. */
+  /** Get an adapter by its ID. Outbound text sent through it passes the outbound filter. */
   getById(id: ChannelName): ChannelAdapter | undefined {
-    return this.channels.get(id)?.adapter;
+    return this.channels.get(id)?.proxy;
   }
 
-  /** Get all registered adapters. */
+  /** Get all registered adapters (filtered, as getById). */
   getAll(): ReadonlyMap<ChannelName, ChannelAdapter> {
     const result = new Map<ChannelName, ChannelAdapter>();
     for (const [id, managed] of this.channels) {
-      result.set(id, managed.adapter);
+      result.set(id, managed.proxy);
     }
     return result;
   }

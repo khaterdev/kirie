@@ -1,10 +1,10 @@
 import { EventEmitter } from "node:events";
-import pino from "pino";
 import type { SessionStore } from "./session-store.js";
 import type { ScheduleFireEvent, ScheduleStore } from "../mcp/tools/schedule.js";
 import type { ChannelRegistry } from "../channels/registry.js";
+import { createModuleLogger } from "../logging/logger.js";
 
-const log = pino({ name: "heartbeat" });
+const log = createModuleLogger("heartbeat");
 
 /**
  * Default heartbeat interval: 10 seconds.

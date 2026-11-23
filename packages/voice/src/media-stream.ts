@@ -1,3 +1,4 @@
+// Not used by the webhook call path (PLAN C.14).
 /**
  * WebSocket media stream handler for Twilio bidirectional audio.
  *

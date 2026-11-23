@@ -38,7 +38,7 @@ export function createProactiveToolHandlers(engine: ProactiveEngine | null) {
         }
 
         return {
-          enabled: true,
+          enabled: engine.isRunning,
           running: engine.isRunning,
           signalQueueSize: engine.signalQueueSize,
           lastTriageAt: engine.lastTriageTimestamp,

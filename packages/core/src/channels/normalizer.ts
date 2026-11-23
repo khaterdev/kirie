@@ -65,6 +65,12 @@ export interface UnifiedMessage {
   };
   /** Whether this message is an edit of a previously sent message */
   readonly isEdited?: boolean;
+  /**
+   * The sender forwarded this from someone else (Telegram `forward_origin`).
+   * Its text is not the sender's own words: stored with a flag and treated as
+   * untrusted by learning and the user model.
+   */
+  readonly isForwarded?: boolean;
   /** Reaction event (add or remove an emoji on a message) */
   readonly reaction?: {
     readonly emoji: string;
@@ -80,3 +86,28 @@ export interface UnifiedMessage {
  * Channel adapters emit UnifiedMessage instances to registered listeners.
  */
 export type MessageListener = (message: UnifiedMessage) => void | Promise<void>;
+
+/**
+ * A press on an inline button, normalized across channels.
+ * The press is only a request: InteractionRouter decides whether it is honoured.
+ */
+export interface UnifiedInteraction {
+  /** Platform interaction id (Telegram callback_query.id), used to acknowledge the press */
+  readonly id: string;
+  readonly channel: ChannelName;
+  readonly senderId: string;
+  readonly senderName: string;
+  /** Chat that holds the message with the buttons */
+  readonly chatId: string;
+  readonly chatType: ChatType;
+  /** The message that carries the buttons */
+  readonly messageId: string;
+  /** Callback data of the pressed button */
+  readonly data: string;
+  /** Unix timestamp in milliseconds */
+  readonly timestamp: number;
+  readonly raw: unknown;
+}
+
+/** Listener callback type for button presses. */
+export type InteractionListener = (interaction: UnifiedInteraction) => void | Promise<void>;

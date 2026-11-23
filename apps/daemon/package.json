@@ -29,8 +29,10 @@
     "@kirie/channel-slack": "workspace:*",
     "@kirie/channel-whatsapp": "workspace:*",
     "@kirie/channel-signal": "workspace:*",
+    "@kirie/channel-voice": "workspace:*",
     "@kirie/skills": "workspace:*",
     "@kirie/memory": "workspace:*",
+    "@kirie/voice": "workspace:*",
     "pino": "^9.0.0"
   },
   "devDependencies": {

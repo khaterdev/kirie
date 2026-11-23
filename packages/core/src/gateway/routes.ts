@@ -1,15 +1,15 @@
 import { Hono } from "hono";
-import pino from "pino";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelRegistry } from "../channels/registry.js";
 import type { SessionStore } from "../engine/session-store.js";
 import type { ChannelName } from "../channels/normalizer.js";
 import type { UsageDashboard } from "../logging/usage-dashboard.js";
-import type { ScheduleStore, WebhookFireEvent } from "../mcp/tools/schedule.js";
 import type { ProactiveEngine } from "../engine/proactive.js";
+import { createModuleLogger } from "../logging/logger.js";
+import { scrubSecrets } from "../security/secret-scrubber.js";
 
-const log = pino({ name: "gateway-routes" });
+const log = createModuleLogger("gateway-routes");
 
 /**
  * Dependencies injected into the gateway routes.
@@ -25,10 +25,6 @@ export interface GatewayDeps {
   onShutdown: () => void;
   /** Callback to initiate graceful restart (stop + start without process exit) */
   onRestart: () => void;
-  /** Optional callback for Twilio voice status webhook events */
-  onVoiceStatusCallback?: (callSid: string, callStatus: string) => void;
-  /** Optional function to generate TwiML for a call stream */
-  generateTwiml?: (callId: string) => string | null;
   /** SSE clients connected to the canvas events endpoint */
   canvasSseClients?: Set<{ write: (data: string) => void; close: () => void }>;
   /** Broadcast a message to all connected canvas SSE clients */
@@ -37,10 +33,6 @@ export interface GatewayDeps {
   canvasClientDir?: string;
   /** Usage dashboard for token analytics */
   usageDashboard?: UsageDashboard;
-  /** Optional schedule store for webhook lookup */
-  scheduleStore?: ScheduleStore;
-  /** Optional callback when a webhook fires */
-  onWebhookFire?: (event: WebhookFireEvent) => void;
   /** Optional ProactiveEngine for proactive status/trigger API */
   proactiveEngine?: ProactiveEngine | null;
 }
@@ -70,7 +62,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
         state: status.state,
         failureCount: status.failureCount,
         connectedAt: status.connectedAt ?? null,
-        lastError: status.lastError ?? null,
+        lastError: status.lastError != null ? scrubSecrets(status.lastError, { sink: "http" }) : null,
         running: deps.channelRegistry.isRunning(id),
       };
     }
@@ -291,108 +283,6 @@ export function createRoutes(deps: GatewayDeps): Hono {
     return c.body(csv);
   });
 
-  // ── Webhook routes ────────────────────────────────────────────────────
-
-  app.all("/webhooks/:path", async (c) => {
-    const webhookPath = c.req.param("path");
-
-    if (!deps.scheduleStore) {
-      return c.json({ status: "error", message: "Webhooks not configured" }, 503);
-    }
-
-    const webhook = deps.scheduleStore.getWebhook(webhookPath);
-    if (!webhook) {
-      return c.json({ status: "error", message: `Webhook "${webhookPath}" not found` }, 404);
-    }
-
-    // Check HTTP method
-    if (webhook.method !== "GET" && webhook.method !== "POST") {
-      // Fallback: accept any method
-    } else if (c.req.method !== webhook.method && webhook.method !== "GET") {
-      return c.json(
-        { status: "error", message: `Expected ${webhook.method} request` },
-        405,
-      );
-    }
-
-    // Parse request body for POST requests
-    let requestBody: unknown;
-    if (c.req.method === "POST") {
-      try {
-        requestBody = await c.req.json();
-      } catch {
-        requestBody = await c.req.text();
-      }
-    }
-
-    // Extract headers
-    const requestHeaders: Record<string, string> = {};
-    for (const [key, value] of c.req.raw.headers.entries()) {
-      requestHeaders[key] = value;
-    }
-
-    const event: WebhookFireEvent = {
-      name: webhook.name,
-      path: webhook.path,
-      handlerMessage: webhook.handler_message,
-      channel: webhook.channel,
-      chatId: webhook.chat_id,
-      requestBody,
-      requestHeaders,
-    };
-
-    if (deps.onWebhookFire) {
-      deps.onWebhookFire(event);
-    }
-
-    log.info({ webhook: webhook.name, path: webhookPath }, "webhook fired");
-
-    return c.json({ status: "ok", webhook: webhook.name, message: "Webhook triggered" });
-  });
-
-  // ── Voice webhook routes ──────────────────────────────────────────────
-
-  // POST /voice/twilio/webhook - handle Twilio call status callbacks
-  app.post("/voice/twilio/webhook", async (c) => {
-    try {
-      const formData = await c.req.parseBody();
-      const callSid = formData.CallSid as string | undefined;
-      const callStatus = formData.CallStatus as string | undefined;
-
-      if (!callSid || !callStatus) {
-        return c.json({ status: "error", message: "Missing CallSid or CallStatus" }, 400);
-      }
-
-      log.info({ callSid, callStatus }, "Twilio voice status callback");
-
-      if (deps.onVoiceStatusCallback) {
-        deps.onVoiceStatusCallback(callSid, callStatus);
-      }
-
-      return c.json({ status: "ok" });
-    } catch (err) {
-      log.error({ err }, "voice webhook error");
-      return c.json({ status: "error", message: "An internal error occurred" }, 500);
-    }
-  });
-
-  // POST /voice/twilio/twiml/:callId - serve TwiML for streaming
-  app.post("/voice/twilio/twiml/:callId", (c) => {
-    const callId = c.req.param("callId");
-
-    if (!deps.generateTwiml) {
-      return c.text("Voice not configured", 503);
-    }
-
-    const twiml = deps.generateTwiml(callId);
-    if (!twiml) {
-      return c.text("Call not found", 404);
-    }
-
-    c.header("Content-Type", "application/xml");
-    return c.body(twiml);
-  });
-
   // ── Proactive intelligence API (used by stdio MCP subprocess) ────────
 
   // GET /api/proactive/status - get proactive engine status
@@ -411,7 +301,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
     }
 
     return c.json({
-      enabled: true,
+      enabled: engine.isRunning,
       running: engine.isRunning,
       signalQueueSize: engine.signalQueueSize,
       lastTriageAt: engine.lastTriageTimestamp,
@@ -513,7 +403,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
       }
     } catch (err) {
       log.error({ err }, "channel action failed");
-      const message = err instanceof Error ? err.message : "An internal error occurred";
+      const message = err instanceof Error ? scrubSecrets(err.message, { sink: "http" }) : "An internal error occurred";
       return c.json({ status: "error", message }, 500);
     }
   });

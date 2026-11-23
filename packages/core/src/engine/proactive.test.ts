@@ -1269,3 +1269,180 @@ describe("TriageRunner", () => {
     expect(result.decisions).toEqual([]);
   });
 });
+
+// ============================================================================
+// 5. Owner controls used by /heartbeat (interval, snooze, status)
+// ============================================================================
+
+describe("ProactiveEngine owner controls (/heartbeat)", () => {
+  const allDay = { start: "00:00", end: "23:59", timezone: "UTC" };
+
+  /** Engine with one channel in the given state and a triage LLM that answers `action` for every signal. */
+  function setup(state: "disconnected" | "error", action: "notify-now" | "escalate") {
+    const adapter = createMockAdapter("telegram", state, 2, "Network request failed");
+    const registry = createMockRegistry(new Map([["telegram", adapter]]));
+    const createBackgroundTask = vi.fn();
+    const engine = new ProactiveEngine(createEngineDeps({
+      config: createTestConfig({ tier2IntervalMinutes: 999, activeHours: allDay }),
+      channelRegistry: registry,
+      createBackgroundTask,
+    }));
+    (mockQueryFn as Mock).mockImplementation(({ prompt }: { prompt: string }) => {
+      const signalId = /channel-health-[\w-]+/.exec(prompt)?.[0];
+      return mockQueryStream(JSON.stringify([{ action, signalId, message: "Telegram needs a look" }]))();
+    });
+    return { adapter, engine, createBackgroundTask };
+  }
+
+  async function tickAndWaitForTriage(engine: ProactiveEngine): Promise<void> {
+    const completed = vi.fn();
+    engine.on("triageCompleted", completed);
+    engine.onTick(createTickEvent({ tickNumber: 1, timestamp: Date.now() }));
+    await vi.waitFor(() => expect(completed).toHaveBeenCalled());
+  }
+
+  afterEach(() => {
+    (mockQueryFn as Mock).mockReset();
+  });
+
+  it("setTier2IntervalMinutes changes the next triage time", async () => {
+    const engine = new ProactiveEngine(createEngineDeps());
+    await engine.runTriage(); // no checklist, no signals: returns at once and stamps lastTriageAt
+    const last = engine.lastTriageTimestamp;
+    expect(last).toBeGreaterThan(0);
+    expect(engine.nextTriageAt).toBe(last + 15 * 60_000);
+    engine.setTier2IntervalMinutes(30);
+    expect(engine.tier2IntervalMinutes).toBe(30);
+    expect(engine.nextTriageAt).toBe(last + 30 * 60_000);
+    engine.setTier2IntervalMinutes(5);
+    expect(engine.nextTriageAt).toBe(last + 5 * 60_000);
+  });
+
+  it("a shorter interval makes triage due on the next tick that passes it", async () => {
+    const engine = new ProactiveEngine(createEngineDeps());
+    await engine.runTriage();
+    const last = engine.lastTriageTimestamp;
+    const spy = vi.spyOn(engine, "runTriage");
+    engine.start();
+    engine.onTick(createTickEvent({ tickNumber: 2, timestamp: last + 6 * 60_000 }));
+    expect(spy).not.toHaveBeenCalled(); // 15 m interval: not due yet
+    engine.setTier2IntervalMinutes(5);
+    engine.onTick(createTickEvent({ tickNumber: 3, timestamp: last + 6 * 60_000 }));
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a non-positive or non-finite interval", () => {
+    const engine = new ProactiveEngine(createEngineDeps());
+    expect(() => engine.setTier2IntervalMinutes(0)).toThrow(RangeError);
+    expect(() => engine.setTier2IntervalMinutes(Number.NaN)).toThrow(RangeError);
+    expect(engine.tier2IntervalMinutes).toBe(15);
+  });
+
+  it("while snoozed, a notify-now for a non-critical signal goes to the digest and nothing is sent", async () => {
+    const { adapter, engine } = setup("disconnected", "notify-now");
+    const sent = vi.fn();
+    engine.on("notificationSent", sent);
+    engine.snooze(Date.now() + 60 * 60_000);
+    engine.start();
+    await tickAndWaitForTriage(engine);
+    expect(sent).not.toHaveBeenCalled();
+    expect(adapter.sendText).not.toHaveBeenCalled();
+    expect(engine.notifications.digestQueueSize).toBe(1);
+  });
+
+  it("without a snooze the same decision is sent now", async () => {
+    const { engine } = setup("disconnected", "notify-now");
+    const sent = vi.fn();
+    engine.on("notificationSent", sent);
+    engine.start();
+    await tickAndWaitForTriage(engine);
+    expect(sent).toHaveBeenCalledOnce();
+    expect(engine.notifications.digestQueueSize).toBe(0);
+  });
+
+  it("while snoozed, a decision about a critical signal still goes out", async () => {
+    const { engine } = setup("error", "notify-now");
+    const sent = vi.fn();
+    engine.on("notificationSent", sent);
+    engine.snooze(Date.now() + 60 * 60_000);
+    engine.start();
+    await tickAndWaitForTriage(engine);
+    expect(sent).toHaveBeenCalledOnce();
+  });
+
+  it("while snoozed, a non-critical escalation is skipped", async () => {
+    const { engine, createBackgroundTask } = setup("disconnected", "escalate");
+    engine.snooze(Date.now() + 60 * 60_000);
+    engine.start();
+    await tickAndWaitForTriage(engine);
+    expect(createBackgroundTask).not.toHaveBeenCalled();
+  });
+
+  it("an escalation runs when not snoozed", async () => {
+    const { engine, createBackgroundTask } = setup("disconnected", "escalate");
+    engine.start();
+    await tickAndWaitForTriage(engine);
+    expect(createBackgroundTask).toHaveBeenCalledOnce();
+  });
+
+  it("snooze(null) and a past time end the snooze; an expired snooze reads 0", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-11-23T10:00:00Z"));
+      const engine = new ProactiveEngine(createEngineDeps());
+      const until = Date.now() + 60_000;
+      engine.snooze(until);
+      expect(engine.snoozedUntil).toBe(until);
+      expect(engine.isSnoozed()).toBe(true);
+      vi.setSystemTime(until + 1);
+      expect(engine.snoozedUntil).toBe(0);
+      expect(engine.isSnoozed()).toBe(false);
+      engine.snooze(Date.now() + 60_000);
+      engine.snooze(null);
+      expect(engine.snoozedUntil).toBe(0);
+      engine.snooze(Date.now() - 1);
+      expect(engine.snoozedUntil).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop() then start() resumes tick processing", () => {
+    const warn = createMockAdapter("telegram", "disconnected", 2);
+    const engine = new ProactiveEngine(createEngineDeps({
+      config: createTestConfig({ tier2IntervalMinutes: 999 }),
+      channelRegistry: createMockRegistry(new Map([["telegram", warn]])),
+    }));
+    vi.spyOn(engine, "runTriage").mockResolvedValue({ signalsProcessed: 0, decisions: [] });
+    const detected = vi.fn();
+    engine.on("signalDetected", detected);
+    engine.start();
+    engine.stop();
+    engine.onTick(createTickEvent({ tickNumber: 1 }));
+    expect(detected).not.toHaveBeenCalled();
+    engine.start();
+    engine.onTick(createTickEvent({ tickNumber: 2 }));
+    expect(detected).toHaveBeenCalled();
+  });
+
+  it("status() reports what proactive_status does, plus interval and snooze", async () => {
+    const engine = new ProactiveEngine(createEngineDeps());
+    expect(engine.status()).toEqual({
+      running: false,
+      signalQueueSize: 0,
+      lastTriageAt: 0,
+      nextTriageAt: 15 * 60_000,
+      digestQueueSize: 0,
+      dedupCacheSize: 0,
+      notifiedTypesCacheSize: 0,
+      tier2IntervalMinutes: 15,
+      snoozedUntil: 0,
+      triageInProgress: false,
+    });
+    engine.start();
+    const until = Date.now() + 120_000;
+    engine.snooze(until);
+    engine.setTier2IntervalMinutes(45);
+    expect(engine.status()).toMatchObject({ running: true, tier2IntervalMinutes: 45, snoozedUntil: until });
+  });
+});

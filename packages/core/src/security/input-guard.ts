@@ -34,7 +34,11 @@ export interface SuspiciousPatternMatch {
 const DEFAULT_MAX_TEXT_BYTES = 16 * 1024; // 16 KB
 const DEFAULT_MAX_MEDIA_BYTES = 20 * 1024 * 1024; // 20 MB
 
-const SUSPICIOUS_PATTERNS: Array<{ regex: RegExp; description: string }> = [
+/**
+ * Prompt-injection heuristics. Exported so other content checks (learning
+ * proposal intake) reuse the same list instead of writing their own.
+ */
+export const SUSPICIOUS_INPUT_PATTERNS: ReadonlyArray<{ readonly regex: RegExp; readonly description: string }> = [
   {
     regex: /(?:system|assistant)\s*(?:prompt|message|instruction)/i,
     description: "Attempts to reference system/assistant prompt",
@@ -139,7 +143,7 @@ export class InputGuard {
   detectSuspicious(text: string): SuspiciousPatternMatch[] {
     const matches: SuspiciousPatternMatch[] = [];
 
-    for (const { regex, description } of SUSPICIOUS_PATTERNS) {
+    for (const { regex, description } of SUSPICIOUS_INPUT_PATTERNS) {
       const match = regex.exec(text);
       if (match) {
         matches.push({
