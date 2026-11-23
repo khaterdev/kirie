@@ -29,7 +29,17 @@ export const LearningConfigSchema = z.object({
   skillWriteGuard: z.enum(["enforce", "audit", "off"]).default("enforce"),
   allowUntrustedSkillProposals: z.boolean().default(false),
   allowRemoteEmbeddings: z.boolean().default(false),
-  /** Tools whose output counts as untrusted input for the turn (content not written by the owner). */
+  /**
+   * Tools that bring no outside content into the turn. Any tool not on this
+   * list makes the turn's provenance "mixed" (fails closed: Bash, Read, web,
+   * browser and chat-history reads all count as outside content).
+   */
+  trustedTools: z.array(z.string()).default([
+    "Skill", "TodoWrite", "Write", "Edit", "MultiEdit", "NotebookEdit",
+    "mcp__kirie-tools__learning_propose", "mcp__kirie-tools__proposals_list",
+    "mcp__kirie-tools__memory_store", "mcp__kirie-tools__daily_note_append",
+  ]),
+  /** Tools whose output always counts as untrusted input for the turn, even when also listed as trusted. */
   untrustedTools: z.array(z.string()).default([
     "WebFetch", "WebSearch",
     "mcp__kirie-tools__web_fetch", "mcp__kirie-tools__web_search",

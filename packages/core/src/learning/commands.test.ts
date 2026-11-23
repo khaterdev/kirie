@@ -134,6 +134,13 @@ describe("/proposals and /learn", () => {
     expect((await run(`/proposals approve ${a},${d}`)).reply).toContain(`Applied #${d}`);
   });
 
+  it("a mixed proposal also needs show before a typed approve", async () => {
+    const id = file({ trust: "mixed" });
+    expect((await run(`/proposals approve ${id}`)).reply).toContain(`/proposals show ${id}`);
+    await run(`/proposals show ${id}`);
+    expect((await run(`/proposals approve ${id}`)).reply).toContain(`Applied #${id}`);
+  });
+
   it("an untrusted proposal needs show before a typed approve", async () => {
     const id = file({ trust: "untrusted" });
     expect((await run(`/proposals approve ${id}`)).reply).toContain(`/proposals show ${id}`);
@@ -149,6 +156,8 @@ describe("/proposals and /learn", () => {
       payload: { name: "runner", description: "Run", skillMd: skillMd("runner", "Run", "```js\neval(x)\n```\n") },
     });
     const id = (r as { id: number }).id;
+    expect((await run(`/proposals approve ${id}`)).reply).toContain(`/proposals show ${id}`);
+    await run(`/proposals show ${id}`);
     expect((await run(`/proposals approve ${id}`)).reply).toContain("force");
     expect((await run(`/proposals approve ${id} force`)).reply).toContain(`Applied #${id}`);
     expect(existsSync(join(system.skillsRoot, "runner", "SKILL.md"))).toBe(true);

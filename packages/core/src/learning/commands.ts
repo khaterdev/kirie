@@ -15,8 +15,7 @@ import type { RuntimeSettings } from "../config/runtime-settings.js";
 import { mintOwnerApproval, type ProposalApplier } from "./applier.js";
 import type { ProposalRecord, ProposalStore } from "./proposal-store.js";
 import type { ReflectionEngine } from "./reflection.js";
-import { isLowTrust } from "./proposal-types.js";
-import { proposalAllowsBulk, renderProposalDetail } from "./notifier.js";
+import { ProposalReviewLog, proposalAllowsBulk, proposalAllowsOneTap, renderProposalDetail } from "./notifier.js";
 
 export interface LearningCommandDeps {
   store: ProposalStore;
@@ -30,12 +29,12 @@ export interface LearningCommandDeps {
   /** Configured (YAML) learning.enabled */
   configEnabled: () => boolean;
   config: () => { maxPending: number; maxReflectionsPerDay: number; maxCostUsdPerDay: number; memoryPolicy: string; skillWriteGuard: string };
+  /** Shared with the Show button */
+  reviews?: ProposalReviewLog;
   now?: () => number;
 }
 
 export const LEARNING_ENABLED_SETTING = "learning.enabled";
-/** An untrusted proposal must have been shown this recently before a typed approve. */
-const SHOW_BEFORE_APPROVE_MS = 30 * 60_000;
 const MAX_IDS = 20;
 
 function actorOf(ctx: CommandContext): string {
@@ -74,7 +73,7 @@ function auditLine(r: AuditRecord): string {
 
 export function createLearningCommands(deps: LearningCommandDeps): CommandDefinition[] {
   const now = (): number => deps.now?.() ?? Date.now();
-  const shownAt = new Map<number, number>();
+  const reviews = deps.reviews ?? new ProposalReviewLog(now);
 
   const learn: CommandDefinition = {
     name: "learn",
@@ -195,7 +194,7 @@ export function createLearningCommands(deps: LearningCommandDeps): CommandDefini
           if (!ids || ids.length !== 1) return "Usage: /proposals show <id>";
           const rec = deps.store.get(ids[0]!);
           if (!rec) return `Proposal #${ids[0]} not found.`;
-          shownAt.set(rec.id, now());
+          reviews.markShown(rec);
           return renderProposalDetail(rec, deps.applier.preview(rec));
         }
         case "approve": {
@@ -214,11 +213,8 @@ export function createLearningCommands(deps: LearningCommandDeps): CommandDefini
           } else {
             const rec = deps.store.get(ids[0]!);
             if (!rec) return `Proposal #${ids[0]} not found.`;
-            if (isLowTrust(rec.trust)) {
-              const shown = shownAt.get(rec.id);
-              if (shown === undefined || now() - shown > SHOW_BEFORE_APPROVE_MS) {
-                return `Proposal #${rec.id} comes from content not written by you. Read it first with /proposals show ${rec.id}, then approve it.`;
-              }
+            if (!proposalAllowsOneTap(rec) && !reviews.wasShown(rec)) {
+              return `Proposal #${rec.id} is not from your own messages alone, or is flagged. Read it first with /proposals show ${rec.id}, then approve it.`;
             }
           }
           const lines: string[] = [];

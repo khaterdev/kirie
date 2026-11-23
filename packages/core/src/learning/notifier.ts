@@ -22,7 +22,7 @@ import { mintOwnerApproval, type ProposalApplier } from "./applier.js";
 import type { LearningAuditSink } from "./intake.js";
 import type { LearningKv } from "./learning-db.js";
 import type { ProposalRecord, ProposalStore } from "./proposal-store.js";
-import { isLowTrust, payloadHash8, type ProposalOrigin } from "./proposal-types.js";
+import { payloadHash8, type ProposalOrigin } from "./proposal-types.js";
 
 const log = createModuleLogger("learning-notifier");
 
@@ -38,14 +38,52 @@ const LAST_DIGEST_KEY = "notify:last_digest_at";
 // Policy
 // ---------------------------------------------------------------------------
 
-/** One-tap Approve: owner or mixed trust, no scanner block, still pending. */
+/** Flags that rule out one-tap approval. */
+const ONE_TAP_BLOCKING_FLAGS = new Set(["scanner_block", "injection_pattern", "untrusted_source"]);
+
+/**
+ * One-tap Approve (and typed approve without a prior show): owner trust and no
+ * blocking flag. `mixed`, `untrusted` and `unverified` need /proposals show,
+ * then a typed /proposals approve.
+ */
 export function proposalAllowsOneTap(rec: Pick<ProposalRecord, "trust" | "riskFlags">): boolean {
-  return (rec.trust === "owner" || rec.trust === "mixed") && !rec.riskFlags.includes("scanner_block");
+  return rec.trust === "owner" && !rec.riskFlags.some((f) => ONE_TAP_BLOCKING_FLAGS.has(f));
 }
 
 /** Bulk approve: owner trust and no risk flags at all. */
 export function proposalAllowsBulk(rec: Pick<ProposalRecord, "trust" | "riskFlags">): boolean {
   return rec.trust === "owner" && rec.riskFlags.length === 0;
+}
+
+/** How long a show counts for a later typed approve. */
+export const SHOW_BEFORE_APPROVE_MS = 30 * 60_000;
+
+/**
+ * Which proposals the owner has looked at in full (/proposals show or the Show
+ * button), keyed by id and payload hash, so a typed approve applies exactly
+ * the content that was shown. In memory: a restart needs a new show.
+ */
+export class ProposalReviewLog {
+  private readonly shown = new Map<string, number>();
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  private static key(rec: Pick<ProposalRecord, "id" | "payloadHash">): string {
+    return `${rec.id}:${rec.payloadHash}`;
+  }
+
+  markShown(rec: Pick<ProposalRecord, "id" | "payloadHash">): void {
+    this.shown.set(ProposalReviewLog.key(rec), this.now());
+    if (this.shown.size > 500) {
+      const first = this.shown.keys().next().value;
+      if (first !== undefined) this.shown.delete(first);
+    }
+  }
+
+  wasShown(rec: Pick<ProposalRecord, "id" | "payloadHash">): boolean {
+    const at = this.shown.get(ProposalReviewLog.key(rec));
+    return at !== undefined && this.now() - at <= SHOW_BEFORE_APPROVE_MS;
+  }
 }
 
 function truncate(text: string, max: number): string {
@@ -54,14 +92,14 @@ function truncate(text: string, max: number): string {
 
 function trustLine(rec: ProposalRecord): string {
   if (rec.trust === "owner") return "Trust: owner (from your own messages)";
-  if (rec.trust === "mixed") return "Trust: mixed. Warning: the turn also read content not written by you (web, files, tools). Check it before approving.";
+  if (rec.trust === "mixed") return "Trust: mixed. Warning: the turn also read content not written by you (web, files, shell, tools). Read it in full before approving.";
   return `Trust: ${rec.trust}. Derived from content not written by you; it cannot be approved with one tap.`;
 }
 
 function hintLine(rec: ProposalRecord): string {
   return proposalAllowsOneTap(rec)
     ? `Reply /proposals approve ${rec.id} or /proposals reject ${rec.id}.`
-    : `Review with /proposals show ${rec.id}, then /proposals approve ${rec.id}${rec.riskFlags.includes("scanner_block") ? " force" : ""} or /proposals reject ${rec.id}.`;
+    : `Review with Show or /proposals show ${rec.id}, then /proposals approve ${rec.id}${rec.riskFlags.includes("scanner_block") ? " force" : ""}, or /proposals reject ${rec.id}.`;
 }
 
 export function renderProposalCardText(rec: ProposalRecord, preview: string): string {
@@ -197,6 +235,7 @@ const ACTION_RE = /^([ars]):(\d{1,12}):([0-9a-f]{8})$/;
 export interface ProposalActionDeps {
   store: ProposalStore;
   applier: ProposalApplier;
+  reviews: ProposalReviewLog;
   owners: { isOwner(channel: ChannelName, senderId: string): boolean };
   audit?: LearningAuditSink;
   now?: () => Date;
@@ -226,6 +265,7 @@ export function createProposalActionHandler(deps: ProposalActionDeps): OwnerActi
     const now = deps.now?.() ?? new Date();
 
     if (op === "s") {
+      deps.reviews.markShown(rec);
       return { replaceText: renderProposalDetail(rec, deps.applier.preview(rec)) };
     }
     if (op === "r") {
@@ -234,7 +274,7 @@ export function createProposalActionHandler(deps: ProposalActionDeps): OwnerActi
         ? { replaceText: `Proposal #${id} · ${rec.title}\nRejected ${hhmm(now)}`, removeButtons: true, toast: "Rejected" }
         : { toast: `Proposal #${id} is already ${rec.status}.`, removeButtons: true };
     }
-    if (isLowTrust(rec.trust) || !proposalAllowsOneTap(rec)) {
+    if (!proposalAllowsOneTap(rec)) {
       return { toast: `Proposal #${id} needs /proposals show ${id}, then /proposals approve ${id}.`, alert: true };
     }
     const outcome = await deps.applier.approve(id, approval);

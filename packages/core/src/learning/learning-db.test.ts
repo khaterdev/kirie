@@ -52,13 +52,20 @@ describe("learning.db", () => {
     expect(store.insert(newProposal("a".repeat(64)))).not.toBeNull();
   });
 
-  it("recoverInterrupted turns a row stuck in applying into failed", () => {
+  it("recoverInterrupted: applying becomes failed, undoing becomes applied", () => {
     env = tempLearningEnv();
     const store = new ProposalStore(env.db);
     const id = store.insert(newProposal("b".repeat(64)))!;
     expect(store.claimForApply(id, { by: "telegram:1", via: "command", at: new Date().toISOString() })).toBe(true);
-    expect(store.recoverInterrupted()).toEqual([id]);
+    const undoing = store.insert(newProposal("c".repeat(64)))!;
+    store.claimForApply(undoing, { by: "telegram:1", via: "command", at: new Date().toISOString() });
+    store.markApplied(undoing, { backupDir: "/x" }, new Date().toISOString());
+    expect(store.claimForUndo(undoing)).toBe(true);
+    expect(store.get(undoing)!.status).toBe("undoing");
+    expect(store.recoverInterrupted()).toEqual({ failed: [id], reapplied: [undoing] });
     expect(store.get(id)).toMatchObject({ status: "failed", error: expect.stringContaining("interrupted") });
+    // An interrupted undo goes back to applied, never to an approvable status.
+    expect(store.get(undoing)!.status).toBe("applied");
   });
 
   it("user_facts_fts follows inserts and deletes through triggers", () => {

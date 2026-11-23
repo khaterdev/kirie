@@ -308,8 +308,9 @@ export class ReflectionEngine {
       if (t.userMsgId !== null) byUser.set(t.userMsgId, t);
       if (t.assistantMsgId !== null) byAssistant.set(t.assistantMsgId, t);
     }
-    // A user message with no turn row (history from before tracking) counts as unknown provenance.
-    const unknown = kept.some((m) => m.role === "user" && !byUser.has(m.id));
+    // A message with no turn row (history from before tracking, or a background or scheduled
+    // result posted into the chat) is of unknown provenance.
+    const unknown = kept.some((m) => (m.role === "user" ? !byUser.has(m.id) : !byAssistant.has(m.id)));
     const trust = unknown ? "untrusted" : trustOfWindow(turns);
 
     const lines = kept.map((m) => {

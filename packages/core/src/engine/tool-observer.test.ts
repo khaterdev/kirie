@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { isUntrustedTool, newToolUseSummary, observeSdkMessage, skillNameForPath, usedUntrustedTool } from "./tool-observer.js";
+import { LEARNING_PROPOSE_TOOL, isUntrustedTool, newToolUseSummary, observeSdkMessage, skillNameForPath, usedUntrustedTool } from "./tool-observer.js";
 
 const ROOT = "/data/kirie/.claude/skills";
 
@@ -62,10 +62,36 @@ describe("tool observer", () => {
     expect(isUntrustedTool("mcp__kirie-tools__web_fetch", patterns)).toBe(true);
     expect(isUntrustedTool("mcp__kirie-tools__memory_search", patterns)).toBe(false);
     expect(isUntrustedTool("Bash", patterns)).toBe(false);
+  });
+
+  it("usedUntrustedTool fails closed: only listed trusted tools keep a turn clean", () => {
+    const trusted = ["Skill", "Write", "mcp__kirie-tools__memory_store"];
     const acc = newToolUseSummary();
-    acc.tools = { Bash: 1, "mcp__kirie-tools__memory_store": 1 };
-    expect(usedUntrustedTool(acc, patterns)).toBe(false);
-    acc.tools.WebFetch = 1;
-    expect(usedUntrustedTool(acc, patterns)).toBe(true);
+    acc.tools = { Skill: 1, "mcp__kirie-tools__memory_store": 1 };
+    expect(usedUntrustedTool(acc, ["WebFetch"], trusted)).toBe(false);
+    acc.tools.Bash = 1;
+    expect(usedUntrustedTool(acc, ["WebFetch"], trusted)).toBe(true);
+    expect(usedUntrustedTool({ ...newToolUseSummary(), tools: { Skill: 1 } }, ["Skill"], trusted)).toBe(true);
+    expect(usedUntrustedTool({ ...newToolUseSummary(), tools: { Skill: 1 } }, [], [])).toBe(true);
+    expect(usedUntrustedTool({ ...newToolUseSummary(), overflow: true }, [], trusted)).toBe(true);
+  });
+
+  it("more than 200 distinct tools sets overflow", () => {
+    const acc = newToolUseSummary();
+    observeSdkMessage(assistant(Array.from({ length: 205 }, (_, i) => ({ type: "tool_use", name: `t${i}` }))), acc, [ROOT]);
+    expect(acc.overflow).toBe(true);
+  });
+
+  it("collects proposal ids only from learning_propose results in its own stream", () => {
+    const acc = newToolUseSummary();
+    observeSdkMessage(assistant([{ type: "tool_use", id: "tu-1", name: LEARNING_PROPOSE_TOOL, input: { sessionKey: "telegram:dm:1" } }]), acc, [ROOT]);
+    const result = (id: string, text: string): SDKMessage =>
+      ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] }] } } as unknown as SDKMessage);
+    observeSdkMessage(result("tu-other", JSON.stringify({ id: 99, status: "pending" })), acc, [ROOT]);
+    observeSdkMessage(result("tu-1", JSON.stringify({ id: 7, status: "pending" }, null, 2)), acc, [ROOT]);
+    expect(acc.proposalIds).toEqual([7]);
+    observeSdkMessage(assistant([{ type: "tool_use", id: "tu-2", name: LEARNING_PROPOSE_TOOL, input: {} }]), acc, [ROOT]);
+    observeSdkMessage(result("tu-2", JSON.stringify({ status: "dropped", reason: "daily_cap" })), acc, [ROOT]);
+    expect(acc.proposalIds).toEqual([7]);
   });
 });

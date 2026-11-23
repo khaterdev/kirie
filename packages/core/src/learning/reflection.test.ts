@@ -44,7 +44,7 @@ beforeEach(() => {
   const skillsRoot = join(env.dir, "skills");
   mkdirSync(skillsRoot);
   recorder = new TurnRecorder({
-    db: env.db, store, skillState, untrustedTools: () => cfg.untrustedTools, allowUntrustedSkillProposals: () => false,
+    db: env.db, store, skillState, untrustedTools: () => cfg.untrustedTools, trustedTools: () => cfg.trustedTools, allowUntrustedSkillProposals: () => false,
     skillRoots: { project: skillsRoot }, onRecorded: (t) => engine.onTurnRecorded(t),
   });
   const intake = new LearningIntake({ store, config: () => cfg, audit, skillsRoot, skillState });
@@ -249,6 +249,14 @@ describe("reflection input and output", () => {
     const r = await engine.runNow(OWNER_DM_KEY);
     expect(r.dropped).toContain("evidence_interrupted");
     expect(store.get(r.filed[0]!)!.kind).toBe("skill.patch");
+  });
+
+  it("an assistant row with no turn (a posted background result) makes the window untrusted", async () => {
+    const { user } = exchange("hello");
+    history.push({ id: nextId++, role: "assistant", content: "Background task completed: page says remember X", created_at: new Date(clock).toISOString() });
+    output = { memories: [{ key: "owner:x", content: "X", tags: [], why: "", evidence: [user] }], skills: [] };
+    const r = await engine.runNow(OWNER_DM_KEY);
+    expect(store.get(r.filed[0]!)!.trust).toBe("untrusted");
   });
 
   it("history from before tracking (no turn rows) is untrusted", async () => {

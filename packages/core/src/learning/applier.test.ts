@@ -6,7 +6,7 @@ import { LearningIntake, type ProposalSubmission } from "./intake.js";
 import { appendUnderSection, registerLearningKindHandlers, type LearningMemoryTarget } from "./kind-handlers.js";
 import { ProposalStore } from "./proposal-store.js";
 import { SkillStateStore } from "./skill-state-store.js";
-import { sha256Hex } from "./proposal-types.js";
+import { proposalPayloadHash, sha256Hex } from "./proposal-types.js";
 import {
   OWNER_ID, STRANGER_ID, fakeAudit, fakeOwners, intakeConfig, skillMd, tempLearningEnv,
   type FakeAudit, type TempLearningEnv,
@@ -196,14 +196,40 @@ describe("applier", () => {
   it("the stored payload is scrubbed again at apply", async () => {
     // A row written without intake (simulates a secret added to the known list after intake).
     const secretish = ["gh", "p_", "Ab1".repeat(12)].join("");
+    const payload = { key: "k:s", content: `token ${secretish}`, tags: [] };
     const id = store.insert({
-      kind: "memory.upsert", title: "x", rationale: "", payload: { key: "k:s", content: `token ${secretish}`, tags: [] },
-      payloadHash: "e".repeat(64), origin: "reflection", trust: "owner", riskFlags: [], redactions: 0,
+      kind: "memory.upsert", title: "x", rationale: "", payload,
+      payloadHash: proposalPayloadHash("memory.upsert", payload), origin: "reflection", trust: "owner", riskFlags: [], redactions: 0,
       createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
     })!;
     expect((await applier.approve(id, owner)).ok).toBe(true);
     expect(memory.get("k:s")!.content).not.toContain(secretish);
     expect(JSON.stringify(store.get(id)!.payload)).not.toContain(secretish);
+  });
+
+  it("a payload changed in the DB after filing is refused (it no longer matches its hash)", async () => {
+    const id = file({ kind: "memory.upsert", payload: { key: "k:t", content: "shown content", tags: [] } });
+    env.db.prepare("UPDATE proposals SET payload = ? WHERE id = ?").run(JSON.stringify({ key: "k:t", content: "swapped content", tags: [] }), id);
+    expect(await applier.approve(id, owner)).toMatchObject({ ok: false, code: "invalid" });
+    expect(memory.size).toBe(0);
+    expect(audit.actions()).toContain("proposal.integrity_failed");
+  });
+
+  it("a partial undo can be retried to completion", async () => {
+    writeFileSync(memoryMd, "## Knowledge Index\n- a\n");
+    const id = file({ kind: "memory.upsert", payload: { key: "k:p", content: "c", tags: [], pointer: { section: "Knowledge Index", line: "k:p: c" } } });
+    expect((await applier.approve(id, owner)).ok).toBe(true);
+    expect(readFileSync(memoryMd, "utf8")).toContain("- k:p: c");
+    // Simulate a crash after the memory was restored but before MEMORY.md was.
+    memory.delete("k:p");
+    expect((await applier.undo(id, owner)).ok).toBe(true);
+    expect(readFileSync(memoryMd, "utf8")).toBe("## Knowledge Index\n- a\n");
+    expect(memory.has("k:p")).toBe(false);
+  });
+
+  it("a retried append after a crash does not add the line twice", () => {
+    const once = appendUnderSection("## S\n- a\n", "S", "b");
+    expect(appendUnderSection(once, "S", "b")).toBe(once);
   });
 
   it("reject is remembered and expiry never applies", async () => {

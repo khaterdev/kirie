@@ -160,6 +160,10 @@ export class ProposalApplier {
     }
     const handler = this.kinds.get(rec.kind);
     if (!handler) return { ok: false, id, code: "no_handler", message: `No handler is registered for ${rec.kind}.` };
+    // The stored payload must still be the content its hash (and so its card and show) was made from.
+    if (proposalPayloadHash(rec.kind, rec.payload) !== rec.payloadHash) {
+      return this.refuse(id, "invalid", `Proposal #${id} was changed after it was filed; it cannot be applied.`, actor, "proposal.integrity_failed");
+    }
 
     const at = this.now();
     if (!this.deps.store.claimForApply(id, { by: `${approval.channel}:${approval.senderId}`, via: approval.via, at: at.toISOString() })) {

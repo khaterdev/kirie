@@ -144,6 +144,8 @@ export interface TurnRecorderDeps {
   store: ProposalStore;
   skillState: SkillStateStore;
   untrustedTools: () => readonly string[];
+  /** Tools that bring no outside content; any other tool makes the turn mixed. Default: none (fails closed). */
+  trustedTools?: () => readonly string[];
   allowUntrustedSkillProposals: () => boolean;
   /** Project skills root, then the user root (`~/.claude/skills`). Used to place a first-seen skill. */
   skillRoots: { project: string; user?: string };
@@ -166,7 +168,7 @@ export class TurnRecorder {
   record(input: TurnRecordInput): TurnLogRecord {
     const startedIso = new Date(input.startedAt).toISOString();
     const endedIso = new Date(input.endedAt).toISOString();
-    const untrusted = usedUntrustedTool(input.toolUse, this.deps.untrustedTools());
+    const untrusted = usedUntrustedTool(input.toolUse, this.deps.untrustedTools(), this.deps.trustedTools?.() ?? []);
     const tx = this.deps.db.transaction(() => {
       const res = this.deps.db
         .prepare(
@@ -196,7 +198,7 @@ export class TurnRecorder {
     });
     const id = tx();
     const turn = this.get(id)!;
-    this.finalizeTrust(turn);
+    this.finalizeTrust(turn, input.toolUse.proposalIds);
     if (this.deps.onRecorded) {
       try {
         this.deps.onRecorded(turn);
@@ -207,17 +209,18 @@ export class TurnRecorder {
     return turn;
   }
 
-  private finalizeTrust(turn: TurnLogRecord): void {
+  /**
+   * Agent-filed proposals take the trust of the turn whose own stream filed
+   * them (ids from the learning_propose results). A background, goal or
+   * webhook turn is always untrusted. Proposals no turn claims stay unverified.
+   */
+  private finalizeTrust(turn: TurnLogRecord, proposalIds: readonly number[]): void {
     const at = new Date().toISOString();
-    const changed = turn.source === "main"
-      ? this.deps.store.finalizeUnverified(turn.sessionKey, turn.startedAt, turn.endedAt, trustOfTurn(turn), turn.id)
-      : [
-          ...this.deps.store.finalizeUnverified(turn.sessionKey, turn.startedAt, turn.endedAt, "untrusted", turn.id),
-          ...this.deps.store.downgradeAgentToolInWindow(turn.sessionKey, turn.startedAt, turn.endedAt),
-        ];
+    const trust: ProposalTrust = turn.source === "main" ? trustOfTurn(turn) : "untrusted";
+    const changed = this.deps.store.finalizeByIds(proposalIds, trust, turn.id);
     if (changed.length === 0) return;
     const allowUntrusted = this.deps.allowUntrustedSkillProposals();
-    for (const id of new Set(changed)) {
+    for (const id of changed) {
       const rec = this.deps.store.get(id);
       if (!rec) continue;
       this.deps.audit?.record({ feature: "learning", action: "proposal.trust_finalized", actor: "system", detail: { id, trust: rec.trust, turnId: turn.id } });

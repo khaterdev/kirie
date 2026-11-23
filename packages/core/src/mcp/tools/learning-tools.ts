@@ -122,7 +122,7 @@ export const createLearningTools: FeatureToolFactory = (ctx) => {
           title: { type: "string", description: "One line, at most 120 characters" },
           rationale: { type: "string", description: "Why this is worth keeping" },
           payload: { type: "string", description: "JSON string, shape depends on kind (see the tool description)" },
-          sessionKey: { type: "string", description: "Your session_key from the <session_context> tag" },
+          sessionKey: { type: "string", description: "Your session_key from the <session_context> tag (for display; trust is decided by code from the turn that files the proposal)" },
         },
         required: ["kind", "title", "payload", "sessionKey"],
       },

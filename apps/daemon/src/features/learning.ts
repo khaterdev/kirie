@@ -100,6 +100,7 @@ export const setupLearning: FeatureSetup = (ctx) => {
     dataDir: ctx.dataDir,
     agentCwd: ctx.agentCwd,
     userSkillsRoot: join(homedir(), ".claude", "skills"),
+    homeDir: homedir(),
     config: () => cfg,
     enabled,
     configEnabled: () => cfg.enabled,

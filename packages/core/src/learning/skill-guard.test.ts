@@ -1,16 +1,17 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { HookInput, Options } from "@anthropic-ai/claude-agent-sdk";
 import { SdkOptionsPipeline, type SdkCallContext, type SdkCallKind, type ToolGateCall } from "../engine/sdk-options.js";
 import { TurnContextRegistry, type TurnOrigin } from "../engine/turn-context.js";
-import { SKILL_WRITE_GUARD_REASON, createSkillWriteGuard, protectedTargetOf, type SkillWriteGuardMode } from "./skill-guard.js";
+import { SKILL_WRITE_GUARD_REASON, createSkillWriteGuard, protectedTargetOf, skillGuardProtectedPaths, type SkillWriteGuardMode } from "./skill-guard.js";
 import { OWNER_DM_KEY, fakeAudit, type FakeAudit } from "./learning.test-util.js";
 
 let dir: string;
 let dataDir: string;
 let skillsRoot: string;
+let home: string;
 let turns: TurnContextRegistry;
 let audit: FakeAudit;
 let mode: SkillWriteGuardMode;
@@ -20,6 +21,8 @@ beforeEach(() => {
   dataDir = join(dir, "kirie");
   skillsRoot = join(dataDir, ".claude", "skills");
   mkdirSync(join(skillsRoot, "tmux"), { recursive: true });
+  home = join(dir, "home");
+  mkdirSync(join(home, ".claude", "skills"), { recursive: true });
   turns = new TurnContextRegistry();
   audit = fakeAudit();
   mode = "enforce";
@@ -27,7 +30,7 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 function guard() {
-  return createSkillWriteGuard({ skillsRoot, dataDir, turns, mode: () => mode, audit });
+  return createSkillWriteGuard({ skillsRoot, userSkillsRoot: join(home, ".claude", "skills"), dataDir, agentCwd: dataDir, homeDir: home, turns, mode: () => mode, audit });
 }
 
 function ctx(kind: SdkCallKind = "chat"): SdkCallContext {
@@ -84,7 +87,36 @@ describe("skill write guard", () => {
     const link = join(dir, "sneaky");
     symlinkSync(skillsRoot, link);
     expect((await guard().check(call("Write", join(link, "tmux", "SKILL.md")))).decision).toBe("deny");
-    expect(protectedTargetOf(join(link, "x", "SKILL.md"), dataDir, skillsRoot, dataDir)).toMatchObject({ kind: "skill" });
+    const paths = skillGuardProtectedPaths({ skillsRoot, dataDir });
+    expect(protectedTargetOf(join(link, "x", "SKILL.md"), dataDir, paths)).toMatchObject({ kind: "skill" });
+  });
+
+  it("a skill dir or SOUL.md that is itself a symlink out of the tree is still protected, by either path", async () => {
+    withOrigin("webhook");
+    const dev = join(dir, "dev");
+    mkdirSync(join(dev, "foo"), { recursive: true });
+    symlinkSync(join(dev, "foo"), join(skillsRoot, "foo"));
+    expect((await guard().check(call("Write", join(skillsRoot, "foo", "SKILL.md")))).decision).toBe("deny");
+    expect((await guard().check(call("Edit", join(dev, "foo", "SKILL.md")))).decision).toBe("deny");
+    const dotfiles = join(dir, "dotfiles");
+    mkdirSync(dotfiles);
+    writeFileSync(join(dotfiles, "SOUL.md"), "soul");
+    symlinkSync(join(dotfiles, "SOUL.md"), join(dataDir, "SOUL.md"));
+    expect((await guard().check(call("Write", join(dataDir, "SOUL.md")))).decision).toBe("deny");
+    expect((await guard().check(call("Write", join(dotfiles, "SOUL.md")))).decision).toBe("deny");
+  });
+
+  it("protects the user skills root, config.yaml and the Claude settings files", async () => {
+    withOrigin("schedule");
+    for (const p of [
+      join(home, ".claude", "skills", "x", "SKILL.md"),
+      join(dataDir, "config.yaml"),
+      join(dataDir, ".claude", "settings.json"),
+      join(home, ".claude", "settings.local.json"),
+    ]) {
+      expect((await guard().check(call("Write", p))).decision, p).toBe("deny");
+    }
+    expect((await guard().check(call("Write", join(home, "notes.txt")))).decision).toBe("pass");
   });
 
   it("audit mode never denies; off does nothing", async () => {

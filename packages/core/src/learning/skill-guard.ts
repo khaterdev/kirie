@@ -1,8 +1,9 @@
 /**
  * Skill write guard: `ToolGate` "skill-write-guard", order 100 (PLAN B.1, C.3, DECISIONS 18).
  *
- * File-tool writes to a skill under `<agentCwd>/.claude/skills`, or to
- * `<dataDir>/SOUL.md`, `TOOLS.md`, `USER.md`, are allowed only in a turn the
+ * File-tool writes to a skill under `<agentCwd>/.claude/skills` or
+ * `~/.claude/skills`, or to `<dataDir>/SOUL.md`, `TOOLS.md`, `USER.md`,
+ * `config.yaml`, or a `.claude/settings*.json` of the agent cwd or home, are allowed only in a turn the
  * owner authored (`originOf(ctx) === "owner_message"`). Scheduled, loop,
  * webhook, goal, background and other users' turns must file a proposal.
  *
@@ -13,8 +14,8 @@
  * the approval gate's job; the curator's drift detection reports what slips by.
  */
 
-import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ToolGate, ToolGateCall, ToolGateVerdict } from "../engine/sdk-options.js";
 import { originOf, type TurnContextRegistry } from "../engine/turn-context.js";
 import type { LearningAuditSink } from "./intake.js";
@@ -30,14 +31,53 @@ export type SkillWriteGuardMode = "enforce" | "audit" | "off";
 export interface SkillWriteGuardDeps {
   /** `<agentCwd>/.claude/skills` */
   skillsRoot: string;
+  /** `~/.claude/skills`: the SDK loads it too (settingSources "user") */
+  userSkillsRoot?: string;
   /** `~/.kirie` */
   dataDir: string;
+  /** config.agent.workspace || dataDir: its `.claude/settings*.json` are protected */
+  agentCwd?: string;
+  /** Home directory: `~/.claude/settings*.json` are protected */
+  homeDir?: string;
   turns: TurnContextRegistry;
   mode: () => SkillWriteGuardMode;
   audit?: LearningAuditSink;
 }
 
-const IDENTITY_FILES = ["SOUL.md", "TOOLS.md", "USER.md"] as const;
+/** Identity files under the data dir, plus the daemon config (it holds the guard's own mode). */
+const DATA_DIR_FILES = ["SOUL.md", "TOOLS.md", "USER.md", "config.yaml"] as const;
+const CLAUDE_SETTINGS_FILES = ["settings.json", "settings.local.json"] as const;
+
+export interface ProtectedPaths {
+  /** Directories whose whole subtree is protected: skill roots, and targets of symlinked skill dirs (with their skill name) */
+  roots: Array<{ path: string; skill?: string }>;
+  /** Exact files */
+  files: string[];
+}
+
+export function skillGuardProtectedPaths(deps: Pick<SkillWriteGuardDeps, "skillsRoot" | "userSkillsRoot" | "dataDir" | "agentCwd" | "homeDir">): ProtectedPaths {
+  const roots: ProtectedPaths["roots"] = [deps.skillsRoot, ...(deps.userSkillsRoot ? [deps.userSkillsRoot] : [])].map((path) => ({ path }));
+  // A skill directory that is a symlink: its target tree is protected too.
+  for (const { path: root } of [...roots]) {
+    try {
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isSymbolicLink()) continue;
+        try {
+          roots.push({ path: realpathSync.native(join(root, entry.name)), skill: entry.name });
+        } catch {
+          // dangling link: nothing to protect behind it
+        }
+      }
+    } catch {
+      // root missing
+    }
+  }
+  const files: string[] = DATA_DIR_FILES.map((f) => resolve(deps.dataDir, f));
+  for (const base of [deps.agentCwd, deps.homeDir]) {
+    if (base) for (const f of CLAUDE_SETTINGS_FILES) files.push(resolve(base, ".claude", f));
+  }
+  return { roots, files };
+}
 
 /** Resolve symlinks of the longest existing ancestor, so a symlinked path cannot dodge the check. */
 function canonical(path: string): string {
@@ -66,24 +106,33 @@ function within(child: string, parent: string): boolean {
 
 export type ProtectedTarget = { kind: "skill"; skill: string; file: string } | { kind: "identity"; file: string };
 
-/** The protected target a path resolves to, or null. */
-export function protectedTargetOf(filePath: string, cwd: string, skillsRoot: string, dataDir: string): ProtectedTarget | null {
-  const abs = canonical(isAbsolute(filePath) ? filePath : resolve(cwd, filePath));
-  const roots = new Set([resolve(skillsRoot), canonical(skillsRoot)]);
-  for (const root of roots) {
-    if (within(abs, root) || abs.toLowerCase() === root.toLowerCase()) {
-      const rel = relative(root.toLowerCase(), abs.toLowerCase());
-      const skill = rel.split(sep)[0] ?? "";
-      return { kind: "skill", skill: skill || "(root)", file: basename(abs) };
+function matchTarget(abs: string, paths: ProtectedPaths): ProtectedTarget | null {
+  const lower = abs.toLowerCase();
+  for (const { path: rootPath, skill: linked } of paths.roots) {
+    for (const root of new Set([resolve(rootPath), canonical(rootPath)])) {
+      if (within(abs, root) || lower === root.toLowerCase()) {
+        const skill = linked ?? relative(root.toLowerCase(), lower).split(sep)[0] ?? "";
+        return { kind: "skill", skill: skill || "(root)", file: basename(abs) };
+      }
     }
   }
-  const dataDirs = new Set([resolve(dataDir), canonical(dataDir)]);
-  for (const dir of dataDirs) {
-    for (const name of IDENTITY_FILES) {
-      if (abs.toLowerCase() === resolve(dir, name).toLowerCase()) return { kind: "identity", file: name };
+  for (const filePath of paths.files) {
+    for (const file of new Set([resolve(filePath), canonical(filePath)])) {
+      if (lower === file.toLowerCase()) return { kind: "identity", file: basename(filePath) };
     }
   }
   return null;
+}
+
+/**
+ * The protected target a path resolves to, or null. Both the path as written
+ * and its symlink-resolved form are checked, so a link pointing into a
+ * protected tree and a protected entry that is itself a link (a skill dir or
+ * SOUL.md symlinked to a dotfiles repo) are both caught.
+ */
+export function protectedTargetOf(filePath: string, cwd: string, paths: ProtectedPaths): ProtectedTarget | null {
+  const lexical = isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
+  return matchTarget(lexical, paths) ?? matchTarget(canonical(lexical), paths);
 }
 
 function targetPath(input: Record<string, unknown>): string | null {
@@ -104,7 +153,7 @@ export function createSkillWriteGuard(deps: SkillWriteGuardDeps): ToolGate {
       if (mode === "off") return { decision: "pass" };
       const path = targetPath(call.input);
       if (!path) return { decision: "pass" };
-      const target = protectedTargetOf(path, call.cwd || call.ctx.cwd, deps.skillsRoot, deps.dataDir);
+      const target = protectedTargetOf(path, call.cwd || call.ctx.cwd, skillGuardProtectedPaths(deps));
       if (!target) return { decision: "pass" };
 
       const origin = originOf(call.ctx, deps.turns);

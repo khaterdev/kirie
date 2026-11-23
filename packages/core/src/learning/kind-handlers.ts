@@ -132,6 +132,8 @@ export function appendUnderSection(text: string, section: string, line: string):
   }
   let end = idx + 1;
   while (end < lines.length && !/^#{1,2}\s/.test(lines[end]!)) end++;
+  // Idempotent: a retry after a crash does not add the line twice.
+  if (lines.slice(idx + 1, end).some((l) => l.trim() === entry)) return text;
   let insertAt = end;
   while (insertAt > idx + 1 && lines[insertAt - 1]!.trim() === "") insertAt--;
   lines.splice(insertAt, 0, entry);
@@ -166,6 +168,9 @@ function applyMemoryMdAppend(deps: LearningKindHandlerDeps, p: MemoryMdAppendPay
 
 function undoMemoryMd(r: MemoryMdApplyResult): void {
   const current = readIfExists(r.file);
+  const backup = r.backupFile ? readIfExists(r.backupFile) : null;
+  // Already restored (a retried undo): nothing to do.
+  if (r.backupFile ? current !== null && backup !== null && current === backup : current === null) return;
   if (current === null || sha256Hex(current) !== r.newHash) {
     throw new ProposalApplyError("conflict", "MEMORY.md changed after the proposal was applied; not restoring it");
   }
@@ -209,7 +214,13 @@ export function createMemoryUpsertHandler(deps: LearningKindHandlerDeps): Propos
       try {
         await memory.store(p.key, p.content, tags);
       } catch (err) {
-        if (memoryMd) undoMemoryMd(memoryMd);
+        if (memoryMd) {
+          try {
+            undoMemoryMd(memoryMd);
+          } catch {
+            // the store error below is the one to report; MEMORY.md keeps its backup in the backup dir
+          }
+        }
         throw err;
       }
       return {
@@ -225,12 +236,14 @@ export function createMemoryUpsertHandler(deps: LearningKindHandlerDeps): Propos
       if (!memory) throw new ProposalApplyError("invalid", "the memory store is not available");
       const backup = JSON.parse(readFileSync(String(r.backupFile), "utf8")) as { key: string; existed: boolean; content: string | null; tags: string[] };
       const current = memory.recall(backup.key);
-      if (current && sha256Hex(current.content) !== r.newHash) {
+      const alreadyRestored = backup.existed ? current?.content === backup.content : current === null;
+      if (current && !alreadyRestored && sha256Hex(current.content) !== r.newHash) {
         throw new ProposalApplyError("conflict", `memory "${backup.key}" changed after the proposal was applied`);
       }
-      if (isMemoryMdResult(r.memoryMd)) undoMemoryMd(r.memoryMd);
+      // Memory first, then MEMORY.md: a retry after a partial undo finds the memory restored and finishes.
       if (backup.existed && backup.content !== null) await memory.store(backup.key, backup.content, backup.tags);
       else await memory.delete(backup.key);
+      if (isMemoryMdResult(r.memoryMd)) undoMemoryMd(r.memoryMd);
     },
     preview(raw) {
       const p = MemoryUpsertPayloadSchema.parse(raw);

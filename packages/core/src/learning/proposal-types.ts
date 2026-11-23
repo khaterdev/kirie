@@ -18,7 +18,7 @@ export type ProposalKind =
 export type ProposalOrigin = "reflection" | "agent_tool" | "curator" | "user_model" | "owner_command";
 export type ProposalTrust = "owner" | "mixed" | "untrusted" | "unverified";
 export type ProposalStatus =
-  | "pending" | "applying" | "applied" | "rejected" | "expired" | "failed" | "superseded" | "undone";
+  | "pending" | "applying" | "applied" | "undoing" | "rejected" | "expired" | "failed" | "superseded" | "undone";
 
 export const PROPOSAL_KINDS: readonly ProposalKind[] = [
   "memory.upsert", "memory_md.append",

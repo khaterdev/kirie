@@ -19,6 +19,7 @@ let recorder: TurnRecorder;
 let intake: LearningIntake;
 let skillsRoot: string;
 const UNTRUSTED = ["WebFetch", "mcp__*"];
+const TRUSTED = ["Skill", "Write", "mcp__kirie-tools__learning_propose"];
 
 beforeEach(() => {
   env = tempLearningEnv();
@@ -27,7 +28,7 @@ beforeEach(() => {
   skillsRoot = join(env.dir, "skills");
   mkdirSync(join(skillsRoot, "tmux"), { recursive: true });
   recorder = new TurnRecorder({
-    db: env.db, store, skillState, untrustedTools: () => UNTRUSTED, allowUntrustedSkillProposals: () => false,
+    db: env.db, store, skillState, untrustedTools: () => UNTRUSTED, trustedTools: () => TRUSTED, allowUntrustedSkillProposals: () => false,
     skillRoots: { project: skillsRoot }, audit: fakeAudit(),
   });
   intake = new LearningIntake({ store, config: () => intakeConfig(), skillsRoot, skillState });
@@ -94,41 +95,57 @@ describe("TurnRecorder", () => {
     expect(skillState.usageCounts()).toEqual({ tmux: 1, "plugin:thing": 1 });
   });
 
-  it("finalizes unverified agent proposals only inside the matching session and time window", () => {
-    const inWindow = agentProposal("memory", "k:in");
-    const otherSession = agentProposal("memory", "k:other", "telegram:dm:9999");
-    const t = recorder.record(turn());
-    expect(store.get(inWindow)!.trust).toBe("owner");
-    expect(store.get(inWindow)!.sourceTurnIds).toEqual([t.id]);
-    expect(store.get(otherSession)!.trust).toBe("unverified");
+  function claiming(ids: number[], tools: Record<string, number> = {}): ToolUseSummary {
+    const sum = summary({ "mcp__kirie-tools__learning_propose": ids.length, ...tools });
+    sum.proposalIds = ids;
+    return sum;
+  }
 
-    const later = agentProposal("memory", "k:later");
-    // A turn that ended before the proposal was filed does not adopt it.
-    recorder.record(turn({ startedAt: Date.now() - 60_000, endedAt: Date.now() - 30_000 }));
-    expect(store.get(later)!.trust).toBe("unverified");
+  it("finalizes only the proposals the turn's own stream filed", () => {
+    const mine = agentProposal("memory", "k:in");
+    const other = agentProposal("memory", "k:other");
+    const t = recorder.record(turn({ toolUse: claiming([mine]) }));
+    expect(store.get(mine)!.trust).toBe("owner");
+    expect(store.get(mine)!.sourceTurnIds).toEqual([t.id]);
+    expect(store.get(other)!.trust).toBe("unverified");
   });
 
-  it("a turn that read untrusted content finalizes as mixed", () => {
+  it("a forged owner session key does not give owner trust: the filing turn's provenance wins", () => {
+    // A group or webhook turn files with the owner's DM key while the owner's own DM turn is running.
+    const forged = agentProposal("skill", "forged-skill", OWNER_DM_KEY);
+    recorder.record(turn());
+    expect(store.get(forged)!.trust).toBe("unverified");
+    recorder.record(turn({ sessionKey: "telegram:group:-500", origin: "other_user", toolUse: claiming([forged]) }));
+    expect(store.get(forged)).toMatchObject({ trust: "untrusted", status: "rejected", decidedBy: "system" });
+  });
+
+  it("a turn that read content from a non-trusted tool finalizes as mixed", () => {
     const id = agentProposal("memory", "k:mixed");
-    recorder.record(turn({ toolUse: summary({ WebFetch: 1 }) }));
+    recorder.record(turn({ toolUse: claiming([id], { WebFetch: 1 }) }));
     expect(store.get(id)!.trust).toBe("mixed");
+    const viaBash = agentProposal("memory", "k:bash");
+    recorder.record(turn({ toolUse: claiming([viaBash], { Bash: 1 }) }));
+    expect(store.get(viaBash)!.trust).toBe("mixed");
   });
 
   it("a scheduled turn finalizes as untrusted and an agent skill proposal is dropped", () => {
     const mem = agentProposal("memory", "k:sched");
     const sk = agentProposal("skill", "sched-skill");
-    recorder.record(turn({ origin: "schedule" }));
+    recorder.record(turn({ origin: "schedule", toolUse: claiming([mem, sk]) }));
     expect(store.get(mem)).toMatchObject({ trust: "untrusted", status: "pending" });
     expect(store.get(sk)).toMatchObject({ trust: "untrusted", status: "rejected", decidedBy: "system" });
   });
 
-  it("a background turn on the owner's session key downgrades owner-trust proposals filed in its window", () => {
-    const start = Date.now() - 10_000;
+  it("a background turn's proposals are untrusted, whatever session key they carry", () => {
     const id = agentProposal("memory", "k:bg");
-    recorder.record(turn());
-    expect(store.get(id)!.trust).toBe("owner");
-    recorder.record(turn({ source: "background", origin: "background", startedAt: start, endedAt: Date.now() + 1000 }));
+    recorder.record(turn({ source: "background", origin: "background", toolUse: claiming([id]) }));
     expect(store.get(id)!.trust).toBe("untrusted");
+  });
+
+  it("an overflowing tool map counts as untrusted input", () => {
+    const sum = summary({ Skill: 1 });
+    sum.overflow = true;
+    expect(recorder.record(turn({ toolUse: sum })).untrustedInput).toBe(true);
   });
 
   it("calls onRecorded and survives a throwing listener", () => {
@@ -154,6 +171,9 @@ describe("LearningTurnTracker", () => {
     tracker.observe({ type: "turn_start", ctx: chatCtx, accountId: null });
     tracker.observe({ type: "message", ctx: chatCtx, message: toolMsg("Bash", { command: "secret-cmd" }) });
     tracker.observe({ type: "message", ctx: chatCtx, message: toolMsg("Skill", { skill: "tmux" }) });
+    const filed = agentProposal("memory", "k:tracked");
+    tracker.observe({ type: "message", ctx: chatCtx, message: { type: "assistant", message: { content: [{ type: "tool_use", id: "tu-p", name: "mcp__kirie-tools__learning_propose", input: {} }] } } as unknown as SDKMessage });
+    tracker.observe({ type: "message", ctx: chatCtx, message: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-p", content: [{ type: "text", text: JSON.stringify({ id: filed, status: "pending" }, null, 2) }] }] } } as unknown as SDKMessage });
     tracker.observe({ type: "turn_end", ctx: chatCtx, accountId: null, result });
     const now = Date.now();
     tracker.onTurnComplete({
@@ -164,6 +184,8 @@ describe("LearningTurnTracker", () => {
     const t = recorder.lastTurn(OWNER_DM_KEY)!;
     expect(t).toMatchObject({ source: "main", origin: "owner_message", userMsgId: 5, tools: { Bash: 1, Skill: 1 }, skills: ["tmux"] });
     expect(JSON.stringify(t)).not.toContain("secret-cmd");
+    // Bash is not a trusted tool, so the proposal this turn filed is mixed.
+    expect(store.get(filed)!.trust).toBe("mixed");
   });
 
   it("records a background turn on its turn_end with origin background", () => {

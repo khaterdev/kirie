@@ -259,33 +259,39 @@ export class ProposalStore {
     );
   }
 
-  /** applied -> applying (undo claim). */
+  /** applied -> undoing (undo claim; a status of its own so a crash never makes an applied row re-approvable). */
   claimForUndo(id: number): boolean {
-    return this.db.prepare("UPDATE proposals SET status = 'applying' WHERE id = ? AND status = 'applied'").run(id).changes === 1;
+    return this.db.prepare("UPDATE proposals SET status = 'undoing' WHERE id = ? AND status = 'applied'").run(id).changes === 1;
   }
 
   releaseUndo(id: number, error: string): void {
-    this.db.prepare("UPDATE proposals SET status = 'applied', error = ? WHERE id = ? AND status = 'applying'").run(error.slice(0, 500), id);
+    this.db.prepare("UPDATE proposals SET status = 'applied', error = ? WHERE id = ? AND status = 'undoing'").run(error.slice(0, 500), id);
   }
 
   markUndone(id: number, decision: ProposalDecision): void {
     this.db
-      .prepare("UPDATE proposals SET status = 'undone', decided_at = ?, decided_by = ?, decided_via = ? WHERE id = ? AND status = 'applying'")
+      .prepare("UPDATE proposals SET status = 'undone', decided_at = ?, decided_by = ?, decided_via = ? WHERE id = ? AND status = 'undoing'")
       .run(decision.at, decision.by, decision.via, id);
   }
 
   /**
-   * Rows left in `applying` by a crash or restart mid-apply (or mid-undo) become
-   * `failed`, so the owner sees them and can retry; a retry re-runs the stale
-   * and conflict checks. Call once at startup, before anything is applied.
+   * After a crash or restart: rows left in `applying` become `failed` (a retry
+   * re-runs the stale and conflict checks); rows left in `undoing` go back to
+   * `applied` (the owner can run undo again). Call once at startup.
    */
-  recoverInterrupted(): number[] {
+  recoverInterrupted(): { failed: number[]; reapplied: number[] } {
     const tx = this.db.transaction(() => {
-      const ids = (this.db.prepare("SELECT id FROM proposals WHERE status = 'applying'").all() as { id: number }[]).map((r) => r.id);
+      const ids = (status: string) =>
+        (this.db.prepare("SELECT id FROM proposals WHERE status = ?").all(status) as { id: number }[]).map((r) => r.id);
+      const failed = ids("applying");
+      const reapplied = ids("undoing");
       this.db
         .prepare("UPDATE proposals SET status = 'failed', error = 'interrupted by a restart; check the target before retrying' WHERE status = 'applying'")
         .run();
-      return ids;
+      this.db
+        .prepare("UPDATE proposals SET status = 'applied', error = 'undo interrupted by a restart; run undo again' WHERE status = 'undoing'")
+        .run();
+      return { failed, reapplied };
     });
     return tx();
   }
@@ -304,46 +310,24 @@ export class ProposalStore {
   }
 
   /**
-   * Trust finalization for agent-tool proposals (R4 section 0.6): rows still
-   * `unverified` filed for this session inside the turn's window take the
-   * turn's trust. Returns the ids changed.
+   * Trust finalization for agent-tool proposals (R4 section 0.6), bound to
+   * the turn whose own stream returned these proposal ids from
+   * learning_propose. The session key the agent passed is never trusted. Only
+   * rows still `unverified` change. Returns the ids changed.
    */
-  finalizeUnverified(sessionKey: string, startedIso: string, endedIso: string, trust: ProposalTrust, turnId: number): number[] {
+  finalizeByIds(ids: readonly number[], trust: ProposalTrust, turnId: number): number[] {
+    if (ids.length === 0) return [];
     const tx = this.db.transaction(() => {
-      const rows = this.db
-        .prepare(
-          `SELECT id, source_turn_ids FROM proposals
-           WHERE origin = 'agent_tool' AND trust = 'unverified' AND source_session_key = ?
-             AND created_at >= ? AND created_at <= ?`,
-        )
-        .all(sessionKey, startedIso, endedIso) as { id: number; source_turn_ids: string }[];
+      const changed: number[] = [];
+      const select = this.db.prepare("SELECT source_turn_ids FROM proposals WHERE id = ? AND origin = 'agent_tool' AND trust = 'unverified'");
       const update = this.db.prepare("UPDATE proposals SET trust = ?, source_turn_ids = ? WHERE id = ? AND trust = 'unverified'");
-      for (const r of rows) {
-        const turns = parseJson<number[]>(r.source_turn_ids, []);
-        update.run(trust, JSON.stringify([...turns, turnId]), r.id);
+      for (const id of ids) {
+        const row = select.get(id) as { source_turn_ids: string } | undefined;
+        if (!row) continue;
+        const turns = parseJson<number[]>(row.source_turn_ids, []);
+        if (update.run(trust, JSON.stringify([...turns, turnId]), id).changes === 1) changed.push(id);
       }
-      return rows.map((r) => r.id);
-    });
-    return tx();
-  }
-
-  /**
-   * A non-chat turn (background task, goal, webhook) ran for this session key:
-   * any pending agent-tool proposal filed for that key in its window is
-   * untrusted, whatever trust it was given meanwhile. Downgrade only.
-   */
-  downgradeAgentToolInWindow(sessionKey: string, startedIso: string, endedIso: string): number[] {
-    const tx = this.db.transaction(() => {
-      const ids = (this.db
-        .prepare(
-          `SELECT id FROM proposals
-           WHERE origin = 'agent_tool' AND status = 'pending' AND trust IN ('unverified', 'owner', 'mixed')
-             AND source_session_key = ? AND created_at >= ? AND created_at <= ?`,
-        )
-        .all(sessionKey, startedIso, endedIso) as { id: number }[]).map((r) => r.id);
-      const update = this.db.prepare("UPDATE proposals SET trust = 'untrusted' WHERE id = ?");
-      for (const id of ids) update.run(id);
-      return ids;
+      return changed;
     });
     return tx();
   }

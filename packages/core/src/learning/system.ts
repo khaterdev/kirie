@@ -27,7 +27,7 @@ import { createLearningCommands } from "./commands.js";
 import { LearningIntake, parseSkillFrontmatter } from "./intake.js";
 import { registerLearningKindHandlers, type LearningMemoryTarget } from "./kind-handlers.js";
 import { LearningKv, USAGE_TRACKING_STARTED_KEY, learningDbPath, openLearningDb, type LearningDb } from "./learning-db.js";
-import { ProposalNotifier, createProposalActionHandler } from "./notifier.js";
+import { ProposalNotifier, ProposalReviewLog, createProposalActionHandler } from "./notifier.js";
 import { ProposalStore } from "./proposal-store.js";
 import { ReflectionEngine, type OneShotRunner, type ReflectionHistoryEntry } from "./reflection.js";
 import { createSkillWriteGuard } from "./skill-guard.js";
@@ -39,8 +39,10 @@ export interface LearningSystemDeps {
   dataDir: string;
   /** config.agent.workspace || dataDir */
   agentCwd: string;
-  /** ~/.claude/skills (report-only root; usage counting only) */
+  /** ~/.claude/skills (usage counting; protected by the skill write guard; never written by proposals) */
   userSkillsRoot?: string;
+  /** Home directory, for the guard's `~/.claude/settings*.json` */
+  homeDir?: string;
   /** Default `<dataDir>/learning.db` */
   dbPath?: string;
   /** Live learning config */
@@ -119,8 +121,12 @@ export function createLearningSystem(deps: LearningSystemDeps): LearningSystem {
   const kv = new LearningKv(db);
   kv.setIfAbsent(USAGE_TRACKING_STARTED_KEY, (deps.now?.() ?? new Date()).toISOString());
   const store = new ProposalStore(db);
-  for (const id of store.recoverInterrupted()) {
+  const interrupted = store.recoverInterrupted();
+  for (const id of interrupted.failed) {
     deps.audit.record({ feature: "learning", action: "proposal.apply_interrupted", actor: "system", detail: { id } });
+  }
+  for (const id of interrupted.reapplied) {
+    deps.audit.record({ feature: "learning", action: "proposal.undo_interrupted", actor: "system", detail: { id } });
   }
   const skillState = new SkillStateStore(db);
   const skillsRoot = learningSkillsRoot(deps.agentCwd);
@@ -159,6 +165,7 @@ export function createLearningSystem(deps: LearningSystemDeps): LearningSystem {
     store,
     skillState,
     untrustedTools: () => deps.config().untrustedTools,
+    trustedTools: () => deps.config().trustedTools,
     allowUntrustedSkillProposals: () => deps.config().allowUntrustedSkillProposals,
     skillRoots: { project: skillsRoot, ...(deps.userSkillsRoot ? { user: deps.userSkillsRoot } : {}) },
     audit: deps.audit,
@@ -201,13 +208,17 @@ export function createLearningSystem(deps: LearningSystemDeps): LearningSystem {
 
   const guard = createSkillWriteGuard({
     skillsRoot,
+    ...(deps.userSkillsRoot ? { userSkillsRoot: deps.userSkillsRoot } : {}),
     dataDir: deps.dataDir,
+    agentCwd: deps.agentCwd,
+    ...(deps.homeDir ? { homeDir: deps.homeDir } : {}),
     turns: deps.turns,
     mode: () => deps.config().skillWriteGuard,
     audit: deps.audit,
   });
 
-  const actionHandler = createProposalActionHandler({ store, applier, owners: deps.owners, audit: deps.audit });
+  const reviews = new ProposalReviewLog();
+  const actionHandler = createProposalActionHandler({ store, applier, reviews, owners: deps.owners, audit: deps.audit });
   const commands = createLearningCommands({
     store,
     applier,
@@ -218,6 +229,7 @@ export function createLearningSystem(deps: LearningSystemDeps): LearningSystem {
     enabled: deps.enabled,
     configEnabled: deps.configEnabled,
     config: deps.config,
+    reviews,
   });
 
   return {
