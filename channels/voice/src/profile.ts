@@ -5,7 +5,11 @@
  * Speech recognition mishears; a misheard sentence must not become a shell
  * command. Profile "chat" (default) removes shell, file writes, subagents,
  * the browser, restarts, MCP-server edits, spawning, background tasks and
- * placing calls. Profile "full" keeps the normal tools (the approvals gate
+ * placing calls, plus every indirect route to a full-tool turn (relaying into
+ * another session, scheduling, background-task messages, proactive triggers)
+ * and every external MCP server configured for Kirie (only kirie-tools stays;
+ * user-scope connectors are only excluded when agent.strictMcpConfig is on).
+ * Profile "full" keeps the normal tools (the approvals gate
  * stays in charge) but still never places calls from a call. Computer use is
  * never available on a voice session: the cua-driver server and its tools are
  * removed whatever the profile.
@@ -27,8 +31,16 @@ export const VOICE_CHAT_PROFILE_DISALLOWED: readonly string[] = [
   `${K}mcp_servers_remove`,
   `${K}sessions_spawn`,
   `${K}background_task_create`,
+  `${K}background_task_send_message`,
+  `${K}sessions_send`,
+  `${K}schedule_create`,
+  `${K}schedule_webhook`,
+  `${K}proactive_trigger`,
+  `${K}channel_action`,
   `${K}sandbox_bash`,
 ];
+
+const KIRIE_SERVER = "kirie-tools";
 
 export const VOICE_ALWAYS_DISALLOWED: readonly string[] = [`${K}voice_call_initiate`];
 
@@ -47,12 +59,15 @@ export function applyVoiceToolProfile(options: Options, ctx: SdkCallContext, pro
   if (!isVoiceSession(ctx)) return;
   const deny = new Set<string>(profile === "chat" ? VOICE_CHAT_PROFILE_DISALLOWED : VOICE_ALWAYS_DISALLOWED);
   options.disallowedTools = [...new Set([...(options.disallowedTools ?? []), ...deny])];
+  const externalMcp = (t: string) => t.startsWith("mcp__") && !t.startsWith(K);
   if (options.allowedTools) {
-    options.allowedTools = options.allowedTools.filter((t) => !deny.has(t) && !t.startsWith(CUA_PREFIX));
+    options.allowedTools = options.allowedTools.filter((t) =>
+      !deny.has(t) && !t.startsWith(CUA_PREFIX) && !(profile === "chat" && externalMcp(t)));
   }
-  if (options.mcpServers && CUA_SERVER in options.mcpServers) {
-    const { [CUA_SERVER]: _removed, ...rest } = options.mcpServers;
-    options.mcpServers = rest;
+  if (options.mcpServers) {
+    const kept = Object.entries(options.mcpServers).filter(([name]) =>
+      name !== CUA_SERVER && (profile === "full" || name === KIRIE_SERVER));
+    if (kept.length !== Object.keys(options.mcpServers).length) options.mcpServers = Object.fromEntries(kept);
   }
 }
 

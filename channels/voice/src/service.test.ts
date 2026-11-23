@@ -143,6 +143,15 @@ describe("provider selection", () => {
     expect(h.ingress.mountedPrefixes()).toEqual(["/voice/twilio"]);
   });
 
+  it("/voice off closes a Plivo call that is still ringing (no id yet) without calling the hangup endpoint", async () => {
+    h = await makeHarness({ provider: "plivo" });
+    expect((await h.service.placeCall({ alias: "mom", text: "hi", mode: "say", requestedBy: "owner-command" })).ok).toBe(true);
+    await h.service.switchOff("owner:t");
+    expect(h.service.live.size).toBe(0);
+    expect(h.fetchCalls.filter((c) => c.method === "DELETE")).toEqual([]);
+    expect(h.store.recent(1)[0]).toMatchObject({ state: "canceled", endReason: "switched-off" });
+  });
+
   it("on success unmounts /voice/twilio, mounts /voice/plivo, persists the override; reset returns to config", async () => {
     h = await makeHarness({ provider: "twilio" });
     const r = await h.service.setProvider("plivo", "owner:telegram:1");
@@ -328,6 +337,17 @@ describe("voice tool profile", () => {
     applyVoiceToolProfile(other, tgCtx, "chat");
     expect(other.allowedTools).toEqual(allowed);
     expect(other.disallowedTools).toBeUndefined();
+  });
+
+  it("chat profile also closes indirect routes to a full-tool turn and external MCP servers", () => {
+    const options = {
+      allowedTools: ["mcp__kirie-tools__sessions_send", "mcp__kirie-tools__schedule_create", "mcp__kirie-tools__send_message", "mcp__docs__delete"],
+      mcpServers: { "kirie-tools": {}, docs: {} },
+    } as never as Parameters<typeof applyVoiceToolProfile>[0];
+    applyVoiceToolProfile(options, voiceCtx, "chat");
+    expect(options.allowedTools).toEqual(["mcp__kirie-tools__send_message"]);
+    expect(Object.keys(options.mcpServers!)).toEqual(["kirie-tools"]);
+    expect(options.disallowedTools).toEqual(expect.arrayContaining(["mcp__kirie-tools__sessions_send", "mcp__kirie-tools__schedule_create", "mcp__kirie-tools__proactive_trigger"]));
   });
 
   it("full profile still removes voice_call_initiate and computer use", () => {

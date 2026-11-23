@@ -31,6 +31,10 @@ export interface PendingTurn {
   settled: boolean;
   /** The caller has been told the answer will arrive on Telegram, or the call ended mid-turn. */
   deferred: boolean;
+  /** The text the turn was resolved with. */
+  reply?: string;
+  /** The reply was put into markup (or forwarded once the call ended). */
+  spoken: boolean;
 }
 
 export interface LiveCall {
@@ -49,6 +53,8 @@ export interface LiveCall {
   readonly alias?: string;
   phase: LivePhase;
   readonly startedAt: number;
+  /** epoch ms of the last accepted webhook for this call. */
+  lastActivityAt: number;
   answeredAt?: number;
   /** epoch ms after which the call is wound down. */
   deadline: number;
@@ -119,9 +125,11 @@ export function createPendingTurn(turn: number, startedAt: number): PendingTurn 
     promise,
     settled: false,
     deferred: false,
+    spoken: false,
     resolve(text: string) {
       if (pending.settled) return;
       pending.settled = true;
+      pending.reply = text;
       resolveFn(text);
     },
   };

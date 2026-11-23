@@ -87,7 +87,7 @@ export function createVoiceFeature(opts: VoiceFeatureOptions = {}): FeatureSetup
     });
     const offError = ctx.pipeline.onTurnError((ev) => {
       const parts = parseSessionKey(ev.sessionKey);
-      if (parts?.channel === "voice") service.flow.turnFinished(parts.chatId, Date.now());
+      if (parts?.channel === "voice") service.flow.turnFailed(parts.chatId);
     });
 
     // Register the adapter before channels start when voice is already usable.

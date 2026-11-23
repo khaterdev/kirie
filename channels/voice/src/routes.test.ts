@@ -112,7 +112,7 @@ describe.each(providers)("voice routes (%s)", (provider) => {
     const r1 = await (await h.post(`${h.prefix}/pin/${token}`, h.payload({ callId: "id-lock-0001", digits: "0000" }))).text();
     expect(tokenIn(r1, "pin")).toBe(token);
     await h.post(`${h.prefix}/pin/${token}`, h.payload({ callId: "id-lock-0001", digits: "1111" }));
-    const r3 = await (await h.post(`${h.prefix}/pin/${token}`, h.payload({ callId: "id-lock-0001", digits: "" }))).text();
+    const r3 = await (await h.post(`${h.prefix}/pin/${token}`, h.payload({ callId: "id-lock-0001", digits: "2222" }))).text();
     expect(r3).toContain("<Hangup/>");
     expect(h.notifyOwner).toHaveBeenCalledTimes(1);
     expect(String(h.notifyOwner.mock.calls[0]![0])).toMatch(/wrong PIN/);
@@ -122,6 +122,60 @@ describe.each(providers)("voice routes (%s)", (provider) => {
     h.advance(31 * 60_000);
     const later = await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-lock-0003" }))).text();
     expect(tokenIn(later, "pin")).not.toBeNull();
+  });
+
+  it("wrong PINs count across calls: hanging up between guesses does not avoid the lockout", async () => {
+    h = await agentHarness(provider);
+    const t1 = tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-xlock-0001" }))).text(), "pin")!;
+    await h.post(`${h.prefix}/pin/${t1}`, h.payload({ callId: "id-xlock-0001", digits: "0000" }));
+    await h.post(`${h.prefix}/pin/${t1}`, h.payload({ callId: "id-xlock-0001", digits: "1111" }));
+    await h.post(`${h.prefix}/status/${t1}`, h.payload({ callId: "id-xlock-0001", status: "completed", duration: 9 }));
+    const t2 = tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-xlock-0002" }))).text(), "pin")!;
+    const r = await (await h.post(`${h.prefix}/pin/${t2}`, h.payload({ callId: "id-xlock-0002", digits: "2222" }))).text();
+    expect(r).toContain("<Hangup/>");
+    expect(String(h.notifyOwner.mock.calls.at(-1)![0])).toMatch(/3 wrong PIN attempts/);
+    expect(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-xlock-0003" }))).text()).toMatch(rejectRe(provider));
+  });
+
+  it("silence at the PIN prompt ends the call without a lockout or an alert", async () => {
+    h = await agentHarness(provider);
+    const t = tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-quiet-0001" }))).text(), "pin")!;
+    const first = await (await h.post(`${h.prefix}/pin/${t}`, h.payload({ callId: "id-quiet-0001", digits: "" }))).text();
+    expect(first).toContain("I did not get a PIN.");
+    await h.post(`${h.prefix}/pin/${t}`, h.payload({ callId: "id-quiet-0001", digits: "" }));
+    const last = await (await h.post(`${h.prefix}/pin/${t}`, h.payload({ callId: "id-quiet-0001", digits: "" }))).text();
+    expect(last).toContain("<Hangup/>");
+    expect(h.notifyOwner).not.toHaveBeenCalled();
+    expect(tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-quiet-0002" }))).text(), "pin")).not.toBeNull();
+  });
+
+  it("a repeated /inbound after the PIN continues the same call instead of creating another", async () => {
+    h = await agentHarness(provider);
+    const token = await connectOwner(h, "id-rep-0001");
+    const again = await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-rep-0001" }))).text();
+    expect(tokenIn(again, "turn")).toBe(token);
+    expect(h.service.live.size).toBe(1);
+  });
+
+  it("a failed turn is answered with an apology, not 'Done.'", async () => {
+    h = await agentHarness(provider);
+    const token = await connectOwner(h, "id-fail-0001");
+    const x = h;
+    x.service.adapter.onMessage(() => { setTimeout(() => x.service.flow.turnFailed(OWNER), 2); });
+    const xml = await (await h.post(`${h.prefix}/turn/${token}`, h.payload({ callId: "id-fail-0001", speech: "do it" }))).text();
+    expect(xml).toContain("Sorry, something went wrong");
+    expect(xml).not.toContain(">Done.<");
+  });
+
+  it("a reply that arrives between webhooks is forwarded when the caller hangs up before hearing it", async () => {
+    h = await agentHarness(provider);
+    const token = await connectOwner(h, "id-lost-0001");
+    await h.post(`${h.prefix}/turn/${token}`, h.payload({ callId: "id-lost-0001", speech: "slow one" }));
+    const msg = h.emitted[0]!;
+    await h.service.adapter.sendText({ ctx: { chatId: OWNER, replyToId: msg.id }, text: "The answer nobody heard." });
+    expect(h.notifyOwner).not.toHaveBeenCalled();
+    await h.post(`${h.prefix}/status/${token}`, h.payload({ callId: "id-lost-0001", status: "completed", duration: 12 }));
+    expect(h.notifyOwner).toHaveBeenCalledWith("From your call:\nThe answer nobody heard.");
   });
 
   it("a spoken turn reaches the pipeline as a voice:dm message and the reply comes back in a speech gather", async () => {
@@ -279,14 +333,20 @@ describe.each(providers)("voice routes (%s)", (provider) => {
     expect(h.notifyOwner.mock.calls.some(([t]) => /daily call limit/.test(String(t)))).toBe(true);
   });
 
-  it("a new inbound call from the same number supersedes a stale one", async () => {
+  it("a new inbound call from the same number supersedes a stale one, but never an active one", async () => {
     h = await agentHarness(provider);
     const first = tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-sup-0001" }))).text(), "pin")!;
-    const second = tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-sup-0002" }))).text(), "pin")!;
+    // Still active: a second call from the same number (caller ID can be spoofed) is busy.
+    const busy = await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-sup-0002" }))).text();
+    expect(busy).toMatch(provider === "twilio" ? /<Reject reason="busy"\/>/ : /<Hangup reason="busy"\/>/);
+    expect(h.service.live.byToken(first)).toBeDefined();
+    // Quiet for over 30 s: it ended without telling us, so a new call replaces it.
+    h.advance(31_000);
+    const second = tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-sup-0003" }))).text(), "pin")!;
     expect(second).not.toBe(first);
     expect(h.service.live.size).toBe(1);
     expect((await h.post(`${h.prefix}/pin/${first}`, h.payload({ callId: "id-sup-0001", digits: PIN }))).status).toBe(403);
-    expect(h.store.recent(2).map((r) => r.endReason)).toContain("superseded");
+    expect(h.store.recent(3).map((r) => r.endReason)).toContain("superseded");
   });
 
   it("outbound words are scrubbed before they are spoken", async () => {

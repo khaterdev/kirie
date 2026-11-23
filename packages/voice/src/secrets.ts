@@ -15,7 +15,7 @@
  * variable, nothing in the repo.
  */
 
-import { lstatSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 
 export type VoiceSecretName =
   | "TWILIO_ACCOUNT_SID" | "TWILIO_AUTH_TOKEN" | "PLIVO_AUTH_ID" | "PLIVO_AUTH_TOKEN" | "VOICE_PIN";
@@ -77,22 +77,30 @@ export function readVoiceEnvFile(path: string, opts: { uid?: number } = {}): Voi
   if (st.isSymbolicLink()) return { status: "ignored", reason: "voice.env is a symlink; use a regular file", values: empty };
   if (!st.isFile()) return { status: "ignored", reason: "voice.env is not a regular file", values: empty };
   const uid = opts.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
-  if (uid !== undefined && st.uid !== uid) {
-    return { status: "ignored", reason: "voice.env is not owned by the user running Kirie", values: empty };
-  }
-  const mode = st.mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    return {
-      status: "ignored",
-      reason: `voice.env has mode ${mode.toString(8).padStart(4, "0")}; run chmod 600 on it`,
-      values: empty,
-    };
-  }
+  const check = (s: { uid: number; mode: number }): string | null => {
+    if (uid !== undefined && s.uid !== uid) return "voice.env is not owned by the user running Kirie";
+    const mode = s.mode & 0o777;
+    if ((mode & 0o077) !== 0) return `voice.env has mode ${mode.toString(8).padStart(4, "0")}; run chmod 600 on it`;
+    return null;
+  };
+  const early = check(st);
+  if (early) return { status: "ignored", reason: early, values: empty };
+  // Open without following links and check the open file itself, so the file cannot be swapped
+  // between the check and the read.
+  let fd: number | null = null;
   try {
-    return { status: "ok", values: parseEnvLines(readFileSync(path, "utf8")) };
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const fst = fstatSync(fd);
+    if (!fst.isFile()) return { status: "ignored", reason: "voice.env is not a regular file", values: empty };
+    const late = check(fst);
+    if (late) return { status: "ignored", reason: late, values: empty };
+    return { status: "ok", values: parseEnvLines(readFileSync(fd, "utf8")) };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") return { status: "ignored", reason: "voice.env is a symlink; use a regular file", values: empty };
     return { status: "ignored", reason: `voice.env could not be read (${code ?? "error"})`, values: empty };
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
 }
 

@@ -50,6 +50,8 @@ type Logger = ReturnType<typeof createModuleLogger>;
 type TimerHandle = ReturnType<typeof setTimeout>;
 
 export const VOICE_MAX_MESSAGE_CHARS = 1000;
+/** Upper bound on the owner-approval wait for an agent-initiated call. */
+export const VOICE_MAX_APPROVAL_MS = 600_000;
 
 export interface VoiceIngress {
   mount(prefix: string, app: { fetch(req: Request): Response | Promise<Response> }): void;
@@ -337,6 +339,9 @@ export class VoiceService {
 
   async switchOff(by: string): Promise<{ ok: boolean; message: string }> {
     const ended = await this.hangupAll("switched-off");
+    // Calls that could not be ended yet (a Plivo call still ringing has no id) are closed here;
+    // once the routes are unmounted their answer webhook gets 404 and the provider drops them.
+    for (const call of this.live.all()) this.flow.finish(call, { reason: "switched-off", state: "canceled" });
     this.d.settings.set(VOICE_SETTING_KEYS.switch, false, by);
     await this.sync();
     return { ok: true, message: `Voice is off.${ended > 0 ? ` Ended ${ended} live call${ended === 1 ? "" : "s"}.` : ""} Inbound calls are rejected and outbound calls refused.` };
@@ -352,8 +357,11 @@ export class VoiceService {
   }
 
   async setProvider(target: VoiceProviderName | "reset", by: string): Promise<{ ok: boolean; message: string }> {
-    if (this.live.size > 0) return { ok: false, message: "A call is live. Hang up first (/voice hangup), then switch the provider." };
+    const liveMessage = "A call is live. Hang up first (/voice hangup), then switch the provider.";
+    if (this.live.size > 0) return { ok: false, message: liveMessage };
     await this.reload();
+    // A call may have arrived while the credentials were being read.
+    if (this.live.size > 0) return { ok: false, message: liveMessage };
     const name: VoiceProviderName = target === "reset" ? this.d.config.provider : target;
     const r = this.readiness(name);
     if (!r.ready) {
@@ -421,7 +429,8 @@ export class VoiceService {
           kind: "voice",
           title: `Kirie wants to call ${alias} (…${lastFour(target.number)}) via ${PROVIDER_LABEL[name]}`,
           body: what,
-          timeoutMs: Math.min(86_400_000, Math.max(5_000, cfg.outbound.approvalTimeoutSeconds * 1000)),
+          // At most 10 minutes, well inside the voice_call_initiate tool's own 15-minute wait.
+          timeoutMs: Math.min(VOICE_MAX_APPROVAL_MS, Math.max(5_000, cfg.outbound.approvalTimeoutSeconds * 1000)),
         });
         this.audit("call.approval", "owner", { outcome: res.outcome, code: res.code, alias });
         if (res.outcome !== "approved") return this.refusal(`The owner did not approve the call (${res.outcome}).`, req);

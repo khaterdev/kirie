@@ -85,6 +85,10 @@ const MAX_CAPTURED_CHARS = 2000;
 const MAX_EMPTY_TURNS = 2;
 /** The PIN gather accepts up to the longest allowed PIN and ends on "#", so the prompt does not reveal the PIN length. */
 const PIN_GATHER_DIGITS = 10;
+/** Wrong PINs are counted per number across calls over this window, so hanging up between guesses does not help. */
+const PIN_FAILURE_WINDOW_MS = 24 * 3600_000;
+/** A live call with no webhook for this long has ended without telling us. */
+const STALE_CALL_MS = 30_000;
 
 export type CapCheck = { ok: true; timeLimitSeconds: number } | { ok: false; reason: string; busy: boolean };
 
@@ -97,6 +101,8 @@ export class VoiceCallFlow {
   private readonly clearTimer: (h: TimerHandle) => void;
   /** Owner number -> lockout end (epoch ms). In memory: a restart clears lockouts. */
   private readonly lockouts = new Map<string, number>();
+  /** Owner number -> times of wrong (non-empty) PIN entries, across calls, within PIN_FAILURE_WINDOW_MS. */
+  private readonly pinFailures = new Map<string, number[]>();
   /** Markup already returned for rejected inbound calls, keyed provider:callId, for duplicate webhooks. */
   private readonly rejected = new Map<string, string>();
   private capNoticeDay: string | null = null;
@@ -207,7 +213,13 @@ export class VoiceCallFlow {
     if (call.watchdog) this.clearTimer(call.watchdog);
     call.watchdog = undefined;
     call.phase = "ended";
-    if (call.pending && !call.pending.settled) call.pending.deferred = true;
+    const pending = call.pending;
+    if (pending && !pending.settled) pending.deferred = true;
+    else if (pending && !pending.spoken && pending.reply) {
+      // The answer arrived but was never spoken: the caller hung up in between.
+      void this.d.notifyOwner(`From your call:\n${pending.reply}`);
+      pending.spoken = true;
+    }
     const wasLive = this.d.live.remove(call.token) !== undefined;
     const now = this.now();
     const duration = end.durationSeconds ?? (call.answeredAt !== undefined ? Math.round((now - call.answeredAt) / 1000) : 0);
@@ -265,7 +277,26 @@ export class VoiceCallFlow {
       this.d.store.update(call.callId, { providerCallId: event.providerCallId });
     }
     if (phases !== "any" && !phases.includes(call.phase)) return null;
+    call.lastActivityAt = this.now();
     return call;
+  }
+
+  /** Markup that continues a call in its current phase (a repeated answer webhook). */
+  private phaseMarkup(provider: VoiceCallProvider, call: LiveCall): string {
+    const v = this.speech(provider);
+    switch (call.phase) {
+      case "pin":
+        return provider.markup.gatherPin({ action: this.url(provider, "pin", call.token), digits: PIN_GATHER_DIGITS, prompt: "Please enter your PIN, then press the pound key.", ...v });
+      case "listening":
+        return this.gather(provider, call, []);
+      case "voicemail":
+      case "say-reply":
+        return this.gather(provider, call, [], "vm");
+      case "thinking":
+        return provider.markup.holdAndRedirect({ pauseSeconds: 1, redirect: this.url(provider, "wait", call.token), ...v });
+      default:
+        return provider.markup.sayAndHangup("Goodbye.", v);
+    }
   }
 
   /** The live call with this provider call id, for the tokenless status route. */
@@ -278,7 +309,7 @@ export class VoiceCallFlow {
   inbound(provider: VoiceCallProvider, event: VoiceCallEvent): FlowResult {
     if (!event.providerCallId) return { status: 403 };
     const existing = this.d.live.byProviderCallId(provider.name, event.providerCallId);
-    if (existing?.lastMarkup) return { status: 200, markup: existing.lastMarkup };
+    if (existing) return { status: 200, markup: existing.lastMarkup ?? this.phaseMarkup(provider, existing) };
     const dupKey = `${provider.name}:${event.providerCallId}`;
     const dup = this.rejected.get(dupKey);
     if (dup) return { status: 200, markup: dup };
@@ -309,13 +340,14 @@ export class VoiceCallFlow {
     else return reject("rejected", "unknown caller");
 
     if (mode === "agent" && caller && this.isLockedOut(caller)) return reject("rejected", "pin lockout");
-    // A phone line carries one call: an older inbound call from the same number has ended
-    // without a hangup webhook (Twilio sends none unless the number's status callback is set).
+    // An older inbound call from the same number that has gone quiet ended without a hangup
+    // webhook (Twilio sends none unless the number's status callback is set): close it. One that
+    // is still active is never ended by a new call (caller ID can be spoofed); the new call is busy.
     if (caller) {
       for (const old of this.d.live.all()) {
-        if (old.direction === "inbound" && old.remote === caller && old.providerCallId !== event.providerCallId) {
-          this.finish(old, { reason: "superseded" });
-        }
+        if (old.direction !== "inbound" || old.remote !== caller || old.providerCallId === event.providerCallId) continue;
+        if (this.now() - old.lastActivityAt < STALE_CALL_MS) return reject("busy", "same number already on a call");
+        this.finish(old, { reason: "superseded" });
       }
     }
     const caps = this.checkCaps();
@@ -347,6 +379,7 @@ export class VoiceCallFlow {
       mode,
       phase: "listening",
       startedAt: now,
+      lastActivityAt: now,
       answeredAt: now,
       deadline: now + caps.timeLimitSeconds * 1000,
       turn: 0,
@@ -381,22 +414,39 @@ export class VoiceCallFlow {
   pin(provider: VoiceCallProvider, call: LiveCall, event: VoiceCallEvent): FlowResult {
     const cfg = this.d.config();
     call.lastMarkup = undefined;
-    if (this.pinMatches(event.digits?.trim())) {
+    const digits = event.digits?.trim() ?? "";
+    const remote = call.remote ?? "";
+    if (digits && this.pinMatches(digits)) {
       call.phase = "listening";
+      this.pinFailures.delete(remote);
       this.log.info({ callId: call.callId }, "pin accepted");
       return { status: 200, markup: this.gather(provider, call, [cfg.inbound.greeting]) };
     }
     call.pinAttempts++;
-    this.log.warn({ callId: call.callId, attempt: call.pinAttempts }, "wrong pin");
-    if (call.pinAttempts >= cfg.inbound.maxPinAttempts) {
-      if (call.remote) this.lockouts.set(call.remote, this.now() + cfg.inbound.pinLockoutMinutes * 60_000);
+    let failures = 0;
+    if (digits) {
+      const since = this.now() - PIN_FAILURE_WINDOW_MS;
+      const list = (this.pinFailures.get(remote) ?? []).filter((t) => t > since);
+      list.push(this.now());
+      this.pinFailures.set(remote, list);
+      failures = list.length;
+      this.log.warn({ callId: call.callId, attempt: call.pinAttempts, failures }, "wrong pin");
+    }
+    if (failures >= cfg.inbound.maxPinAttempts) {
+      this.pinFailures.delete(remote);
+      if (remote) this.lockouts.set(remote, this.now() + cfg.inbound.pinLockoutMinutes * 60_000);
       this.d.audit?.("pin.lockout", { callId: call.callId, provider: provider.name, minutes: cfg.inbound.pinLockoutMinutes });
       void this.d.notifyOwner(
-        `Voice: ${call.pinAttempts} wrong PIN attempts on a call from your number ${maskNumber(call.remote)} via ${provider.name}. ` +
+        `Voice: ${failures} wrong PIN attempts within a day on calls from your number ${maskNumber(call.remote)} via ${provider.name}. ` +
         `Calls from it are refused for ${cfg.inbound.pinLockoutMinutes} minutes. If this was not you, someone is spoofing your number.`,
       );
       const xml = provider.markup.sayAndHangup("Sorry, that is not right. Goodbye.", this.speech(provider));
       this.finish(call, { reason: "pin-failed" });
+      return { status: 200, markup: xml };
+    }
+    if (call.pinAttempts >= cfg.inbound.maxPinAttempts) {
+      const xml = provider.markup.sayAndHangup("Goodbye.", this.speech(provider));
+      this.finish(call, { reason: digits ? "pin-failed" : "no-pin" });
       return { status: 200, markup: xml };
     }
     return {
@@ -404,7 +454,9 @@ export class VoiceCallFlow {
       markup: provider.markup.gatherPin({
         action: this.url(provider, "pin", call.token),
         digits: PIN_GATHER_DIGITS,
-        prompt: "That is not right. Please try again, then press the pound key.",
+        prompt: digits
+          ? "That is not right. Please try again, then press the pound key."
+          : "I did not get a PIN. Please enter it, then press the pound key.",
         ...this.speech(provider),
       }),
     };
@@ -470,6 +522,7 @@ export class VoiceCallFlow {
 
     if (!this.d.live.byToken(call.token)) return { status: 200, markup: provider.markup.sayAndHangup("Goodbye.", v) };
     if (reply !== null) {
+      pending.spoken = true;
       call.pending = null;
       call.phase = "listening";
       return { status: 200, markup: this.gather(provider, call, this.renderReply(provider, reply)) };
@@ -517,6 +570,15 @@ export class VoiceCallFlow {
     if (!call || !pending || pending.turn !== turnRef.turn || pending.settled || pending.deferred) return false;
     pending.resolve(text);
     return true;
+  }
+
+  /** The pipeline failed a voice turn: answer the waiting webhook with an apology (the error text, if any, goes to Telegram). */
+  turnFailed(remote: string): void {
+    for (const call of this.d.live.all()) {
+      if (call.remote === remote && call.pending && !call.pending.settled) {
+        call.pending.resolve("Sorry, something went wrong with that request. I will send the details on Telegram.");
+      }
+    }
   }
 
   /** The pipeline finished a voice turn. A turn that sent nothing is answered with an empty reply. */
@@ -614,6 +676,7 @@ export class VoiceCallFlow {
       alias: input.alias,
       phase: "dialing",
       startedAt: now,
+      lastActivityAt: now,
       deadline: now + (ring + input.timeLimitSeconds) * 1000,
       turn: 0,
       emptyTurns: 0,

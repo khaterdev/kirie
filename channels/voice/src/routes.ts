@@ -40,8 +40,8 @@ export interface VoiceRouteDeps {
   /** Called for every request that passed the signature check. */
   onAccepted?(): void;
   log?: Logger;
-  /** Per-prefix request budget. Default 300 per minute. */
-  maxRequestsPerMinute?: number;
+  /** Refusals logged per minute before the log goes quiet (refusals are still counted). Default 20. */
+  maxRefusalLogsPerMinute?: number;
   now?: () => number;
 }
 
@@ -59,7 +59,8 @@ function forbidden(): Response {
 }
 
 function toParams(body: string): Record<string, string | string[]> {
-  const out: Record<string, string | string[]> = {};
+  // No prototype: a field named "__proto__" stays an ordinary field and is signed like any other.
+  const out = Object.create(null) as Record<string, string | string[]>;
   for (const [k, v] of new URLSearchParams(body)) {
     const cur = out[k];
     if (cur === undefined) out[k] = v;
@@ -78,13 +79,17 @@ function headersOf(req: Request): Record<string, string | undefined> {
 export function createVoiceRoutes(prefix: string, deps: VoiceRouteDeps): Hono {
   const log = deps.log ?? createModuleLogger("voice-routes");
   const now = deps.now ?? Date.now;
-  const budget = deps.maxRequestsPerMinute ?? 300;
+  const logBudget = deps.maxRefusalLogsPerMinute ?? 20;
   let windowStart = 0;
-  let windowCount = 0;
+  let windowLogs = 0;
 
+  // There is no request budget before verification: the signature check over at most
+  // 16 KB is cheap, so junk traffic can never crowd out the provider's real webhooks.
   const reject = (reason: string): Response => {
     deps.onRejected?.(reason);
-    log.warn({ prefix, reason }, "voice webhook refused");
+    const t = now();
+    if (t - windowStart >= 60_000) { windowStart = t; windowLogs = 0; }
+    if (++windowLogs <= logBudget) log.warn({ prefix, reason }, "voice webhook refused");
     return forbidden();
   };
 
@@ -96,10 +101,6 @@ export function createVoiceRoutes(prefix: string, deps: VoiceRouteDeps): Hono {
 
   /** The shared preamble. Returns the verified request and the provider, or a 403 response. */
   const verify = async (c: Context): Promise<{ provider: VoiceCallProvider; req: VoiceWebhookRequest } | Response> => {
-    const t = now();
-    if (t - windowStart >= 60_000) { windowStart = t; windowCount = 0; }
-    if (++windowCount > budget) return new Response(null, { status: 429 });
-
     if (c.req.method !== "POST") return reject("method");
     const contentType = c.req.header("content-type") ?? "";
     if (!contentType.toLowerCase().startsWith("application/x-www-form-urlencoded")) return reject("content-type");
@@ -166,5 +167,9 @@ export function createVoiceRoutes(prefix: string, deps: VoiceRouteDeps): Hono {
   });
 
   app.all("*", () => reject("route"));
+  app.onError((err) => {
+    log.error({ prefix, err: err instanceof Error ? err.message : String(err) }, "voice webhook handler failed");
+    return reject("handler error");
+  });
   return app;
 }

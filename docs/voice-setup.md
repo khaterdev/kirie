@@ -192,7 +192,7 @@ When voice is active, the agent gets `voice_call_initiate`, `voice_call_status`,
 - Calls go only to aliases in `voice.contacts`, plus `me`. Raw numbers are refused.
 - `talk` mode works only with your own number. Messages are limited to 1000 characters.
 - With `outbound.agentCalls: ask` (the default), you get an Approve / Deny card for each call. It shows the alias, the last 4 digits, the provider and the exact words. No answer within `outbound.approvalTimeoutSeconds` (120 s) means deny.
-- During a call, the agent runs with a reduced tool set (`agent.toolProfile: chat`): no shell, no file edits, no subagents, no browser, no restarts, no MCP-server changes, no background tasks, no placing calls, and never computer use. A misheard sentence must not become a command.
+- During a call, the agent runs with a reduced tool set (`agent.toolProfile: chat`): no shell, no file edits, no subagents, no browser, no restarts, no MCP-server changes, no background tasks, no placing calls, and never computer use. It also gets nothing that would run later with full tools: no relaying into another session, no scheduling, no background-task messages, no proactive triggers, and no external MCP servers from `config.yaml`. A misheard sentence must not become a command. The claude.ai connectors that load from your user settings are only excluded when `agent.strictMcpConfig` is on.
 
 ## Costs and caps
 
@@ -214,7 +214,7 @@ Do this once per provider, cheapest first:
 2. `curl https://kirie.example.com/healthz` returns `ok`. Through the tunnel, `curl -X POST https://kirie.example.com/voice/<provider>/inbound` must return **403**: it is unsigned. `https://kirie.example.com/status` must **not** answer; the control plane must not be reachable.
 3. `/call me This is a test.` Your phone rings, you hear the announcement and the message, you say something, and the reply appears in Telegram. `/voice status` then shows "last valid webhook: … ago".
 4. `/call me --talk` Have a two-turn conversation. Then ask something slow and check that you hear "One moment.", and that the answer still arrives.
-5. Inbound, if you want it: set `inbound.mode: agent`, restart, call your provider number from your phone, enter the PIN and press `#`. Then test a wrong PIN three times: you should get a Telegram alert, and for `pinLockoutMinutes` your number should be refused.
+5. Inbound, if you want it: set `inbound.mode: agent`, restart, call your provider number from your phone, enter the PIN and press `#`. Then test a wrong PIN three times: you should get a Telegram alert, and for `pinLockoutMinutes` your number should be refused. Wrong PINs are counted per number over 24 hours across calls, so hanging up between guesses does not help. Silence at the PIN prompt only ends the call.
 6. Call from a number that is not yours. It must be rejected, or must reach voicemail if you set `unknownCallers: voicemail`.
 7. On Plivo, also run the checks in the next section.
 
@@ -225,7 +225,7 @@ These are design assumptions to confirm on the first real calls.
 **Plivo:**
 
 - Whether `<GetInput>` falls through to the next element when there is no input. Plivo documents this for the older `GetDigits`, and the GetInput example implies it. Kirie places a `<Redirect>` after every GetInput as the fall-through. Check: during step 4, stay silent after a question. You should hear "Sorry, I did not catch that."
-- The full list of standard params Plivo posts with a GetInput action request. Kirie needs only the token in the URL and checks `CallUUID` when present. If turns are refused with 403 after the first answer, look at the "voice webhook refused" log lines.
+- The full list of standard params Plivo posts with a GetInput action request. Kirie needs the token in the URL, and once a call's `CallUUID` is known it requires every later webhook of that call to carry the same `CallUUID`. If Plivo's GetInput posts omit it, every turn after the PIN gets 403. If turns are refused with 403 after the first answer, look at the "voice webhook refused" log lines.
 - Plivo's timeout for action URLs. Kirie holds each webhook at most 9 s, which is within Twilio's documented 15 s limit; Plivo's limit is unknown.
 - Whether Plivo retries a webhook with the same nonce. Nonces are not treated as single-use; replay protection rests on the per-call token, the call id and the call phase.
 - Whether numbers must be sent without `+`. Kirie sends them without `+` and reads them back with `+` added. If outbound calls fail with a number-format error, this is why.
@@ -248,7 +248,7 @@ The Plivo signature check was tested against a fixture generated with Plivo's ow
 - **403 in the logs ("voice webhook refused", reason "signature")**: almost always `ingress.publicBaseUrl` differs from the URL configured in the console (scheme, host, trailing slash, a path prefix). It can also mean the auth token in `voice.env` or the credential store is wrong, or (Twilio) that the `AccountSid` does not match.
 - **"not ready"**: `/voice status` lists exactly what is missing per provider. A note such as "voice.env has mode 0644" means the file is ignored: run `chmod 600 ~/.kirie/secrets/voice.env`.
 - **Twilio debugger error 11200, or Plivo "answer URL unreachable"**: the tunnel is down, or the hostname changed.
-- **Inbound calls get "busy"**: a call is already live (`maxConcurrentCalls: 1`), or an earlier call never reported its hangup. Set the Twilio status callback URL as described above.
+- **Inbound calls get "busy"**: a call is already live (`maxConcurrentCalls: 1`), or an earlier call never reported its hangup. A live call from your own number that has had no webhook for 30 seconds is treated as ended. Set the Twilio status callback URL as described above.
 - **Call records**: `~/.kirie/voice-calls/calls.jsonl` (mode 0600). Non-owner numbers are stored masked. Audit records: `~/.kirie/logs/audit.jsonl`, feature `voice`.
 
 ## Turning it off
