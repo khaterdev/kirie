@@ -8,10 +8,14 @@
  *   and subshell or group boundaries, and recurse into nested command text:
  *   `$(..)`, backticks, `<(..)`, `>(..)`, `bash -c '<literal>'`, `eval`,
  *   `xargs`, `find -exec`, `watch`, `ssh host '<cmd>'`, `kubectl exec -- ..`,
- *   `docker exec ..`, `su -c`, `env -S`, here-docs fed to a shell.
+ *   `docker exec ..`, `su -c`, `env -S`, here-docs fed to a shell, `trap '<cmd>'`,
+ *   literal scripts a shell or `source` reads from `<(..)`, `=(..)` or
+ *   `/dev/stdin`, zsh `(e:..:)` glob qualifiers, and compound-command bodies
+ *   without a separator (`for x do ..`, `{ .. } always { .. }`).
  * - Unwrap `sudo`, `env`, `command`, `nohup`, `timeout` and friends.
  * - Mark *uncertain* instead of guessing. Anything this parser cannot read
- *   with confidence is reported, never silently accepted.
+ *   with confidence is reported, never silently accepted; a loop guard that
+ *   runs out is reported as `too-deep`.
  * - Never throw, linear in the input (each nesting level re-reads only its own
  *   text, and nesting is capped), no regular expression with nested
  *   quantifiers.
@@ -109,6 +113,10 @@ export const SHELL_MAX_CERTAIN_LENGTH = 8000;
 /** Nesting depth limit for `$(..)`, `bash -c`, `eval`, ... */
 export const SHELL_MAX_DEPTH = 16;
 const MAX_UNWRAP = 24;
+/** Past MAX_UNWRAP the rest is unwrapped again one nesting level down, while it is at most this many words. */
+const MAX_REUNWRAP_WORDS = 2000;
+/** Compound-command bodies split out of one segment (`for x do ..`, `while ((..)) { .. }`) per parse. */
+const MAX_BODY_SPLITS = 16;
 const MAX_BRACE_EXPANSION = 64;
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh", "yash", "posh", "rbash"]);
@@ -237,10 +245,11 @@ class Scanner {
         this.readHeredocBodies();
         continue;
       }
-      if (c === "#") {
+      if (c === "#" && this.commentStartsAt(this.i)) {
         while (this.i < s.length && s[this.i] !== "\n") this.i++;
         continue;
       }
+      if (c === "(" && this.readGlobQualifier()) continue;
       if (c === "(" && s[this.i + 1] === "(") {
         // Arithmetic command (( .. )): a single word, never a here-doc or a command list.
         const end = findArithEnd(s, this.i + 2);
@@ -281,12 +290,70 @@ class Scanner {
           continue;
         }
       }
-      this.tokens.push({ t: "word", w: this.readWord() });
+      this.pushWord(this.readWord());
     }
     if (this.pending.length > 0) {
       this.problems.push({ code: "unterminated-heredoc", detail: "here-document without its body" });
       this.pending = [];
     }
+  }
+
+  /**
+   * True when a `#` at `i` starts a comment: only at the start of a word, after
+   * a blank or an operator. Right after a word (`<(x)#y`, `((1))#y`) or after a
+   * carriage return (not a blank to the shell) it is word text (GATES-B2).
+   */
+  private commentStartsAt(i: number): boolean {
+    if (i === 0) return true;
+    const p = this.s[i - 1];
+    return p === " " || p === "\t" || p === "\n" || p === ";" || p === "&" || p === "|" || p === "(";
+  }
+
+  /** A word token; text glued to the previous word (after `<(..)` or `((..))`) is the same shell word. */
+  private pushWord(w: Word): void {
+    const last = this.tokens[this.tokens.length - 1];
+    if (last?.t === "word" && last.w.end === w.start) {
+      const a = last.w;
+      last.w = {
+        value: a.value + w.value,
+        quotedMask: [...a.quotedMask, ...w.quotedMask],
+        raw: this.s.slice(a.start, w.end),
+        start: a.start,
+        end: w.end,
+        quoted: a.quoted || w.quoted,
+        expansion: a.expansion || w.expansion,
+        glob: a.glob || w.glob,
+        subs: [...a.subs, ...w.subs],
+      };
+      return;
+    }
+    this.tokens.push({ t: "word", w });
+  }
+
+  /**
+   * `(` glued to a word: a zsh glob qualifier (`*(e:'cmd':)`, `*(+fn)`, `*(.)`)
+   * or an extended pattern (`!(x)`). Read as part of the word and reported as
+   * uncertain; `e`-qualifier code is parsed as a command too. Not for array
+   * assignments (`a=(..)`) or function definitions (`f()`). Returns false when
+   * this `(` is not one.
+   */
+  private readGlobQualifier(): boolean {
+    const s = this.s;
+    const last = this.tokens[this.tokens.length - 1];
+    if (last?.t !== "word" || last.w.end !== this.i || last.w.value.endsWith("=")) return false;
+    let k = this.i + 1;
+    while (isBlank(s[k])) k++;
+    if (s[k] === ")") return false;
+    const end = findParenEnd(s, this.i + 1);
+    if (end === -1) return false;
+    const inner = s.slice(this.i + 1, end);
+    const subs = [...this.collectSubstitutions(inner), ...globQualifierCode(inner)];
+    this.problems.push({ code: "glob-qualifier", detail: "zsh glob qualifiers and extended patterns can run code; not analysed in full" });
+    const text = s.slice(this.i, end + 1);
+    const a = last.w;
+    last.w = { ...a, value: a.value + text, quotedMask: [...a.quotedMask, ...Array.from({ length: text.length }, () => false)], raw: s.slice(a.start, end + 1), end: end + 1, glob: true, subs: [...a.subs, ...subs] };
+    this.i = end + 1;
+    return true;
   }
 
   private readOperator(): void {
@@ -313,7 +380,8 @@ class Scanner {
     this.i += op.length;
     while (isBlank(s[this.i])) this.i++;
     const token: Extract<Token, { t: "redir" }> = { t: "redir", op, start, end: this.i, ...(fd !== undefined ? { fd } : {}) };
-    if (this.i >= s.length || isOpChar(s[this.i])) {
+    const procSub = (s[this.i] === "<" || s[this.i] === ">") && s[this.i + 1] === "(";
+    if (this.i >= s.length || (isOpChar(s[this.i]) && !procSub)) {
       this.problems.push({ code: "parse-error", detail: `redirect ${op} without a target` });
       this.tokens.push(token);
       return;
@@ -396,8 +464,8 @@ class Scanner {
       for (let k = 0; k < text.length; k++) mask.push(q);
     };
 
-    // Process substitution at the start of a word: <( .. ) and >( .. )
-    if ((s[this.i] === "<" || s[this.i] === ">") && s[this.i + 1] === "(") {
+    // Process substitution at the start of a word: <( .. ), >( .. ) and zsh's =( .. )
+    if ((s[this.i] === "<" || s[this.i] === ">" || s[this.i] === "=") && s[this.i + 1] === "(") {
       const kind = `${s[this.i]}()`;
       const end = findParenEnd(s, this.i + 2);
       if (end === -1) {
@@ -487,6 +555,18 @@ class Scanner {
         push(s.slice(this.i, r.end + 1), false);
         this.i = r.end + 1;
         continue;
+      }
+      if (c === "[" && !quoted && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+        // NAME[subscript]=value: bash reads the subscript as one piece (`a[1<<2]=5` is no here-document).
+        const close = assignmentSubscriptEnd(s, this.i);
+        if (close !== -1) {
+          const sub = s.slice(this.i, close + 1);
+          if (sub.includes("$(") || sub.includes("`")) subs.push(...this.collectSubstitutions(sub));
+          if (sub.includes("$")) expansion = true;
+          push(sub, false);
+          this.i = close + 1;
+          continue;
+        }
       }
       if (c === "*" || c === "?" || c === "[") glob = true;
       push(c, false);
@@ -654,6 +734,43 @@ function findDoubleQuoteEnd(s: string, from: number, nesting = 0): number {
     i++;
   }
   return -1;
+}
+
+/** Index of the `]` closing an assignment subscript that starts at `open`, when `=` or `+=` follows it; else -1. */
+function assignmentSubscriptEnd(s: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < s.length && i < open + 4096; i++) {
+    const c = s[i];
+    if (c === "\n") return -1;
+    if (c === "[") depth++;
+    else if (c === "]") {
+      depth--;
+      if (depth === 0) return s[i + 1] === "=" || (s[i + 1] === "+" && s[i + 2] === "=") ? i : -1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Code run by zsh glob qualifiers: `e` (and `oe`/`Oe` sorting) followed by a
+ * delimited string. Quotes inside are removed the way the shell would before
+ * zsh evaluates the string.
+ */
+function globQualifierCode(inner: string): Sub[] {
+  const out: Sub[] = [];
+  const pairs: Readonly<Record<string, string>> = { "[": "]", "{": "}", "<": ">", "(": ")" };
+  for (let i = 0; i < inner.length && out.length < 8; i++) {
+    if (inner[i] !== "e" || i + 1 >= inner.length) continue;
+    const open = inner[i + 1]!;
+    if (/[A-Za-z0-9\s]/.test(open)) continue;
+    const close = pairs[open] ?? open;
+    const end = inner.indexOf(close, i + 2);
+    if (end === -1) continue;
+    const code = inner.slice(i + 2, end).replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1");
+    out.push({ text: code, kind: "glob (e)" });
+    i = end;
+  }
+  return out;
 }
 
 function findArithEnd(s: string, from: number): number {
@@ -992,8 +1109,52 @@ function skipOptions(words: Word[], from: number, valueOpts: ReadonlySet<string>
   return i;
 }
 
+/** True for paths that are the shell's own standard input. */
+function isStdinPath(v: string): boolean {
+  return v === "/dev/stdin" || v === "/dev/fd/0" || v === "/proc/self/fd/0";
+}
+
+/**
+ * The text a substituted command prints when it is a fully literal `echo` or
+ * `printf` (`<(echo 'rm -rf ~')`), else null. Scans tokens only, never builds
+ * segments, so it cannot recurse.
+ */
+function literalCommandOutput(text: string): string | null {
+  const sc = new Scanner(text);
+  try {
+    sc.run();
+  } catch {
+    return null;
+  }
+  if (sc.problems.length > 0) return null;
+  const toks = sc.tokens.filter((t) => !(t.t === "op" && t.op === "\n"));
+  if (toks.length === 0 || toks.some((t) => t.t !== "word")) return null;
+  const ws = toks.map((t) => (t as Extract<Token, { t: "word" }>).w);
+  const cmd = normalizeCmd(ws[0]!.value);
+  if (cmd !== "echo" && cmd !== "printf") return null;
+  if (ws.slice(1).some((w) => w.expansion || w.subs.length > 0)) return null;
+  const rest = ws.slice(1).map((w) => w.value);
+  if (cmd === "echo") while (rest[0] !== undefined && /^-[neE]+$/.test(rest[0])) rest.shift();
+  return rest.join(" ") || null;
+}
+
+/**
+ * When a word is a process substitution (`<(..)`, zsh `=(..)`) used as a file
+ * of commands: the literal script text if it can be read, else null. Returns
+ * undefined when the word is no such substitution.
+ */
+function substitutionScript(w: Word | undefined): { literal: string | null } | undefined {
+  if (!w) return undefined;
+  const fileSubs = w.subs.filter((x) => x.kind === "<()" || x.kind === "=()");
+  if (fileSubs.length === 0) return undefined;
+  const whole = fileSubs.length === 1 && w.subs.length === 1 && /^[<=]\(/.test(w.raw) && w.raw.endsWith(")") && w.value === w.raw;
+  return { literal: whole ? literalCommandOutput(fileSubs[0]!.text) : null };
+}
+
 /** The parser proper. */
 class ShellParser {
+  private bodySplits = 0;
+
   constructor(private readonly st: BuildState) {}
 
   parseText(text: string, meta: Meta, cwd: string | null): void {
@@ -1118,27 +1279,59 @@ class ShellParser {
   ): number {
     const st = this.st;
     let words = inWords.map((w) => substituteKnownVar(w, vars));
+    const unquoted = (w: Word | undefined, ...values: string[]): boolean => w !== undefined && !w.quoted && values.includes(w.value);
 
-    // Reserved words in command position.
-    for (let guard = 0; guard < 64 && words.length > 0 && !words[0]!.quoted; guard++) {
-      const v = words[0]!.value;
-      if (RESERVED_PREFIX.has(v) || RESERVED_SKIP.has(v)) {
-        words = words.slice(1);
-        if (v === "time") while (words[0] && (words[0].value === "-p" || words[0].value === "--")) words = words.slice(1);
-        continue;
-      }
-      break;
+    // Reserved words in command position (one pass, no limit: every one is stripped).
+    let k = 0;
+    let condition = false;
+    while (k < words.length && !words[k]!.quoted && (RESERVED_PREFIX.has(words[k]!.value) || RESERVED_SKIP.has(words[k]!.value))) {
+      const v = words[k]!.value;
+      if (v === "while" || v === "until" || v === "if" || v === "elif") condition = true;
+      k++;
+      if (v === "time") while (k < words.length && (words[k]!.value === "-p" || words[k]!.value === "--")) k++;
     }
-    if (words[0] && !words[0].quoted && words[0].value === "function") {
+    if (k > 0) words = words.slice(k);
+    if (unquoted(words[0], "function")) {
       // `function NAME { body` : the body starts a command of its own.
       if (words[1]) st.functions.add(words[1].value);
       words = words.slice(2);
-      while (words.length > 0 && !words[0]!.quoted && RESERVED_PREFIX.has(words[0]!.value)) words = words.slice(1);
+      let j = 0;
+      while (j < words.length && !words[j]!.quoted && RESERVED_PREFIX.has(words[j]!.value)) j++;
+      words = words.slice(j);
+    }
+    const splitBudget = (): boolean => {
+      if (++this.bodySplits <= MAX_BODY_SPLITS) return true;
+      if (this.bodySplits === MAX_BODY_SPLITS + 1) st.uncertain.push({ code: "too-deep", detail: `more than ${MAX_BODY_SPLITS} compound commands without separators` });
+      return false;
+    };
+    // zsh `{ try } always { finally }` in one segment: both blocks run.
+    const alwaysAt = words.findIndex((w, idx) => idx > 0 && unquoted(w, "always") && unquoted(words[idx - 1], "}"));
+    if (alwaysAt !== -1 && splitBudget()) {
+      st.uncertain.push({ code: "zsh-always", detail: "zsh always blocks are read as separate commands", ...(meta.parent !== undefined ? { segment: meta.parent } : {}) });
+      this.emitSegment(raw, words.slice(0, alwaysAt - 1), [], meta, group, stage, cwd, vars);
+      return this.emitSegment(raw, words.slice(alwaysAt + 1), redirTokens, meta, group, stage, cwd, vars);
     }
     const first = words[0];
-    if (first && !first.quoted && (first.value === "for" || first.value === "select" || first.value === "case")) {
+    if (unquoted(first, "for", "select")) {
+      // `for x do body`, `for ((..)) do body`, `for ((..)) { body; }`: the body needs no separator.
+      const bodyAt = words.findIndex((w, idx) => idx >= 2 && unquoted(w, "do", "{"));
+      if (bodyAt !== -1 && splitBudget()) {
+        this.recurseSubs(words.slice(0, bodyAt), [], meta, cwd, undefined);
+        return this.emitSegment(raw, words.slice(bodyAt + 1), redirTokens, meta, group, stage, cwd, vars);
+      }
       this.recurseSubs(words, redirTokens, meta, cwd, undefined);
       return -1;
+    }
+    if (unquoted(first, "case")) {
+      this.recurseSubs(words, redirTokens, meta, cwd, undefined);
+      return -1;
+    }
+    if (condition || (first !== undefined && first.quoted && first.raw.startsWith("((")) || unquoted(first, "[[")) {
+      // zsh short forms (`while ((1)) { .. }`, `if [[ x ]] { .. }`): the body after `{`, `do` or `then` is a command too.
+      const bodyAt = words.findIndex((w, idx) => idx >= 1 && unquoted(w, "{", "do", "then"));
+      if (bodyAt !== -1 && bodyAt + 1 < words.length && splitBudget()) {
+        this.emitSegment(raw, words.slice(bodyAt + 1), [], meta, group, stage, cwd, vars);
+      }
     }
     if (words.length === 0 && redirTokens.length === 0) return -1;
     const wordsWithAssignments = words;
@@ -1207,7 +1400,7 @@ class ShellParser {
     }
 
     this.recurseSubs(wordsWithAssignments, redirTokens, meta, cwd, index);
-    this.unwrap(segment, expanded, meta, cwd, index);
+    this.unwrap(segment, expanded, meta, cwd, index, redirTokens);
     let info = st.groups.get(segment.group);
     if (!info) {
       info = { decoder: false, byStage: new Map() };
@@ -1228,7 +1421,7 @@ class ShellParser {
   }
 
   /** Strips wrappers off `segment` and recurses into nested command text. */
-  private unwrap(segment: ShellSegment, initial: Array<{ w: Word; value: string }>, meta: Meta, cwd: string | null, index: number): void {
+  private unwrap(segment: ShellSegment, initial: Array<{ w: Word; value: string }>, meta: Meta, cwd: string | null, index: number, redirTokens: Extract<Token, { t: "redir" }>[] = []): void {
     const st = this.st;
     let items = initial;
     segment.fullArgv = items.map((x) => x.value);
@@ -1272,7 +1465,48 @@ class ShellParser {
     };
     const wordsOf = (xs: Array<{ w: Word; value: string }>): Word[] => xs.map((x) => ({ ...x.w, value: x.value }));
 
-    for (let guard = 0; guard < MAX_UNWRAP && items.length > 0; guard++) {
+    /**
+     * A shell reading a script from a substitution or a file descriptor: parse
+     * the literal script when it is one, mark it uncertain either way. Returns
+     * true when `w` was such a source.
+     */
+    const scriptSource = (w: Word | undefined, name: string): boolean => {
+      const sub = substitutionScript(w);
+      if (sub) {
+        uncertain("script-substitution", `${name} runs the output of a command as a script`);
+        if (sub.literal) nested(sub.literal, `${name} <()`);
+        return true;
+      }
+      const fd = w ? /^\/dev\/fd\/([1-9][0-9]*)$/.exec(w.value) : null;
+      if (fd) {
+        const from = redirTokens.find((r) => r.fd === fd[1] && (r.op === "<" || r.op === "<>"));
+        if (!scriptSource(from?.target, name)) uncertain("source-file", `${name} runs commands from file descriptor ${fd[1]}`);
+        return true;
+      }
+      return false;
+    };
+    /** Commands read from standard input (here-doc, here-string, pipe, `< file`). */
+    const stdinScript = (name: string): void => {
+      if (segment.stdinText !== undefined) {
+        uncertain("heredoc-to-shell", `a here-document is run by ${name}`);
+        nested(segment.stdinText, `${name} <<`);
+        return;
+      }
+      if (segment.stage > 0) {
+        const info = st.groups.get(segment.group);
+        if (info?.decoder) uncertain("decode-to-shell", `decoded input is run by ${name}`);
+        else uncertain("pipe-to-shell", `input piped into ${name} is run as commands`);
+        const literal = literalOutputOf(info?.byStage.get(segment.stage - 1));
+        if (literal) nested(literal, `${name} <|`);
+        return;
+      }
+      const input = redirTokens.find((r) => r.op === "<" && r.fd === undefined);
+      if (input && scriptSource(input.target, name)) return;
+      uncertain("source-file", `${name} runs commands from its input`);
+    };
+
+    let guard = 0;
+    for (; guard < MAX_UNWRAP && items.length > 0; guard++) {
       const head = items[0]!;
       if (head.w.expansion || head.w.glob) {
         uncertain("dynamic-command", `the command name "${head.value}" is computed at run time`);
@@ -1425,19 +1659,12 @@ class ShellParser {
           break;
         }
         const scriptArg = ws[j];
-        if (!scriptArg || readsStdin) {
-          if (segment.stdinText !== undefined) {
-            uncertain("heredoc-to-shell", `a here-document is run by ${cmd}`);
-            nested(segment.stdinText, `${cmd} <<`);
-          } else if (segment.stage > 0) {
-            const info = st.groups.get(segment.group);
-            if (info?.decoder) uncertain("decode-to-shell", `decoded input is run by ${cmd}`);
-            else uncertain("pipe-to-shell", `input piped into ${cmd} is run as commands`);
-            const literal = literalOutputOf(info?.byStage.get(segment.stage - 1));
-            if (literal) nested(literal, `${cmd} <|`);
-          } else if (!scriptArg && segment.redirects.some((r) => r.op === "<")) {
-            uncertain("source-file", `${cmd} runs commands from a file`);
+        if (!scriptArg || readsStdin || isStdinPath(scriptArg.value)) {
+          if (segment.stdinText !== undefined || segment.stage > 0 || redirTokens.some((r) => r.op === "<" && r.fd === undefined) || scriptArg) {
+            stdinScript(cmd);
           }
+        } else {
+          scriptSource(scriptArg, cmd);
         }
         break;
       }
@@ -1451,7 +1678,25 @@ class ShellParser {
       }
       if (cmd === "source" || cmd === ".") {
         const target = items[1];
-        if (!target || !target.w.subs.length) uncertain("source-file", `${cmd} runs commands from a file`);
+        if (target && isStdinPath(target.value)) stdinScript(cmd);
+        else if (!scriptSource(target ? { ...target.w, value: target.value } : undefined, cmd)) uncertain("source-file", `${cmd} runs commands from a file`);
+        break;
+      }
+      if (cmd === "trap") {
+        // trap '<commands>' SIGNAL...: the commands run later, in this shell.
+        let j = 1;
+        while (j < items.length && items[j]!.value.startsWith("-") && items[j]!.value !== "-") {
+          const opt = items[j]!.value;
+          j++;
+          if (opt === "--") break;
+          if (opt === "-l" || opt === "-p" || opt === "-P") { j = items.length; break; }
+        }
+        const action = items[j];
+        if (action && action.value !== "-" && action.value !== "") {
+          segment.wrappers.push("trap");
+          if (action.w.expansion) uncertain("trap-dynamic", "trap with a computed command");
+          nested(action.value, "trap");
+        }
         break;
       }
       if (cmd === "alias" || cmd === "unalias") {
@@ -1550,6 +1795,11 @@ class ShellParser {
         break;
       }
       break;
+    }
+    if (guard >= MAX_UNWRAP && items.length > 0) {
+      // Ran out of unwraps: never a silent stop. Uncertain, and the rest is unwrapped one level down.
+      uncertain("too-deep", `more than ${MAX_UNWRAP} wrappers`);
+      if (items.length <= MAX_REUNWRAP_WORDS) nestedWords(items, "wrapper");
     }
 
     segment.argv = items.map((x) => x.value);
