@@ -245,6 +245,44 @@ describe("ApprovalEngine behaviour", () => {
     expect(e.evaluate(bash("rm -rf /", chatCtx({ kind: "webhook", interactive: false }))).decision).toBe("deny");
   });
 
+  it("feature state stores: file tools and shell writes ask in ask mode, run (audited) in yolo", () => {
+    const ask = engine({ mode: "ask" });
+    const yolo = engine();
+    const stores = ["goals.db", "learning.db", "accounts.db", "checkpoints.db", "webhooks.db", "loops.db", "state/plugin-approvals.json", "state/plugin-cache/x", "state/runtime-settings.json", "logs/audit.jsonl", "plugins/p/index.js"];
+    for (const f of stores) {
+      const path = `${DATA}/${f}`;
+      for (const call of [
+        tool("Write", { file_path: path, content: "x" }),
+        tool("Edit", { file_path: path, old_string: "a", new_string: "b" }),
+        bash(`echo x > ${path}`),
+        bash(`cp /tmp/x ${path}`),
+        bash(`rm ${path}`),
+        bash(`mv ${path} /tmp/old`),
+      ]) {
+        const label = `${call.tool} ${f} ${String(call.input.command ?? "")}`;
+        const ev = ask.evaluate(call);
+        expect(ev.decision, label).toBe("ask");
+        expect(ev.findings.map((x) => x.ruleId), label).toContain("fs.protected-write");
+        const y = yolo.evaluate(call);
+        expect(y.decision, label).toBe("allow");
+        expect(y.findings.length, label).toBeGreaterThan(0);
+      }
+    }
+    expect(ask.evaluate(bash(`sqlite3 ${DATA}/goals.db "UPDATE checks SET command='true'"`)).findings.map((f) => f.ruleId)).toContain("kirie.control");
+  });
+
+  it("webhook work (kind or origin): ask mode with unattended deny, whatever the global mode", () => {
+    const webhookCtx = chatCtx({ kind: "webhook", interactive: false, ownerDm: false, taskId: "t-1", label: "webhook task t-1" });
+    for (const mode of ["yolo", "ask"] as const) {
+      const e = engine({ mode });
+      expect(e.evaluate(bash("rm -rf build", webhookCtx)).decision, mode).toBe("ask");
+      expect(e.evaluate(bash("python3 -c 'import os'", webhookCtx)).decision, mode).toBe("ask");
+      expect(e.evaluate(bash("ls -la", webhookCtx)).decision, mode).toBe("allow");
+      expect(e.evaluate(bash("rm -rf ~", webhookCtx)).decision, mode).toBe("deny");
+      expect(e.evaluate(tool("Write", { file_path: `${HOME}/.zshrc`, content: "" }, webhookCtx)).decision, mode).toBe("ask");
+    }
+  });
+
   it("inside the network-less docker sandbox dangerous rules are skipped, hardline and deny still apply", () => {
     const sandbox: ApprovalSandboxInfo = { mode: "docker", network: "none" };
     const e = engine({ mode: "ask", deny: ["terraform *"] }, { sandbox });

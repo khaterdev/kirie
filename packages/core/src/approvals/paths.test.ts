@@ -118,6 +118,23 @@ describe("protected lists", () => {
     }
   });
 
+  it("protect every feature state store and tamper-evident file the plan defines (one test per path)", () => {
+    const paths = [
+      "~/.kirie/plugins/my-plugin/index.js", "~/.kirie/plugins/my-plugin/plugin.json",
+      "~/.kirie/state/plugin-approvals.json", "~/.kirie/state/plugin-approvals.json.tmp",
+      "~/.kirie/state/plugin-cache/abc/file", "~/.kirie/state/runtime-settings.json",
+      "~/.kirie/state/runtime-settings.json.corrupt-1700000000", "~/.kirie/logs/audit.jsonl", "~/.kirie/logs/audit.jsonl.1",
+      "~/.kirie/goals.db", "~/.kirie/goals.db-wal", "~/.kirie/goals.db-shm", "~/.kirie/learning.db", "~/.kirie/learning.db-wal",
+      "~/.kirie/accounts.db", "~/.kirie/accounts.db-journal", "~/.kirie/checkpoints.db", "~/.kirie/webhooks.db",
+      "~/.kirie/loops.db", "~/.kirie/loops.db-wal",
+    ];
+    for (const p of paths) expect(approvalPathMatches(n(p), write), p).toBe(true);
+    // Not over-broad: ordinary files next to them stay writable.
+    for (const p of ["~/.kirie/workspace/notes.md", "~/.kirie/logs/daemon.log", "~/.kirie/media/x.png"]) {
+      expect(approvalPathMatches(n(p), write), p).toBe(false);
+    }
+  });
+
   it("are case-insensitive", () => {
     expect(approvalPathMatches(n("~/.SSH/ID_RSA"), read)).toBe(true);
     expect(approvalPathMatches(n("~/.Kirie/Config.YAML"), write)).toBe(true);
