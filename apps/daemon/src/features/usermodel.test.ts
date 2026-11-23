@@ -97,7 +97,7 @@ describe("usermodel feature", () => {
     const run = vi.spyOn(system.deriver, "run");
     const maybe = vi.spyOn(system.deriver, "maybeRun");
     for (let t = 1; t <= 20; t++) ctx.heartbeat.emit("tick", { tickNumber: t * 60, timestamp: Date.now(), pendingRetries: 0, scheduleFires: 0, sessionsPruned: 0 });
-    ctx.turnListeners.forEach((l) => l({ sessionKey: `telegram:dm:${OWNER}`, origin: "owner_message", channel: "telegram", senderId: OWNER, senderRole: "owner", startedAt: 0, endedAt: 1, durationMs: 1, result: {} as never }));
+    ctx.turnListeners.forEach((l) => l({ sessionKey: `telegram:dm:${OWNER}`, origin: "owner_message", channel: "telegram", senderId: OWNER, senderRole: "owner", startedAt: 0, endedAt: 1, durationMs: 1, result: {} as never, inputs: { chatType: "dm", forwarded: false, replyContext: false, taskResults: false, attachments: false } }));
     expect(run).not.toHaveBeenCalled();
     expect(maybe).not.toHaveBeenCalled();
     expect(ctx.promptAddenda.render(OWNER_DM)).toBe("");

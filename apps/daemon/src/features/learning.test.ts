@@ -60,6 +60,7 @@ function ownerTurn(n: number): TurnCompleteEvent {
     sessionKey: `telegram:dm:${OWNER}`, origin: "owner_message", channel: "telegram", senderId: OWNER, senderRole: "owner",
     userMsgId: n * 2, assistantMsgId: n * 2 + 1, startedAt: now - 1000, endedAt: now, durationMs: 1000,
     result: { response: "ok", sessionId: "s", costUsd: 0, numTurns: 1, isError: false } as ExecutionResult,
+    inputs: { chatType: "dm", forwarded: false, replyContext: false, taskResults: false, attachments: false },
   };
 }
 
