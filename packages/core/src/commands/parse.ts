@@ -68,7 +68,153 @@ export function splitCommandArgs(args: string): string[] {
   return out;
 }
 
-const DURATION_RE = /^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i;
+/** Opening quote -> the characters that may close it. A straight or typographic quote of the other kind inside a value is literal. */
+const QUOTE_CLOSERS: Record<string, string> = {
+  '"': '"',
+  "“": "”",
+  "”": "”",
+  "„": "“”",
+  "'": "'",
+  "‘": "’",
+  "’": "’",
+};
+const DOUBLE_QUOTE_OPENERS = '"“”„';
+/** "--name" anywhere; an en or em dash only for a known name (iOS turns "--" into "—"). */
+const FLAG_AT_RE = /^(--|[–—])([A-Za-z][A-Za-z0-9_-]*)(?==|\s|$)/;
+
+export interface TextAndFlags {
+  /** The free text, verbatim (apostrophes, quotes and backslashes are literal) */
+  text: string;
+  /** Flags in the order given; names lowercased */
+  flags: Array<{ name: string; value: string }>;
+}
+
+export interface TextAndFlagsOptions {
+  /** Flag names (lowercase, without dashes) that take one value each */
+  flags: readonly string[];
+  /** Allow the free text after the flags (when none came before them). Default false */
+  textAfterFlags?: boolean;
+}
+
+function isSpace(ch: string | undefined): boolean {
+  return ch !== undefined && /\s/.test(ch);
+}
+
+/** Index of the quote closing the one at `open`: a closer followed by whitespace or the end. -1 when none. */
+function closingQuote(s: string, open: number): number {
+  const closers = QUOTE_CLOSERS[s[open]!];
+  if (!closers) return -1;
+  for (let i = open + 1; i < s.length; i++) {
+    if (closers.includes(s[i]!) && (i + 1 === s.length || isSpace(s[i + 1]))) return i;
+  }
+  return -1;
+}
+
+/** A flag starting at `i` (which must follow whitespace or the start). */
+function flagAt(s: string, i: number, known: ReadonlySet<string>): { name: string; end: number; dash: string } | null {
+  if (i > 0 && !isSpace(s[i - 1])) return null;
+  const m = FLAG_AT_RE.exec(s.slice(i));
+  if (!m) return null;
+  const name = m[2]!.toLowerCase();
+  if (m[1] !== "--" && !known.has(name)) return null;
+  return { name, end: i + m[0].length, dash: m[1]! };
+}
+
+/**
+ * Split `text [--flag value]...` without shell quoting rules on the text.
+ *
+ * The free text is taken verbatim up to the first flag-looking word ("--x",
+ * or "—x" / "–x" for a known x), so an apostrophe or a typographic quote in
+ * prose never hides a flag. The text may also be given in double quotes
+ * (straight or typographic) when it must contain "--". Each flag takes one
+ * value: `--x=value`, `--x value`, or a quoted value (`"…"`, `'…'`, `“…”`,
+ * `‘…’`) that ends at a matching quote followed by whitespace or the end, so
+ * quotes inside the value are kept. Anything that cannot be read one way only
+ * is an error: an unknown `--x`, a missing value, an unclosed quote, or more
+ * text after a flag's value.
+ */
+export function parseTextAndFlags(raw: string, opts: TextAndFlagsOptions): TextAndFlags | { error: string } {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  const known = new Set(opts.flags);
+  const out: TextAndFlags = { text: "", flags: [] };
+  let i = 0;
+  let quotedText = false;
+
+  const firstFlagFrom = (from: number): number => {
+    for (let j = from; j < s.length; j++) if (flagAt(s, j, known)) return j;
+    return -1;
+  };
+
+  // Quoted text counts as such only when it is all the text before the flags;
+  // otherwise its quotes are part of the prose.
+  let firstFlag = -1;
+  if (s.length > 0 && DOUBLE_QUOTE_OPENERS.includes(s[0]!)) {
+    const close = closingQuote(s, 0);
+    if (close > 0) {
+      const next = firstFlagFrom(close + 1);
+      if (!s.slice(close + 1, next === -1 ? s.length : next).trim()) {
+        out.text = s.slice(1, close);
+        quotedText = true;
+        firstFlag = next;
+      }
+    }
+  }
+  if (!quotedText) {
+    firstFlag = firstFlagFrom(0);
+    out.text = s.slice(0, firstFlag === -1 ? s.length : firstFlag).trim();
+  }
+  if (firstFlag === -1) return out;
+
+  i = firstFlag;
+  while (i < s.length) {
+    while (isSpace(s[i])) i++;
+    if (i >= s.length) break;
+    const flag = flagAt(s, i, known);
+    if (!flag) {
+      const rest = s.slice(i).trim();
+      const last = out.flags[out.flags.length - 1]!;
+      if (opts.textAfterFlags && !out.text && !quotedText) {
+        for (let j = i; j < s.length; j++) {
+          const f = flagAt(s, j, known);
+          if (f) return { error: `--${f.name} must come before the text or right after the other options.` };
+        }
+        out.text = rest;
+        break;
+      }
+      return {
+        error: `Unexpected text after --${last.name} ${clipForError(last.value)}: "${clipForError(rest)}". Write the text first, then the options, and put a value with spaces in quotes.`,
+      };
+    }
+    if (!known.has(flag.name)) return { error: `Unknown option ${flag.dash}${flag.name}.` };
+    i = flag.end;
+    let value: string;
+    if (s[i] === "=") {
+      i++;
+    } else {
+      while (isSpace(s[i])) i++;
+    }
+    if (i >= s.length || (s[i - 1] !== "=" && flagAt(s, i, known))) return { error: `--${flag.name} needs a value.` };
+    if (QUOTE_CLOSERS[s[i]!]) {
+      const close = closingQuote(s, i);
+      if (close === -1) return { error: `The quote after --${flag.name} is not closed.` };
+      value = s.slice(i + 1, close);
+      i = close + 1;
+    } else {
+      const start = i;
+      while (i < s.length && !isSpace(s[i])) i++;
+      value = s.slice(start, i);
+    }
+    out.flags.push({ name: flag.name, value });
+  }
+  return out;
+}
+
+function clipForError(text: string): string {
+  const one = text.replace(/\s+/g, " ");
+  return one.length > 60 ? `${one.slice(0, 59)}…` : one;
+}
+
+const DURATION_RE =/^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i;
 const UNIT_MS = [7 * 86_400_000, 86_400_000, 3_600_000, 60_000, 1000] as const;
 
 /**

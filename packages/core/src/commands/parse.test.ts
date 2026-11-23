@@ -6,6 +6,7 @@ import {
   parseIntInRange,
   parseOnOff,
   splitCommandArgs,
+  parseTextAndFlags,
 } from "./parse.js";
 
 describe("parseCommandText", () => {
@@ -127,5 +128,27 @@ describe("parseOnOff", () => {
     expect(parseOnOff("off")).toBe(false);
     expect(parseOnOff("no")).toBe(false);
     expect(parseOnOff("maybe")).toBeNull();
+  });
+});
+
+describe("parseTextAndFlags", () => {
+  const flags = ["check", "budget"] as const;
+
+  it("takes the text verbatim up to the first flag", () => {
+    expect(parseTextAndFlags(`the user's “thing” \\ ok --budget 2`, { flags })).toEqual({
+      text: "the user's “thing” \\ ok",
+      flags: [{ name: "budget", value: "2" }],
+    });
+  });
+
+  it("allows text after the flags only when asked and when none came before", () => {
+    expect(parseTextAndFlags("--budget 2 do it", { flags, textAfterFlags: true })).toEqual({ text: "do it", flags: [{ name: "budget", value: "2" }] });
+    expect(parseTextAndFlags("--budget 2 do it", { flags })).toMatchObject({ error: expect.stringContaining("Unexpected text") });
+    expect(parseTextAndFlags("a --budget 2 do it", { flags, textAfterFlags: true })).toMatchObject({ error: expect.stringContaining("Unexpected text") });
+    expect(parseTextAndFlags("--budget 2 do it --check x", { flags, textAfterFlags: true })).toMatchObject({ error: expect.stringContaining("--check must come before") });
+  });
+
+  it("treats an en or em dash as a flag only for a known name", () => {
+    expect(parseTextAndFlags("wait —really —budget 2", { flags })).toEqual({ text: "wait —really", flags: [{ name: "budget", value: "2" }] });
   });
 });

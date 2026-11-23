@@ -11,7 +11,7 @@ import { GoalsConfigSchema, type GoalsConfig } from "../config/sections/goals.js
 import { GoalStore } from "./goal-store.js";
 import type { BackgroundTask } from "../engine/background-task-store.js";
 import { GoalController, type GoalControllerDeps } from "./goal-controller.js";
-import { createGoalCommands, parseGoalStartArgs, resolveGoalCwd, GOAL_OFF_TEXT } from "./commands.js";
+import { createGoalCommands, parseGoalStartText, resolveGoalCwd, GOAL_OFF_TEXT } from "./commands.js";
 
 const OWNER = "1001";
 const STRANGER = "2002";
@@ -23,38 +23,80 @@ function msg(text: string, senderId = OWNER): UnifiedMessage {
   } as UnifiedMessage;
 }
 
-describe("parseGoalStartArgs", () => {
+describe("parseGoalStartText", () => {
   it("parses text and every flag", () => {
-    const r = parseGoalStartArgs(
-      ["fix", "the", "tests", "--check", "pnpm vitest run", "--check=pnpm lint", "--rounds", "8", "--time", "1h30m", "--budget", "$5", "--cwd", "/tmp"],
+    const r = parseGoalStartText(
+      `fix the tests --check "pnpm vitest run" --check="pnpm lint" --rounds 8 --time 1h30m --budget $5 --cwd /tmp`,
       { maxChecks: 5 },
     );
     expect(r).toEqual({ text: "fix the tests", checks: ["pnpm vitest run", "pnpm lint"], rounds: 8, minutes: 90, budgetUsd: 5, cwd: "/tmp" });
   });
 
   it("accepts bare minutes for --time", () => {
-    expect(parseGoalStartArgs(["x", "--time", "45"], { maxChecks: 5 })).toMatchObject({ minutes: 45 });
+    expect(parseGoalStartText("x --time 45", { maxChecks: 5 })).toMatchObject({ minutes: 45 });
   });
 
   it.each([
-    [["--rounds", "0", "x"], "--rounds"],
-    [["--rounds", "101", "x"], "--rounds"],
-    [["--time", "25h", "x"], "--time"],
-    [["--budget", "abc", "x"], "--budget"],
-    [["--budget", "5000", "x"], "--budget"],
-    [["--check"], "needs a value"],
-    [["--check", "  ", "x"], "needs a command"],
-    [["--check", "a\nb", "x"], "one line"],
-    [["--frobnicate", "1", "x"], "Unknown option"],
-    [["--rounds", "3"], "Say what the goal is"],
-  ])("rejects %j", (argv, msgPart) => {
-    const r = parseGoalStartArgs(argv, { maxChecks: 5 });
+    ["x --rounds 0", "--rounds must be"],
+    ["x --rounds 101", "--rounds must be"],
+    ["x --time 25h", "--time must be"],
+    ["x --budget abc", "--budget must be"],
+    ["x --budget 5000", "--budget must be"],
+    ["x --check", "needs a value"],
+    [`x --check "  "`, "needs a command"],
+    ["x --check \"a\nb\"", "one line"],
+    ["x --frobnicate 1", "Unknown option"],
+    ["--rounds 3", "Say what the goal is"],
+  ])("rejects %j", (raw, msgPart) => {
+    const r = parseGoalStartText(raw, { maxChecks: 5 });
     expect("error" in r && r.error).toContain(msgPart);
   });
 
   it("limits the number of checks", () => {
-    const r = parseGoalStartArgs(["x", "--check", "a", "--check", "b"], { maxChecks: 1 });
+    const r = parseGoalStartText("x --check a --check b", { maxChecks: 1 });
     expect("error" in r && r.error).toContain("At most 1");
+  });
+
+  // RUNTIME-B1 / GOAL-B1: shell quoting rules on prose hid or mangled the flags.
+  it.each([
+    [
+      `fix the user's login bug --check "pnpm vitest run packages/core" --rounds 3 --budget 2`,
+      { text: "fix the user's login bug", checks: ["pnpm vitest run packages/core"], rounds: 3, budgetUsd: 2 },
+    ],
+    [
+      `don't stop until the auth tests pass --check "pnpm vitest run packages/core" --rounds 3 --budget 2`,
+      { text: "don't stop until the auth tests pass", checks: ["pnpm vitest run packages/core"], rounds: 3, budgetUsd: 2 },
+    ],
+    [`fix auth --check “pnpm vitest run” --rounds 3`, { text: "fix auth", checks: ["pnpm vitest run"], rounds: 3 }],
+    [`fix auth --check ‘pnpm vitest run’ --time 90m`, { text: "fix auth", checks: ["pnpm vitest run"], minutes: 90 }],
+    [`don’t break the user’s login --check "pnpm test" --budget 2`, { text: "don’t break the user’s login", checks: ["pnpm test"], budgetUsd: 2 }],
+    [`the “auth” tests --check “pnpm test” --rounds 4`, { text: "the “auth” tests", checks: ["pnpm test"], rounds: 4 }],
+    [`it's done when 'ok' prints --check "grep -q 'ok' out.txt" --rounds 2`, { text: "it's done when 'ok' prints", checks: ["grep -q 'ok' out.txt"], rounds: 2 }],
+    [`fix it --check 'test "$(cat v)" = 1' --rounds 2`, { text: "fix it", checks: ['test "$(cat v)" = 1'], rounds: 2 }],
+    [`fix it --check “grep "ok" out.txt” --rounds 2`, { text: "fix it", checks: ['grep "ok" out.txt'], rounds: 2 }],
+    [`fix it --check "grep -E 'a\\|b' f" --budget 1`, { text: "fix it", checks: ["grep -E 'a\\|b' f"], budgetUsd: 1 }],
+    [`back\\slash \\ text --rounds 2`, { text: "back\\slash \\ text", checks: [], rounds: 2 }],
+    [`don't stop —check “pnpm test” —rounds 3 —budget 2`, { text: "don't stop", checks: ["pnpm test"], rounds: 3, budgetUsd: 2 }],
+    [`"fix the --verbose flag" --rounds 2`, { text: "fix the --verbose flag", checks: [], rounds: 2 }],
+    [`wait — the deploy is broken —check “make check”`, { text: "wait — the deploy is broken", checks: ["make check"] }],
+  ])("keeps every flag with quotes in the text: %s", (raw, want) => {
+    expect(parseGoalStartText(raw, { maxChecks: 5 })).toEqual(want);
+  });
+
+  it.each([
+    [`fix auth --check pnpm vitest run --rounds 3`, "Unexpected text after --check pnpm"],
+    [`fix auth --check "pnpm vitest run --rounds 3`, "not closed"],
+    [`fix auth --check “pnpm vitest run --rounds 3`, "not closed"],
+    [`fix auth --rounds 3 and also lint`, "Unexpected text after --rounds 3"],
+    [`fix the --verbose output`, "Unknown option --verbose"],
+    [`--rounds 3 fix the bug`, "Unexpected text"],
+    [`fix it --rounds 3 --rounds 5`, "given twice"],
+    [`fix it --check`, "needs a value"],
+    [`fix it --check --rounds 3`, "needs a value"],
+  ])("refuses flag text it cannot read one way only: %s", (raw, msgPart) => {
+    const r = parseGoalStartText(raw, { maxChecks: 5 });
+    expect("error" in r).toBe(true);
+    expect("error" in r && r.error).toContain(msgPart);
   });
 });
 
@@ -185,6 +227,58 @@ describe("/goal", () => {
     });
     expect(evaluateCheck).toHaveBeenCalledWith("pnpm vitest run packages/core", { sessionKey: "telegram:dm:1001", cwd: dir });
     expect(requestApproval).not.toHaveBeenCalled();
+  });
+
+  it("an apostrophe in the goal text keeps the check and caps, and the reply lists them (RUNTIME-B1 reviewer proof)", async () => {
+    const r = await run(`/goal don't stop until the auth tests pass --check "pnpm vitest run packages/core" --rounds 3 --budget 2`);
+    const [g] = store.listRecent();
+    expect(g).toMatchObject({
+      goal: "don't stop until the auth tests pass",
+      checks: [{ command: "pnpm vitest run packages/core" }],
+      maxRounds: 3,
+      maxCostUsd: 2,
+      maxMinutes: cfg.maxMinutes,
+    });
+    expect(evaluateCheck).toHaveBeenCalledWith("pnpm vitest run packages/core", expect.anything());
+    expect(r.text).toContain("1. pnpm vitest run packages/core");
+    expect(r.text).toContain("Caps: 3 rounds");
+    expect(r.text).toContain("$2");
+  });
+
+  it("typographic quotes around a check give the whole command, not a broken first word", async () => {
+    const r = await run(`/goal fix auth --check “pnpm vitest run” --rounds 3`);
+    expect(store.listRecent()[0]).toMatchObject({ goal: "fix auth", checks: [{ command: "pnpm vitest run" }], maxRounds: 3 });
+    expect(r.text).toContain("1. pnpm vitest run");
+  });
+
+  it("a goal without checks says so in the reply", async () => {
+    const r = await run("/goal tidy the readme");
+    expect(r.text).toContain("Checks: none");
+    expect(r.text).toContain(`Caps: ${cfg.maxRounds} rounds`);
+  });
+
+  it.each([
+    `/goal fix auth --check pnpm vitest run --rounds 3`,
+    `/goal don't stop --check "pnpm vitest run --rounds 3`,
+    `/goal fix auth --rounds 3 and also lint`,
+  ])("flag text that cannot be read one way only starts nothing and shows an example: %s", async (text) => {
+    const r = await run(text);
+    expect(r.text).toContain("Nothing was started");
+    expect(r.text).toContain("Example: /goal");
+    expect(store.listRecent()).toEqual([]);
+    expect(evaluateCheck).not.toHaveBeenCalled();
+  });
+
+  it("resume keeps --budget when the instructions contain an apostrophe", async () => {
+    await run("/goal first");
+    const [g] = store.listRecent();
+    store.transition(g!.id, ["running"], "paused", { pauseRequested: false });
+    store.update(g!.id, { costUsd: 9.5 });
+    const r = await run(`/goal resume ${g!.id} don't touch the public API --budget 3`);
+    expect(r.text).toContain("resumed");
+    const after = store.get(g!.id)!;
+    expect(after.costLimitUsd).toBeCloseTo(12.5);
+    expect(after.resumeNote).toBe("don't touch the public API");
   });
 
   it("owner flags override the defaults", async () => {

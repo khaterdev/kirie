@@ -18,7 +18,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import type { CommandContext, CommandDefinition, CommandResult } from "../commands/types.js";
-import { parseDuration, parseIntInRange } from "../commands/parse.js";
+import { parseDuration, parseIntInRange, parseTextAndFlags } from "../commands/parse.js";
 import type { RuntimeSettings } from "../config/runtime-settings.js";
 import type { GoalsConfig } from "../config/sections/goals.js";
 import type { GoalController } from "./goal-controller.js";
@@ -51,6 +51,7 @@ export const GOAL_USAGE = [
   "  Work on a goal in the background until a judge confirms it is done.",
   "  Every --check command must exit 0 before the judge is asked; the judge can never override a failing check.",
   "  Stops at the round, time or estimated-cost cap.",
+  "  Write the goal text first, then the options; put each --check command in quotes. The reply lists the checks and caps as understood.",
   "  Example: /goal fix the failing auth tests --check \"pnpm vitest run packages/core\" --rounds 8 --time 1h",
   "/goal start <text> ...   same, when the text starts with a word like stop or list",
   "/goal list | /goal status [id]",
@@ -77,25 +78,21 @@ export interface ParsedGoalStart {
   cwd?: string;
 }
 
-/** Parse the tokens of `/goal [start] <text> [flags]`. Returns an error string on bad input. */
-export function parseGoalStartArgs(argv: readonly string[], opts: { maxChecks: number }): ParsedGoalStart | { error: string } {
-  const words: string[] = [];
+const GOAL_START_FLAGS = ["check", "rounds", "time", "budget", "cwd"] as const;
+
+export const GOAL_FLAGS_EXAMPLE = 'Example: /goal fix the user\'s login bug --check "pnpm vitest run packages/core" --rounds 3 --time 1h --budget 2';
+
+/**
+ * Parse the text after `/goal` (or `/goal start`): the goal text verbatim,
+ * then the flags. Apostrophes and typographic quotes in the goal text are
+ * literal; anything flag-like that cannot be read one way only is refused
+ * (see `parseTextAndFlags`), so a check or a cap is never silently lost.
+ */
+export function parseGoalStartText(raw: string, opts: { maxChecks: number }): ParsedGoalStart | { error: string } {
+  const split = parseTextAndFlags(raw, { flags: GOAL_START_FLAGS });
+  if ("error" in split) return { error: `${split.error} Nothing was started. Put each --check command in quotes.\n${GOAL_FLAGS_EXAMPLE}` };
   const out: ParsedGoalStart = { text: "", checks: [] };
-  for (let i = 0; i < argv.length; i++) {
-    const tok = argv[i]!;
-    if (!tok.startsWith("--")) {
-      words.push(tok);
-      continue;
-    }
-    const eq = tok.indexOf("=");
-    const flag = (eq > 0 ? tok.slice(2, eq) : tok.slice(2)).toLowerCase();
-    let value: string | undefined;
-    if (eq > 0) value = tok.slice(eq + 1);
-    else {
-      value = argv[i + 1];
-      i++;
-    }
-    if (value === undefined) return { error: `--${flag} needs a value.` };
+  for (const { name: flag, value } of split.flags) {
     switch (flag) {
       case "check": {
         const cmd = value.trim();
@@ -106,12 +103,14 @@ export function parseGoalStartArgs(argv: readonly string[], opts: { maxChecks: n
         break;
       }
       case "rounds": {
+        if (out.rounds !== undefined) return { error: "--rounds is given twice." };
         const n = parseIntInRange(value, GOAL_OWNER_BOUNDS.rounds.min, GOAL_OWNER_BOUNDS.rounds.max);
         if (n === null) return { error: `--rounds must be a whole number from ${GOAL_OWNER_BOUNDS.rounds.min} to ${GOAL_OWNER_BOUNDS.rounds.max}.` };
         out.rounds = n;
         break;
       }
       case "time": {
+        if (out.minutes !== undefined) return { error: "--time is given twice." };
         const ms = /^\d+$/.test(value.trim())
           ? Number(value.trim()) * 60_000
           : parseDuration(value);
@@ -123,6 +122,7 @@ export function parseGoalStartArgs(argv: readonly string[], opts: { maxChecks: n
         break;
       }
       case "budget": {
+        if (out.budgetUsd !== undefined) return { error: "--budget is given twice." };
         const v = value.trim().replace(/^\$/, "");
         const n = /^\d+(\.\d+)?$/.test(v) ? Number(v) : NaN;
         if (!(n >= GOAL_OWNER_BOUNDS.budgetUsd.min && n <= GOAL_OWNER_BOUNDS.budgetUsd.max)) {
@@ -132,19 +132,29 @@ export function parseGoalStartArgs(argv: readonly string[], opts: { maxChecks: n
         break;
       }
       case "cwd": {
+        if (out.cwd !== undefined) return { error: "--cwd is given twice." };
         if (!value.trim()) return { error: "--cwd needs a path." };
         out.cwd = value.trim();
         break;
       }
-      default:
-        return { error: `Unknown option --${flag}.` };
     }
   }
   if (out.checks.length > opts.maxChecks) return { error: `At most ${opts.maxChecks} checks per goal.` };
-  out.text = words.join(" ").trim();
-  if (!out.text) return { error: "Say what the goal is." };
+  out.text = split.text.trim();
+  if (!out.text) return { error: "Say what the goal is, before the options." };
   if (out.text.length > GOAL_TEXT_MAX_CHARS) return { error: `A goal may be at most ${GOAL_TEXT_MAX_CHARS} characters.` };
   return out;
+}
+
+/** What the owner sees after /goal: the checks and caps exactly as parsed. */
+export function formatParsedGoal(parsed: Pick<ParsedGoalStart, "checks">, caps: { maxRounds: number; maxMinutes: number; maxCostUsd: number }): string {
+  const lines = [
+    parsed.checks.length > 0
+      ? `Checks (each must exit 0 before the judge is asked):\n${parsed.checks.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}`
+      : "Checks: none. The judge alone decides when it is done (add --check \"<cmd>\" to require one).",
+    `Caps: ${caps.maxRounds} rounds, ${formatGoalElapsed(caps.maxMinutes * 60_000)}, ${formatGoalCost(caps.maxCostUsd)}.`,
+  ];
+  return lines.join("\n");
 }
 
 /** Expand ~, require an absolute path to an existing directory. */
@@ -225,10 +235,10 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
     return lines.join("\n");
   };
 
-  const start = async (ctx: CommandContext, argv: readonly string[]): Promise<CommandResult> => {
+  const start = async (ctx: CommandContext, raw: string): Promise<CommandResult> => {
     if (!deps.isEnabled()) return GOAL_OFF_TEXT;
     const cfg = deps.config();
-    const parsed = parseGoalStartArgs(argv, { maxChecks: cfg.maxChecks });
+    const parsed = parseGoalStartText(raw, { maxChecks: cfg.maxChecks });
     if ("error" in parsed) return `${parsed.error}\n\n${GOAL_USAGE}`;
     let cwd: string | null = null;
     if (parsed.cwd !== undefined) {
@@ -246,6 +256,7 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
     const maxRounds = parsed.rounds ?? cfg.maxRounds;
     const maxMinutes = parsed.minutes ?? cfg.maxMinutes;
     const maxCostUsd = parsed.budgetUsd ?? cfg.maxCostUsd;
+    const summary = formatParsedGoal(parsed, { maxRounds, maxMinutes, maxCostUsd });
     if (asks.length > 0) {
       const body = [
         parsed.text.slice(0, 1000),
@@ -253,7 +264,7 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
         "These check commands need your approval. The daemon will run them after every round without asking again:",
         ...asks.map((a) => `- ${a.command}${a.reasons.length ? ` (${a.reasons.join("; ")})` : ""}`),
         "",
-        `Caps: ${maxRounds} rounds, ${formatGoalElapsed(maxMinutes * 60_000)}, ${formatGoalCost(maxCostUsd)}.`,
+        summary,
       ].join("\n");
       const ok = await ctx.confirm("Start this goal?", body);
       if (!ok) return "Goal not started.";
@@ -270,10 +281,9 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
       actor: actorOf(ctx),
     });
     if (goal.status === "pending") {
-      return `Goal ${goal.id} is queued (at most ${cfg.maxConcurrent} goal(s) run at a time). Caps: ${formatGoalCaps(goal)}.`;
+      return `Goal ${goal.id} is queued (at most ${cfg.maxConcurrent} goal(s) run at a time).\n${summary}`;
     }
-    // The controller has announced the start in this chat.
-    return undefined;
+    return `Goal ${goal.id} accepted.\n${summary}`;
   };
 
   return [
@@ -296,16 +306,19 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
         off: { description: "Stop new goals from starting" },
       },
       async handler(ctx): Promise<CommandResult> {
-        const argv = ctx.argv;
-        const sub = argv[0]?.toLowerCase();
-        if (argv.length === 0 || sub === "list") return list();
-        if (sub === undefined || !SUBCOMMANDS.has(sub)) return start(ctx, argv);
-        const rest = argv.slice(1);
+        // The first word decides the subcommand; goal text is never split with shell quoting rules.
+        const rawArgs = ctx.args.trim();
+        const firstWord = /^\S+/.exec(rawArgs)?.[0] ?? "";
+        const afterFirst = rawArgs.slice(firstWord.length).trim();
+        const sub = firstWord.toLowerCase();
+        if (!rawArgs || sub === "list") return list();
+        if (!SUBCOMMANDS.has(sub)) return start(ctx, rawArgs);
+        const rest = afterFirst ? afterFirst.split(/\s+/) : [];
         switch (sub) {
           case "help":
             return GOAL_USAGE;
           case "start":
-            return start(ctx, rest);
+            return start(ctx, afterFirst);
           case "on":
           case "off": {
             const enable = sub === "on";
@@ -336,30 +349,29 @@ export function createGoalCommands(deps: GoalCommandDeps): CommandDefinition[] {
           }
           case "resume": {
             let idArg: string | undefined;
-            let i = 0;
-            if (rest[0] !== undefined && GOAL_ID_RE.test(rest[0].toLowerCase())) {
-              idArg = rest[0];
-              i = 1;
+            let resumeRaw = afterFirst;
+            const idWord = /^\S+/.exec(resumeRaw)?.[0];
+            if (idWord !== undefined && GOAL_ID_RE.test(idWord.toLowerCase())) {
+              idArg = idWord;
+              resumeRaw = resumeRaw.slice(idWord.length).trim();
+            }
+            const split = parseTextAndFlags(resumeRaw, { flags: ["budget"], textAfterFlags: true });
+            if ("error" in split) {
+              return `${split.error} Nothing was resumed.\nExample: /goal resume g-ab12cd --budget 5 don't touch the public API`;
             }
             let addBudgetUsd: number | undefined;
-            const noteWords: string[] = [];
-            for (; i < rest.length; i++) {
-              const tok = rest[i]!;
-              if (tok === "--budget" || tok.startsWith("--budget=")) {
-                const raw = tok.includes("=") ? tok.slice(tok.indexOf("=") + 1) : rest[++i];
-                const v = (raw ?? "").trim().replace(/^\$/, "");
-                const n = /^\d+(\.\d+)?$/.test(v) ? Number(v) : NaN;
-                if (!(n >= GOAL_OWNER_BOUNDS.budgetUsd.min && n <= GOAL_OWNER_BOUNDS.budgetUsd.max)) {
-                  return `--budget must be a dollar amount from ${GOAL_OWNER_BOUNDS.budgetUsd.min} to ${GOAL_OWNER_BOUNDS.budgetUsd.max}.`;
-                }
-                addBudgetUsd = n;
-              } else {
-                noteWords.push(tok);
+            for (const { value } of split.flags) {
+              if (addBudgetUsd !== undefined) return "--budget is given twice. Nothing was resumed.";
+              const v = value.trim().replace(/^\$/, "");
+              const n = /^\d+(\.\d+)?$/.test(v) ? Number(v) : NaN;
+              if (!(n >= GOAL_OWNER_BOUNDS.budgetUsd.min && n <= GOAL_OWNER_BOUNDS.budgetUsd.max)) {
+                return `--budget must be a dollar amount from ${GOAL_OWNER_BOUNDS.budgetUsd.min} to ${GOAL_OWNER_BOUNDS.budgetUsd.max}.`;
               }
+              addBudgetUsd = n;
             }
             const picked = pickGoal(deps, idArg, GOAL_RESUMABLE_STATUSES, "resume");
             if (typeof picked === "string") return picked;
-            const note = noteWords.join(" ").trim();
+            const note = split.text.trim();
             return deps.controller.resume(picked.id, actorOf(ctx), {
               ...(note ? { note } : {}),
               ...(addBudgetUsd !== undefined ? { addBudgetUsd } : {}),
