@@ -58,6 +58,11 @@ describe("expandApprovalHome", () => {
 });
 
 describe("normalizeApprovalPath", () => {
+  it("never resolves symlinks under network mount points", () => {
+    const realpath = (p: string) => { if (p.startsWith("/Volumes")) throw new Error("must not be called"); return p; };
+    expect(normalizeApprovalPath("/Volumes/nas/x", "/", { home: HOME, realpath }).real).toBe("/Volumes/nas/x");
+  });
+
   it("resolves relative paths and .. against cwd", () => {
     expect(normalizeApprovalPath("x", "/a/b", ident).lexical).toBe("/a/b/x");
     expect(normalizeApprovalPath("../../.ssh/id_rsa", `${HOME}/dev/x`, ident).lexical).toBe(`${HOME}/.ssh/id_rsa`);

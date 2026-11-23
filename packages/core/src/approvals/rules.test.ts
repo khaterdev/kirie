@@ -18,8 +18,16 @@ const TABLE: Record<string, { yes: string[]; no: string[] }> = {
       "cd / && rm -rf *", "cd ~ && rm -rf .", "rm -rf ..", "rm -rf /U*", "rm -rf ~/..", "\\rm -rf /", "/bin/rm -rf ~",
       "bash -c 'rm -rf ~'", "echo $(rm -rf /)", "rm -rf /etc", "rm -rf /Applications", "{rm,-rf,/}",
       "$'\\x72\\x6d' -rf /", "rm -rf /usr/", "rm -Rf /var", "sudo env X=1 rm -rf /", "rm -rf ~tester",
+      // The empty-variable accident and other shapes that reach a root at run time
+      "X=; rm -rf $X/", "TARGET=\"\" && rm -rf \"$TARGET\"/*", "X=~; rm -rf $X", "export D=/; rm -rf ${D}",
+      "echo / | xargs rm -rf", "echo ~ | xargs -I{} rm -rf {}", "printf '/' | xargs rm -rf",
+      "find / -delete", "find ~ -exec rm -rf {} +", "cd ~ && find . -delete", "find / -type f -delete",
     ],
-    no: ["rm -rf ./build", "rm -rf ~/dev/x/dist", "rm -rf /tmp/build", "rm ~/file.txt", "rm -f /etc/hosts.bak", "rm -rf /usr/local/lib/x", "echo rm -rf /", "git commit -m 'rm -rf /'"],
+    no: [
+      "rm -rf ./build", "rm -rf ~/dev/x/dist", "rm -rf /tmp/build", "rm ~/file.txt", "rm -f /etc/hosts.bak", "rm -rf /usr/local/lib/x",
+      "echo rm -rf /", "git commit -m 'rm -rf /'", "X=/tmp/build; rm -rf $X", "rm -rf \"$BUILD_DIR\"/*", "find ~ -name '*.pyc' -delete",
+      "echo build | xargs rm -rf", "find / -name core", "X=~; unset X; rm -rf $X/dist",
+    ],
   },
   "hard.disk": {
     yes: ["mkfs.ext4 /dev/sda1", "newfs_apfs /dev/disk2s1", "diskutil eraseDisk APFS X disk2", "diskutil apfs deleteContainer disk3", "dd if=/dev/zero of=/dev/disk2", "cat img > /dev/rdisk2", "wipefs -a /dev/sdb"],

@@ -719,6 +719,56 @@ function braceExpand(w: Word): { values: string[]; nested: boolean } | null {
   return { values, nested: false };
 }
 
+/** `-I R`, `-IR`, `-i[R]`, `--replace[=R]`: the replacement string of xargs, or null. */
+function xargsReplaceString(opts: string[]): string | null {
+  for (let i = 0; i < opts.length; i++) {
+    const o = opts[i]!;
+    if (o === "-I") return opts[i + 1] ?? null;
+    if (o.startsWith("-I")) return o.slice(2);
+    if (o === "-i" || o === "--replace") return "{}";
+    if (o.startsWith("-i")) return o.slice(2);
+    if (o.startsWith("--replace=")) return o.slice(10);
+  }
+  return null;
+}
+
+const VAR_REF = /^(?:\$([A-Za-z_][A-Za-z0-9_]*)|\$\{([A-Za-z_][A-Za-z0-9_]*)\})/;
+
+/** Replace a leading `$NAME` / `${NAME}` whose literal value is known from an earlier assignment. */
+function substituteKnownVar(w: Word, vars: ReadonlyMap<string, string>): Word {
+  if (!w.expansion || vars.size === 0 || w.subs.length > 0) return w;
+  const m = VAR_REF.exec(w.value);
+  if (!m) return w;
+  const name = m[1] ?? m[2]!;
+  const known = vars.get(name);
+  if (known === undefined) return w;
+  const rest = w.value.slice(m[0].length);
+  if (rest.includes("$") || rest.includes("`")) return w;
+  const value = known + rest;
+  return { ...w, value, quotedMask: Array.from({ length: value.length }, () => true), expansion: false };
+}
+
+/** Record `NAME=literal` assignments (bare, or through export/declare/local/readonly). */
+function trackVars(seg: ShellSegment, vars: Map<string, string>): void {
+  const record = (a: string): void => {
+    const eq = a.indexOf("=");
+    if (eq <= 0) return;
+    const name = a.slice(0, eq).replace(/\+$/, "");
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return;
+    const value = a.slice(eq + 1);
+    if (value.includes("$") || value.includes("`")) vars.delete(name);
+    else vars.set(name, value);
+  };
+  if (seg.argv.length === 0 && seg.wrappers.length === 0) {
+    for (const a of seg.assignments) record(a);
+    return;
+  }
+  if (["export", "declare", "typeset", "local", "readonly"].includes(seg.cmd)) {
+    for (const a of seg.argv.slice(1)) if (!a.startsWith("-")) record(a);
+  }
+  if (seg.cmd === "unset") for (const a of seg.argv.slice(1)) vars.delete(a);
+}
+
 /** Pipeline stages that decode their input (base64 -d, xxd -r, openssl -d, rev, tr, gunzip). */
 function isDecoderSegment(seg: ShellSegment): boolean {
   const a = seg.argv;
@@ -882,11 +932,14 @@ class ShellParser {
     let parenDepth = 0;
     let inCase = false;
     let cwd = startCwd;
+    /** Shell variables assigned earlier in this text with a literal value (`X=/tmp; rm -rf $X`). */
+    const vars = new Map<string, string>();
 
     const flush = (): void => {
       if (words.length === 0 && redirects.length === 0) return;
       const raw = segStart >= 0 ? text.slice(segStart, segEnd) : "";
-      const idx = this.emitSegment(raw, words, redirects, meta, group, stage, cwd);
+      const idx = this.emitSegment(raw, words, redirects, meta, group, stage, cwd, vars);
+      if (idx !== -1) trackVars(st.segments[idx]!, vars);
       if (idx !== -1 && !meta.remote) cwd = this.trackCd(st.segments[idx]!, cwd);
       words = [];
       redirects = [];
@@ -968,9 +1021,10 @@ class ShellParser {
     group: number,
     stage: number,
     cwd: string | null,
+    vars: ReadonlyMap<string, string> = new Map(),
   ): number {
     const st = this.st;
-    let words = inWords;
+    let words = inWords.map((w) => substituteKnownVar(w, vars));
 
     // Reserved words in command position.
     while (words.length > 0 && !words[0]!.quoted && RESERVED_PREFIX.has(words[0]!.value)) words = words.slice(1);
@@ -1254,7 +1308,21 @@ class ShellParser {
       }
       if (cmd === "xargs") {
         const j = skipOptions(ws, 1, WRAPPER_VALUE_OPTS.xargs!);
-        nestedWords(items.slice(j), "xargs", { dynamicArgs: true });
+        const sub = items.slice(j);
+        const upstream = st.segments.filter((x) => x.group === segment.group && x.stage === segment.stage - 1 && x.depth === segment.depth);
+        const literal = segment.stage > 0 ? literalOutputOf(upstream[upstream.length - 1]) : null;
+        if (literal && sub.length > 0) {
+          const repl = xargsReplaceString(ws.slice(1, j).map((w) => w.value));
+          const literalWord = (value: string): { w: Word; value: string } => ({ w: { ...head.w, value, quotedMask: [], raw: value, quoted: true, expansion: false, glob: false, subs: [] }, value });
+          if (repl !== null) {
+            const line = literal.split("\n")[0]!.trim();
+            nestedWords(sub.map((x) => (x.value.includes(repl) ? literalWord(x.value.split(repl).join(line)) : x)), "xargs", { dynamicArgs: true });
+          } else {
+            nestedWords([...sub, ...literal.split(/\s+/).filter(Boolean).map(literalWord)], "xargs", { dynamicArgs: true });
+          }
+        } else {
+          nestedWords(sub, "xargs", { dynamicArgs: true });
+        }
         break;
       }
       if (cmd === "find") {

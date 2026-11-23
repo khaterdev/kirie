@@ -217,6 +217,7 @@ describe("collectAttackSurface", () => {
     const config = makeConfig({
       security: { groupPolicy: "all" },
       sandbox: { mode: "off" },
+      approvals: { mode: "ask" },
     });
 
     const findings = collectAttackSurface(config);
@@ -230,6 +231,7 @@ describe("collectAttackSurface", () => {
     const config = makeConfig({
       security: { groupPolicy: "disabled" },
       sandbox: { mode: "docker" },
+      approvals: { mode: "ask" },
     });
 
     const findings = collectAttackSurface(config);

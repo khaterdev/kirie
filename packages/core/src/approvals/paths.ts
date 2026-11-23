@@ -170,9 +170,13 @@ export function normalizeApprovalPath(p: string, cwd: string, env: ApprovalPathE
   return { lexical, real: realpathDeepest(lexical, env.realpath ?? defaultRealpath, cache) };
 }
 
+/** Mount points where a stalled network volume could block a realpath call. Never resolved. */
+const NO_REALPATH_PREFIXES = ["/Volumes/", "/net/", "/Network/", "/System/Volumes/Data/Volumes/"];
+
 function realpathDeepest(p: string, realpath: (p: string) => string, cache?: Map<string, string>): string {
   const cached = cache?.get(p);
   if (cached !== undefined) return cached;
+  if (NO_REALPATH_PREFIXES.some((prefix) => p.startsWith(prefix))) return p;
   let current = p;
   const tail: string[] = [];
   for (let i = 0; i < 64; i++) {

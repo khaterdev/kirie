@@ -311,6 +311,33 @@ function anyRootTarget(seg: ShellSegment, targets: Array<{ value: string; expans
   return targets.some((t) => isRootishTarget(seg, t, env));
 }
 
+/** Primaries that make a find targeted (so a delete is not a wipe of the whole tree). */
+const FIND_FILTERS = new Set([
+  "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-newer", "-newermt", "-anewer",
+  "-cnewer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size", "-empty", "-user", "-group", "-uid", "-gid",
+  "-perm", "-links", "-inum", "-samefile", "-lname", "-ilname", "-nouser", "-nogroup", "-flags", "-xattr", "-prune",
+]);
+
+/** `find <root> -delete` (or `-exec rm`) with no filter: the same as rm -rf of that root. */
+function findWipesRoot(seg: ShellSegment, env: ApprovalRuleEnv): boolean {
+  const a = seg.argv;
+  let i = 1;
+  while (i < a.length && /^-[LPHEXdsx]+$/.test(a[i]!)) i++;
+  if (a[i] === "-f") i += 2;
+  const starts: Array<{ value: string; expansion: boolean }> = [];
+  while (i < a.length && !a[i]!.startsWith("-") && a[i] !== "(" && a[i] !== "!") {
+    starts.push({ value: a[i]!, expansion: seg.args[i]?.expansion ?? false });
+    i++;
+  }
+  const primaries = a.slice(i);
+  if (primaries.some((p) => FIND_FILTERS.has(p))) return false;
+  let deletes = primaries.includes("-delete");
+  for (let k = 0; k < primaries.length; k++) {
+    if (["-exec", "-execdir", "-ok", "-okdir"].includes(primaries[k]!) && ["rm", "unlink", "shred", "srm"].includes(basename(primaries[k + 1] ?? ""))) deletes = true;
+  }
+  return deletes && anyRootTarget(seg, starts.length > 0 ? starts : [{ value: ".", expansion: false }], env);
+}
+
 const CURL_VALUE_OPTS = new Set([
   "-d", "--data", "--data-binary", "--data-raw", "--data-urlencode", "--data-ascii", "-F", "--form", "--form-string",
   "-T", "--upload-file", "-X", "--request", "-H", "--header", "-o", "--output", "-u", "--user", "-A", "--user-agent",
@@ -482,8 +509,9 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     group: "hardline",
     severity: "hardline",
     description: "Recursive delete of /, the home folder, /Users or a system root",
-    commands: ["rm"],
+    commands: ["rm", "find"],
     check(seg, env) {
+      if (seg.cmd === "find") return findWipesRoot(seg, env) ? "find deletes everything under a root folder" : null;
       const info = rmInfo(seg);
       if (info.noPreserveRoot) return "rm --no-preserve-root";
       if (info.recursive && anyRootTarget(seg, info.targets, env)) return "recursive delete of a root folder";
