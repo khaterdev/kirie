@@ -718,7 +718,10 @@ export class MessagePipeline {
           }
           throw execErr;
         } finally {
-          this.config.turnContext?.end(route.sessionKey);
+          // Only clear our own turn: after /stopall a newer turn may already have begun.
+          if (this.config.turnContext?.get(route.sessionKey)?.startedAt === startedAt) {
+            this.config.turnContext.end(route.sessionKey);
+          }
         }
         this.runningQueries.delete(route.sessionKey);
 

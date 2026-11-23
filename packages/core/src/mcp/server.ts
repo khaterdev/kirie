@@ -9,7 +9,7 @@ import { MemoryStore, createMemoryToolHandlers, type MemoryManagerLike } from ".
 import { ScheduleStore, createScheduleToolHandlers } from "./tools/schedule.js";
 import { createAgentsToolHandlers } from "./tools/agents-tool.js";
 import type { AgentRegistry } from "../engine/agent-registry.js";
-export type { ScheduleFireEvent, ScheduleDeliveryMode, ScheduleEntry, WebhookEntry, WebhookFireEvent, ActiveHoursConfig } from "./tools/schedule.js";
+export type { ScheduleFireEvent, ScheduleDeliveryMode, ScheduleEntry, ActiveHoursConfig } from "./tools/schedule.js";
 export { isWithinActiveHours } from "./tools/schedule.js";
 import { createMessagingToolHandlers } from "./tools/messaging.js";
 import { ChatHistoryStore, createChatHistoryToolHandlers } from "./tools/chat-history.js";
@@ -35,7 +35,6 @@ import type { SessionStore } from "../engine/session-store.js";
 import { createBroadcastToolHandlers, createLabelToolHandlers } from "./tools/broadcast-labels.js";
 import { LabelStore } from "../routing/labels.js";
 import type { BroadcastTarget } from "../routing/broadcast.js";
-import { createVoiceCallToolHandlers, type VoiceCallToolOptions } from "./tools/voice-call.js";
 import { createNodesToolHandlers, type NodesToolOptions } from "./tools/nodes-tool.js";
 import { createProactiveToolHandlers } from "./tools/proactive-tools.js";
 import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
@@ -73,8 +72,6 @@ export interface McpServerOptions {
   broadcastGroups?: Record<string, { targets: BroadcastTarget[] }>;
   /** Optional label store database (shares scheduleDbPath by default) */
   labelDbPath?: string;
-  /** Optional voice call tool options */
-  voiceCallOptions?: VoiceCallToolOptions;
   /** Optional nodes tool options (gateway URL + token for companion device nodes) */
   nodesOptions?: NodesToolOptions;
   /** Optional embedding provider for chat history semantic search */
@@ -239,13 +236,6 @@ export function createMcpToolRegistry(options: McpServerOptions): {
     tools.set(name, def as unknown as McpToolDefinition);
   }
 
-  // Register voice call tools (optional, depends on voice config)
-  if (options.voiceCallOptions) {
-    const voiceCallHandlers = createVoiceCallToolHandlers(options.voiceCallOptions);
-    for (const [name, def] of Object.entries(voiceCallHandlers)) {
-      tools.set(name, def as unknown as McpToolDefinition);
-    }
-  }
 
   // Register nodes tool (need gateway URL for companion device nodes)
   if (options.nodesOptions) {

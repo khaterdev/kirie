@@ -1153,7 +1153,6 @@ export async function startDaemon(): Promise<void> {
     const adapter = channelRegistry.getById(id);
     if (adapter) void registerCommandMenus(adapter, commands, config.security.owner.identities);
   };
-  channelRegistry.on("started", registerMenusFor);
 
   // 9. Start channels
   pipeline.start();
@@ -1246,6 +1245,7 @@ export async function startDaemon(): Promise<void> {
   // ── Phase 5: command menus for the channels already running (the "started"
   //    listener covers channels that connect later).
   for (const id of channelRegistry.getRunning()) registerMenusFor(id);
+  channelRegistry.on("started", registerMenusFor);
 
   // ── Phase 6: gateway server, with the feature routes mounted under /api/<name>.
   const gateway = new GatewayServer({
