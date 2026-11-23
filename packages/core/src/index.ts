@@ -76,6 +76,15 @@ export * from "./mcp/server.js";
 export { MemoryStore, type MemoryManagerLike } from "./mcp/tools/memory.js";
 export * from "./auto-reply/auto-reply.js";
 export { registerBuiltinCommands } from "./auto-reply/commands.js";
+// Command registry, owner identity and prompts, runtime settings, audit trail (PLAN B.4 to B.6)
+export * from "./commands/index.js";
+export * from "./commands/builtin/core.js";
+export * from "./interaction/index.js";
+export * from "./config/runtime-settings.js";
+export * from "./security/audit-trail.js";
+// Secret scrubber (PLAN B.8)
+export * from "./security/secret-scrubber.js";
+export * from "./security/secret-patterns.js";
 export * from "./hooks/types.js";
 export * from "./hooks/registry.js";
 export * from "./plugins/types.js";
