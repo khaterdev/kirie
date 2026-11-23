@@ -46,6 +46,28 @@ Pattern syntax: a bare glob over one shell command (`git push --force*`,
 `Read(~/dev/**)`; `Edit(...)` covers every file-writing tool), or an MCP tool
 name glob (`mcp__github__delete_*`).
 
+## Built-in tools
+
+Every SDK built-in that runs a shell command is checked exactly like `Bash`
+(hardline list, deny list, ask rules, allow list, the same card): `Monitor`
+(a watched shell command; a WebSocket watch without a command is not a shell
+call) and `PowerShell`. PowerShell is not a POSIX shell, so its commands are
+also always **uncertain** (they ask in `ask` mode).
+
+Built-ins whose effect the gate cannot read from their input are
+**uncertain** (ask in `ask` mode, run in `yolo` as before):
+
+| Tool | Why |
+|---|---|
+| `Workflow` | runs a script (inline, by name or from a file) that starts subagents |
+| `CronCreate`, `ScheduleWakeup` | schedule a prompt that runs later (a durable cron job survives restarts) |
+| `RemoteTrigger` | `create`, `update`, `run` and webhook actions start or change remote agents (`list`, `get`, `list_runs`, `get_run_log` are read-only and do not ask) |
+| `EnterWorktree` | creates or enters a git worktree and moves the session's working directory |
+| `ExitWorktree` with `action: "remove"` | deletes a worktree and its branch |
+
+Subagents (`Agent`) are not asked for: each tool call a subagent makes is
+checked on its own.
+
 ## Unattended work
 
 Background tasks, scheduled jobs, goals and loop ticks ask you like a chat

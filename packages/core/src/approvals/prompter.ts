@@ -21,6 +21,7 @@ import type { AuditTrail } from "../security/audit-trail.js";
 import { scrubSecrets } from "../security/secret-scrubber.js";
 import type { SdkCallContext } from "../engine/sdk-options.js";
 import type { TurnOrigin } from "../engine/turn-context.js";
+import { isApprovalShellCall } from "./engine.js";
 import { isHiddenShellChar } from "./shell-parse.js";
 import type { ApprovalEvaluation, ApprovalPolicy, ApprovalToolCall } from "./types.js";
 
@@ -108,7 +109,7 @@ export function approvalCallDisplay(call: ApprovalToolCall, scrub: (t: string) =
   const input = call.input ?? {};
   let label: string;
   let raw: string;
-  if (call.tool === "Bash" || call.tool.endsWith("__sandbox_bash")) {
+  if (isApprovalShellCall(call.tool, input)) {
     label = "Command";
     raw = str(input.command);
   } else if (call.tool === "Write" || call.tool === "Edit" || call.tool === "MultiEdit" || call.tool === "NotebookEdit") {

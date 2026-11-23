@@ -84,7 +84,41 @@ export const APPROVAL_LIST_SCHEMA = z.array(z.string().max(200)).max(200);
 export const KIRIE_TOOLS_PREFIX = "mcp__kirie-tools__";
 /** The docker-mode shell tool (W3-SBX). Its commands run inside the container. */
 export const APPROVAL_SANDBOX_SHELL_TOOL = `${KIRIE_TOOLS_PREFIX}sandbox_bash`;
-const SHELL_TOOLS = new Set(["Bash", APPROVAL_SANDBOX_SHELL_TOOL]);
+/**
+ * Tools whose `command` input is run by a shell (GATES-B1): Bash, the docker
+ * shell, and the SDK built-ins Monitor (a watched shell command) and
+ * PowerShell. All get the same classification, deny globs, hash and card.
+ */
+export const APPROVAL_SHELL_TOOLS: ReadonlySet<string> = new Set(["Bash", APPROVAL_SANDBOX_SHELL_TOOL, "Monitor", "PowerShell"]);
+
+/** True when this call runs `input.command` through a shell. Monitor without a command (a WebSocket watch) is not one. */
+export function isApprovalShellCall(tool: string, input: Record<string, unknown> | undefined): boolean {
+  if (!APPROVAL_SHELL_TOOLS.has(tool)) return false;
+  if (tool === "Bash" || tool === APPROVAL_SANDBOX_SHELL_TOOL) return true;
+  return typeof input?.command === "string";
+}
+
+/** Read-only RemoteTrigger actions; every other action creates, changes or runs a remote agent. */
+const REMOTE_TRIGGER_READ_ACTIONS = new Set(["list", "get", "list_runs", "get_run_log"]);
+
+/**
+ * SDK built-ins that start or schedule work outside the tools this gate reads
+ * (GATES-B1, docs/approvals.md "Built-in tools"). Their effect cannot be
+ * classified from the input, so they are uncertain: they ask in ask mode and
+ * run in yolo, as before.
+ */
+function builtinToolUncertainty(tool: string, input: Record<string, unknown>): ShellUncertainty[] {
+  const u = (detail: string): ShellUncertainty[] => [{ code: "builtin-tool", detail: `${tool} ${detail}` }];
+  switch (tool) {
+    case "Workflow": return u("runs a workflow script that starts subagents");
+    case "CronCreate": return u(input.durable === true ? "schedules a prompt that runs later, also after a restart" : "schedules a prompt that runs later");
+    case "ScheduleWakeup": return input.stop === true ? [] : u("schedules a prompt that runs later");
+    case "RemoteTrigger": return REMOTE_TRIGGER_READ_ACTIONS.has(str(input.action)) ? [] : u(`${str(input.action) || "?"} creates, changes or runs a remote agent`);
+    case "EnterWorktree": return u("creates or enters a git worktree and moves the session's working directory");
+    case "ExitWorktree": return input.action === "remove" ? u("removes a git worktree and its branch") : [];
+    default: return [];
+  }
+}
 
 const SENSITIVE_KIRIE_TOOLS: Readonly<Record<string, string>> = {
   mcp_servers_add: "registers a new MCP server, which runs an arbitrary command",
@@ -129,7 +163,7 @@ function stableJson(value: unknown, depth = 0): string {
 export function approvalCallHash(tool: string, input: Record<string, unknown>): string {
   try {
     // For a shell call only the command matters (a new description or timeout is the same request).
-    const body = SHELL_TOOLS.has(tool) && typeof input.command === "string" ? input.command : stableJson(input);
+    const body = isApprovalShellCall(tool, input) && typeof input.command === "string" ? input.command : stableJson(input);
     return createHash("sha256").update(`${tool}\n${body}`).digest("hex");
   } catch {
     return createHash("sha256").update(tool).digest("hex");
@@ -331,7 +365,7 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
     ...(env.realpath ? { realpath: env.realpath } : {}),
   };
   const cwd = call.cwd || call.ctx?.cwd || "";
-  const isShell = SHELL_TOOLS.has(call.tool);
+  const isShell = isApprovalShellCall(call.tool, call.input);
   let command = "";
   let lists: CompiledLists | undefined;
   let parsed: ParsedShell | undefined;
@@ -353,6 +387,7 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
       // With the hardline list off these still ask in ask mode (they run in yolo, as before the gate).
       dangerous = policy.hardline ? r.dangerous : [...r.hardline.map((f) => ({ ...f, severity: "dangerous" as const })), ...r.dangerous];
       if (!sandboxed) addParseMismatch(parsed, command, r, ruleEnv, disabled);
+      if (call.tool === "PowerShell") parsed.uncertain.push({ code: "powershell", detail: "PowerShell is not a POSIX shell; the command was read as one only approximately" });
     }
     if (hardline.length > 0) {
       return { ...base, decision: "deny", findings: hardline, uncertain: parsed?.uncertain ?? [], allowlisted: false, summary: `hardline: ${hardline[0]!.ruleId}`, messageForAgent: agentMessage("hardline", hardline[0]!) };
@@ -383,7 +418,8 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
   try {
     const findings: ApprovalFinding[] = [...dangerous];
     if (!isShell) findings.push(...toolFindings(call, lists!, ruleEnv!, pathEnv, cwd, env, new Set(policy.disabledRules)));
-    const uncertain = (parsed?.uncertain ?? []).filter((u) => {
+    const toolUncertain = isShell ? [] : builtinToolUncertainty(call.tool, call.input ?? {});
+    const uncertain = [...(parsed?.uncertain ?? []), ...toolUncertain].filter((u) => {
       if (u.code !== "inline-code") return true;
       if (policy.inlineCode === "allow") return false;
       if (policy.inlineCode === "heuristic") return !inlineCodeLooksInert(u.code_text ?? "");

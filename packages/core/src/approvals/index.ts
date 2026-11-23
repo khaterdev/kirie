@@ -12,6 +12,8 @@ export {
   approvalSandboxInfoFrom,
   APPROVAL_SETTING_KEYS,
   APPROVAL_SANDBOX_SHELL_TOOL,
+  APPROVAL_SHELL_TOOLS,
+  isApprovalShellCall,
   type ApprovalEngineDeps,
   type ApprovalEnvironment,
   type ApprovalTextAnalysis,
