@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   buildPrompt,
+  buildBackgroundTaskSystemPrompt,
   DEFAULT_SYSTEM_PROMPT,
   type ChannelContext,
   type SenderIdentity,
@@ -386,5 +387,40 @@ describe("buildPrompt", () => {
       expect(append).toContain("SOUL.md");
       expect(append).toContain("update SOUL.md accordingly");
     });
+  });
+});
+
+describe("learning prompt rules (PLAN C.3, DECISIONS 4)", () => {
+  let tmpDir: string;
+  beforeEach(() => { tmpDir = mkdtempSync(join(tmpdir(), "kirie-test-learning-rules-")); });
+  afterEach(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  function prompts(): string[] {
+    const chat = buildPrompt({ config: { ...baseConfig, dataDir: tmpDir }, channel: dmChannel, sender: ownerSender });
+    const background = buildBackgroundTaskSystemPrompt({ ...baseConfig, dataDir: tmpDir });
+    return [`${chat.systemPrompt.append}\n${DEFAULT_SYSTEM_PROMPT}`, background];
+  }
+
+  it("the old self-edit text is gone from the chat and background prompts", () => {
+    for (const text of prompts()) {
+      expect(text).not.toContain("you document it as a reusable skill");
+      expect(text).not.toContain("document it as a skill");
+      expect(text).not.toContain("Update skills when you find better approaches");
+      expect(text).not.toContain("Learning something = creating a skill");
+    }
+  });
+
+  it("says to propose with learning_propose and to edit skills only on the owner's explicit request", () => {
+    for (const text of prompts()) {
+      expect(text).toContain("learning_propose");
+      expect(text).toContain("only when the owner explicitly asks in the current conversation");
+      expect(text).toContain("Never edit SOUL.md, TOOLS.md or any skill on your own initiative");
+      expect(text).toContain("you cannot approve, apply or reject proposals");
+    }
+  });
+
+  it("keeps the direct memory DB rules (memoryPolicy direct is the default)", () => {
+    const [chat] = prompts();
+    expect(chat).toContain("Save things here aggressively and often");
   });
 });
