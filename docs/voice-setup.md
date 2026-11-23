@@ -127,6 +127,8 @@ voice:
     maxCallSeconds: 300
     maxCallsPerDay: 10
     maxMinutesPerDay: 20
+    maxUnverifiedCallsPerDay: 10  # voicemails and calls still at the PIN prompt
+    maxUnverifiedMinutesPerDay: 10
     maxConcurrentCalls: 1
     maxTurnsPerCall: 30
     maxThinkSeconds: 60
@@ -205,7 +207,11 @@ Caps apply across both providers:
 - concurrent calls
 - turns per call
 
-Caps are checked before a call is answered or dialled, and the defaults are low. When a cap refuses a call, you get one notice per day.
+Inbound calls that nobody has verified yet (voicemails, and calls from your number that are still at the PIN prompt) have their own daily budget, `maxUnverifiedCallsPerDay` and `maxUnverifiedMinutesPerDay`. So strangers leaving voicemails, or someone spoofing your number at the PIN prompt, cannot use up the calls and minutes that `/call`, the agent and your own verified calls need. A call moves to the main caps once its PIN is right, and a PIN prompt is only offered while the main caps still have room. Worst case per day is therefore the main caps plus the unverified budget (30 minutes with the defaults, against 20 before this budget existed). They can still use up the unverified budget, which also blocks your own calls in for the rest of the day, because a call is unverified until its PIN is entered; `/call me` keeps working.
+
+Caps are checked before a call is answered or dialled, and the defaults are low. When a cap refuses a call, you get one notice per day for each budget.
+
+A signed `/inbound` webhook for a call id Kirie already knows, and that has ended, is refused without using any cap: a captured request cannot be replayed to open a new call.
 
 ## First-call checklist
 
@@ -215,7 +221,7 @@ Do this once per provider, cheapest first:
 2. `curl https://kirie.example.com/healthz` returns `ok`. Through the tunnel, `curl -X POST https://kirie.example.com/voice/<provider>/inbound` must return **403**: it is unsigned. `https://kirie.example.com/status` must **not** answer; the control plane must not be reachable.
 3. `/call me This is a test.` Your phone rings, you hear the announcement and the message, you say something, and the reply appears in Telegram. `/voice status` then shows "last valid webhook: … ago".
 4. `/call me --talk` Have a two-turn conversation. Then ask something slow and check that you hear "One moment.", and that the answer still arrives.
-5. Inbound, if you want it: set `inbound.mode: agent`, restart, call your provider number from your phone, enter the PIN and press `#`. Then test a wrong PIN three times: you should get a Telegram alert, and for `pinLockoutMinutes` your number should be refused. Wrong PINs are counted per number over 24 hours across calls, so hanging up between guesses does not help. Silence at the PIN prompt only ends the call.
+5. Inbound, if you want it: set `inbound.mode: agent`, restart, call your provider number from your phone, enter the PIN and press `#`. Then test a wrong PIN three times: you should get a Telegram alert, and for `pinLockoutMinutes` your number should be refused. Wrong PINs are counted per number over 24 hours across calls, so hanging up between guesses does not help, and a lockout does not reset that count: after one, each further wrong PIN within the 24 hours locks the number again. Lockouts within 7 days escalate, each twice as long as the one before (30, 60, 120 minutes and so on with the default, at most 24 hours). Only the right PIN clears the count and the escalation. Lockouts are stored in `~/.kirie/voice-calls/pin-guard.json` (0600), so a restart does not clear them; to unlock your number early, delete that file and restart. Silence at the PIN prompt only ends the call.
 6. Call from a number that is not yours. It must be rejected, or must reach voicemail if you set `unknownCallers: voicemail`.
 7. On Plivo, also run the checks in the next section.
 

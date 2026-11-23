@@ -205,6 +205,30 @@ describe("CallStore", () => {
     expect(s.recent(10).length).toBeGreaterThanOrEqual(0);
   });
 
+  it("usageToday keeps unverified inbound calls in their own count (VOICE-N4)", () => {
+    const s = new CallStore(dir, () => now);
+    s.create({ ...base, state: "completed", durationSeconds: 60 });
+    const vm = s.create({ ...base, direction: "inbound", mode: "voicemail", role: "unknown", remote: "…0123", requestedBy: "inbound", state: "completed", durationSeconds: 20, unverified: true });
+    expect(s.usageToday()).toEqual({ calls: 1, seconds: 60 });
+    expect(s.usageToday({ unverified: true })).toEqual({ calls: 1, seconds: 20 });
+    s.update(vm.id, { unverified: false });
+    expect(s.usageToday()).toEqual({ calls: 2, seconds: 80 });
+    expect(new CallStore(dir, () => now).usageToday({ unverified: true })).toEqual({ calls: 0, seconds: 0 });
+  });
+
+  it("PIN guard state persists in a 0600 file and survives a reload (VOICE-N5)", () => {
+    const s = new CallStore(dir, () => now);
+    expect(s.pinState("+201001234567")).toEqual({ failures: [], lockouts: [] });
+    s.setPinState("+201001234567", { failures: [now - 1000, now], lockouts: [now], lockedUntil: now + 60_000 });
+    expect(statSync(join(dir, "pin-guard.json")).mode & 0o777).toBe(0o600);
+    const reloaded = new CallStore(dir, () => now);
+    expect(reloaded.pinState("+201001234567")).toEqual({ failures: [now - 1000, now], lockouts: [now], lockedUntil: now + 60_000 });
+    reloaded.setPinState("+201001234567", null);
+    expect(new CallStore(dir, () => now).pinState("+201001234567")).toEqual({ failures: [], lockouts: [] });
+    writeFileSync(join(dir, "pin-guard.json"), "{not json");
+    expect(new CallStore(dir, () => now).pinState("+201001234567")).toEqual({ failures: [], lockouts: [] });
+  });
+
   it("recent is newest first", () => {
     let t = now;
     const s = new CallStore(dir, () => t);

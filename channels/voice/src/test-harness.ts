@@ -72,14 +72,18 @@ export interface HarnessOptions {
   fetchStatus?: number;
   approval?: "approved" | "denied" | "timeout" | "unavailable";
   busy?: boolean;
+  /** Reuse this directory (a daemon restart on the same call store). */
+  dir?: string;
+  /** Start the clock here (epoch ms). */
+  startAt?: number;
 }
 
 export interface FetchCall { url: string; method: string; body: string }
 
 export async function makeHarness(opts: HarnessOptions = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "kirie-voice-harness-"));
+  const dir = opts.dir ?? mkdtempSync(join(tmpdir(), "kirie-voice-harness-"));
   const provider = opts.provider ?? "twilio";
-  let clock = new Date(2026, 10, 23, 12, 0, 0).getTime();
+  let clock = opts.startAt ?? new Date(2026, 10, 23, 12, 0, 0).getTime();
   const config: VoiceConfig = VoiceConfigSchema.parse({
     enabled: true,
     provider,

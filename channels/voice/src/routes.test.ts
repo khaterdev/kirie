@@ -345,13 +345,119 @@ describe.each(providers)("voice routes (%s)", (provider) => {
 
   it("concurrency and daily caps reject", async () => {
     h = await agentHarness(provider, { limits: { maxCallsPerDay: 1 }, inbound: { mode: "agent", unknownCallers: "voicemail" } });
-    await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-caps-0001" }));
+    await connectOwner(h, "id-caps-0001");
     const busy = await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-caps-0002", from: STRANGER }))).text();
     expect(busy).toMatch(provider === "twilio" ? /<Reject reason="busy"\/>/ : /<Hangup reason="busy"\/>/);
     await h.service.hangupAll("test");
     const capped = await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-caps-0003" }))).text();
     expect(capped).toMatch(rejectRe(provider));
     expect(h.notifyOwner.mock.calls.some(([t]) => /daily call limit/.test(String(t)))).toBe(true);
+  });
+
+  it("a replayed, correctly signed /inbound for a call that already ended is refused and uses no cap (VOICE-N2)", async () => {
+    h = await agentHarness(provider, { inbound: { mode: "agent", unknownCallers: "voicemail" } });
+    const inbound = `${h.prefix}/inbound`;
+    // Reviewer proof: the same signed request (same signature and, on Plivo, same nonce) after the call ended.
+    const params = h.payload({ callId: "id-replay-0001" });
+    const headers = h.sign(inbound, params);
+    const first = await (await h.post(inbound, params, { headers })).text();
+    const pinToken = tokenIn(first, "pin")!;
+    await h.post(`${h.prefix}/pin/${pinToken}`, h.payload({ callId: "id-replay-0001", digits: PIN }));
+    await h.post(`${h.prefix}/status/${pinToken}`, h.payload({ callId: "id-replay-0001", status: "completed", duration: 20 }));
+    expect(h.service.live.size).toBe(0);
+    const callsBefore = h.store.recent(50).length;
+    const usageBefore = h.store.usageToday();
+    const replay = await h.post(inbound, params, { headers });
+    expect(replay.status).toBe(200);
+    const xml = await replay.text();
+    expect(xml).toMatch(rejectRe(provider));
+    for (const kind of ["pin", "turn", "vm", "wait"]) expect(tokenIn(xml, kind)).toBeNull();
+    expect(h.service.live.size).toBe(0);
+    expect(h.store.recent(50).length).toBe(callsBefore);
+    expect(h.store.usageToday()).toEqual(usageBefore);
+    // Also for a voicemail that ended, and for a call id the store knows from an outbound call.
+    const vm = await (await h.post(inbound, h.payload({ callId: "id-replay-0002", from: STRANGER }))).text();
+    await h.post(`${h.prefix}/vm/${tokenIn(vm, "vm")!}`, h.payload({ callId: "id-replay-0002", from: STRANGER, speech: "hi" }));
+    expect(await (await h.post(inbound, h.payload({ callId: "id-replay-0002", from: STRANGER }))).text()).toMatch(rejectRe(provider));
+    expect(h.service.live.size).toBe(0);
+  });
+
+  it("unverified inbound calls have their own daily cap and cannot use up the owner's (VOICE-N4)", async () => {
+    h = await agentHarness(provider, { limits: { maxCallsPerDay: 2, maxUnverifiedCallsPerDay: 4 }, inbound: { mode: "agent", unknownCallers: "voicemail" } });
+    const inbound = `${h.prefix}/inbound`;
+    // Reviewer proof: voicemails from strangers and PIN prompts from a spoofed owner number.
+    for (let i = 0; i < 2; i++) {
+      const vm = await (await h.post(inbound, h.payload({ callId: `id-unv-vm-${i}`, from: STRANGER }))).text();
+      await h.post(`${h.prefix}/vm/${tokenIn(vm, "vm")!}`, h.payload({ callId: `id-unv-vm-${i}`, from: STRANGER, speech: "" }));
+      const pin = await (await h.post(inbound, h.payload({ callId: `id-unv-pin-${i}` }))).text();
+      const t = tokenIn(pin, "pin")!;
+      for (let k = 0; k < 3; k++) await h.post(`${h.prefix}/pin/${t}`, h.payload({ callId: `id-unv-pin-${i}`, digits: "" }));
+    }
+    expect(h.service.live.size).toBe(0);
+    // The unverified cap is used up: a fifth unverified call is refused...
+    expect(await (await h.post(inbound, h.payload({ callId: "id-unv-vm-9", from: STRANGER }))).text()).toMatch(rejectRe(provider));
+    expect(h.notifyOwner.mock.calls.some(([t]) => /unverified/.test(String(t)))).toBe(true);
+    // ...but none of it counted against the owner's daily cap.
+    expect(h.store.usageToday().calls).toBe(0);
+    const placed = await h.service.placeCall({ alias: "me", text: "still works", mode: "say", requestedBy: "owner-command", actor: "owner" });
+    expect(placed.ok).toBe(true);
+  });
+
+  it("a call counts against the owner's cap once its PIN is right; a PIN call over the owner's cap is refused (VOICE-N4)", async () => {
+    h = await agentHarness(provider, { limits: { maxCallsPerDay: 1 } });
+    await connectOwner(h, "id-cap-own-0001");
+    expect(h.store.usageToday().calls).toBe(1);
+    await h.service.hangupAll("test");
+    // The owner's cap is full: no PIN prompt is offered, and no unverified slot is used.
+    const xml = await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-cap-own-0002" }))).text();
+    expect(xml).toMatch(rejectRe(provider));
+    expect(h.store.usageToday({ unverified: true }).calls).toBe(0);
+  });
+
+  it("PIN lockouts survive a restart (VOICE-N5)", async () => {
+    const first = await agentHarness(provider);
+    const t = tokenIn(await (await first.post(`${first.prefix}/inbound`, first.payload({ callId: "id-plock-0001" }))).text(), "pin")!;
+    for (const digits of ["0000", "1111", "2222"]) await first.post(`${first.prefix}/pin/${t}`, first.payload({ callId: "id-plock-0001", digits }));
+    expect(String(first.notifyOwner.mock.calls.at(-1)![0])).toMatch(/wrong PIN/);
+    first.service.flow.shutdown();
+    // Same call store, new process.
+    h = await makeHarness({ provider, dir: first.dir, startAt: first.now() + 60_000, config: { inbound: { mode: "agent" } } });
+    expect(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-plock-0002" }))).text()).toMatch(rejectRe(provider));
+    h.advance(30 * 60_000);
+    expect(tokenIn(await (await h.post(`${h.prefix}/inbound`, h.payload({ callId: "id-plock-0003" }))).text(), "pin")).not.toBeNull();
+  });
+
+  it("repeated lockouts escalate and the failure count does not reset at a lockout (VOICE-N5)", async () => {
+    h = await agentHarness(provider);
+    const x = h;
+    let n = 0;
+    const call = async () => tokenIn(await (await x.post(`${x.prefix}/inbound`, x.payload({ callId: `id-esc-${++n}` }))).text(), "pin");
+    const guess = async (token: string, digits: string) => x.post(`${x.prefix}/pin/${token}`, x.payload({ callId: `id-esc-${n}`, digits }));
+    const t1 = (await call())!;
+    for (const d of ["0000", "1111", "2222"]) await guess(t1, d);
+    expect(String(h.notifyOwner.mock.calls.at(-1)![0])).toMatch(/refused for 30 minutes/);
+    h.advance(31 * 60_000);
+    // One more wrong PIN within the day locks again, for twice as long.
+    const t2 = (await call())!;
+    const r = await (await guess(t2, "3333")).text();
+    expect(r).toContain("<Hangup/>");
+    expect(String(h.notifyOwner.mock.calls.at(-1)![0])).toMatch(/refused for 60 minutes/);
+    h.advance(31 * 60_000);
+    expect(await call()).toBeNull();
+    h.advance(30 * 60_000);
+    const t3 = (await call())!;
+    await guess(t3, "4444");
+    expect(String(h.notifyOwner.mock.calls.at(-1)![0])).toMatch(/refused for 120 minutes/);
+    // The right PIN after the lockout clears the failures and the escalation.
+    h.advance(121 * 60_000);
+    const t4 = (await call())!;
+    const ok = await (await guess(t4, PIN)).text();
+    expect(tokenIn(ok, "turn")).toBe(t4);
+    await h.service.hangupAll("test");
+    const t5 = (await call())!;
+    for (const d of ["0000", "1111"]) await guess(t5, d);
+    expect(tokenIn(await (await guess(t5, "2222")).text(), "pin")).toBeNull();
+    expect(String(h.notifyOwner.mock.calls.at(-1)![0])).toMatch(/refused for 30 minutes/);
   });
 
   it("a new inbound call from the same number supersedes a stale one, but never an active one", async () => {

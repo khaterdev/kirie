@@ -561,6 +561,8 @@ export class VoiceService {
     lines.push(`Outbound: ${cfg.outbound.enabled ? "on" : "off"}; agent calls: ${cfg.outbound.agentCalls}. Owner numbers: ${cfg.ownerNumbers.map((n) => maskNumber(n)).join(", ") || "none"}.`);
     const usage = this.d.store.usageToday();
     lines.push(`Today: ${usage.calls}/${cfg.limits.maxCallsPerDay} calls, ${Math.ceil(usage.seconds / 60)}/${cfg.limits.maxMinutesPerDay} minutes. Per call: ${cfg.limits.maxCallSeconds}s.`);
+    const unverified = this.d.store.usageToday({ unverified: true });
+    lines.push(`Unverified inbound today (voicemails, PIN prompts): ${unverified.calls}/${cfg.limits.maxUnverifiedCallsPerDay} calls, ${Math.ceil(unverified.seconds / 60)}/${cfg.limits.maxUnverifiedMinutesPerDay} minutes.`);
     const live = this.live.all();
     lines.push(`Live calls: ${live.length === 0 ? "none" : live.map((c) => `${c.alias ?? maskNumber(c.remote)} ${c.direction} ${c.mode} via ${c.provider} (${c.phase})`).join("; ")}`);
     const recent = this.d.store.recent(3);

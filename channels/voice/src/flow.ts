@@ -85,12 +85,21 @@ const MAX_CAPTURED_CHARS = 2000;
 const MAX_EMPTY_TURNS = 2;
 /** The PIN gather accepts up to the longest allowed PIN and ends on "#", so the prompt does not reveal the PIN length. */
 const PIN_GATHER_DIGITS = 10;
-/** Wrong PINs are counted per number across calls over this window, so hanging up between guesses does not help. */
+/**
+ * Wrong PINs are counted per number across calls over this window, so hanging up between guesses
+ * does not help. A lockout does not reset the count: after one, each further wrong PIN in the
+ * window locks again. Only the right PIN clears it.
+ */
 const PIN_FAILURE_WINDOW_MS = 24 * 3600_000;
+/** Lockouts within this window escalate: each doubles the one before, up to PIN_LOCKOUT_MAX_MINUTES. */
+const PIN_LOCKOUT_HISTORY_MS = 7 * 24 * 3600_000;
+const PIN_LOCKOUT_MAX_MINUTES = 24 * 60;
 /** A live call with no webhook for this long has ended without telling us. */
 const STALE_CALL_MS = 30_000;
 
-export type CapCheck = { ok: true; timeLimitSeconds: number } | { ok: false; reason: string; busy: boolean };
+export type CapCheck = { ok: true; timeLimitSeconds: number; remainingSeconds: number } | { ok: false; reason: string; busy: boolean };
+/** "verified": outbound calls and inbound calls past the PIN; "unverified": voicemails and calls at the PIN prompt. */
+export type CapBudget = "verified" | "unverified";
 
 export class VoiceCallFlow {
   private readonly d: VoiceFlowDeps;
@@ -99,13 +108,10 @@ export class VoiceCallFlow {
   private readonly holdMs: number;
   private readonly setTimer: (fn: () => void, ms: number) => TimerHandle;
   private readonly clearTimer: (h: TimerHandle) => void;
-  /** Owner number -> lockout end (epoch ms). In memory: a restart clears lockouts. */
-  private readonly lockouts = new Map<string, number>();
-  /** Owner number -> times of wrong (non-empty) PIN entries, across calls, within PIN_FAILURE_WINDOW_MS. */
-  private readonly pinFailures = new Map<string, number[]>();
   /** Markup already returned for rejected inbound calls, keyed provider:callId, for duplicate webhooks. */
   private readonly rejected = new Map<string, string>();
-  private capNoticeDay: string | null = null;
+  /** "<day>:<budget>" of the cap notices already sent. */
+  private readonly capNotices = new Set<string>();
 
   constructor(deps: VoiceFlowDeps) {
     this.d = deps;
@@ -146,23 +152,37 @@ export class VoiceCallFlow {
   }
 
   /** Caps shared by inbound and outbound calls and by both providers. */
-  checkCaps(): CapCheck {
+  checkCaps(budget: CapBudget = "verified", opts: { ignoreConcurrency?: boolean } = {}): CapCheck {
     const limits = this.d.config().limits;
-    if (this.d.live.size >= limits.maxConcurrentCalls) return { ok: false, reason: "another call is in progress", busy: true };
-    const usage = this.d.store.usageToday();
-    if (usage.calls >= limits.maxCallsPerDay) {
-      return { ok: false, reason: `the daily call limit (${limits.maxCallsPerDay}) is reached`, busy: false };
+    if (!opts.ignoreConcurrency && this.d.live.size >= limits.maxConcurrentCalls) return { ok: false, reason: "another call is in progress", busy: true };
+    const unverified = budget === "unverified";
+    const usage = this.d.store.usageToday({ unverified });
+    const maxCalls = unverified ? limits.maxUnverifiedCallsPerDay : limits.maxCallsPerDay;
+    const maxMinutes = unverified ? limits.maxUnverifiedMinutesPerDay : limits.maxMinutesPerDay;
+    if (usage.calls >= maxCalls) {
+      return {
+        ok: false,
+        reason: unverified ? `the daily limit for unverified inbound calls (${maxCalls}) is reached` : `the daily call limit (${maxCalls}) is reached`,
+        busy: false,
+      };
     }
-    const remaining = limits.maxMinutesPerDay * 60 - usage.seconds;
-    if (remaining < 30) return { ok: false, reason: `the daily limit of ${limits.maxMinutesPerDay} minutes is used up`, busy: false };
-    return { ok: true, timeLimitSeconds: Math.min(limits.maxCallSeconds, remaining) };
+    const remaining = maxMinutes * 60 - usage.seconds;
+    if (remaining < 30) {
+      return {
+        ok: false,
+        reason: unverified ? `the daily ${maxMinutes} minutes for unverified inbound calls are used up` : `the daily limit of ${maxMinutes} minutes is used up`,
+        busy: false,
+      };
+    }
+    return { ok: true, timeLimitSeconds: Math.min(limits.maxCallSeconds, remaining), remainingSeconds: remaining };
   }
 
-  private noticeCapOnce(reason: string): void {
-    const day = new Date(this.now()).toDateString();
-    if (this.capNoticeDay === day) return;
-    this.capNoticeDay = day;
-    void this.d.notifyOwner(`Voice: a call was refused because ${reason}. The caps reset at midnight.`, { key: "voice-cap" });
+  private noticeCapOnce(reason: string, budget: CapBudget = "verified"): void {
+    const key = `${new Date(this.now()).toDateString()}:${budget}`;
+    if (this.capNotices.has(key)) return;
+    this.capNotices.add(key);
+    if (this.capNotices.size > 20) this.capNotices.delete(this.capNotices.values().next().value!);
+    void this.d.notifyOwner(`Voice: a call was refused because ${reason}. The caps reset at midnight.`, { key: budget === "verified" ? "voice-cap" : "voice-cap-unverified" });
   }
 
   private pinMatches(given: string | undefined): boolean {
@@ -177,14 +197,10 @@ export class VoiceCallFlow {
     return timingSafeEqual(a, b);
   }
 
+  /** Lockouts live in the call store, so a restart does not clear them. */
   private isLockedOut(remote: string): boolean {
-    const until = this.lockouts.get(remote);
-    if (until === undefined) return false;
-    if (until <= this.now()) {
-      this.lockouts.delete(remote);
-      return false;
-    }
-    return true;
+    const until = this.d.store.pinState(remote).lockedUntil;
+    return until !== undefined && until > this.now();
   }
 
   private scheduleWatchdog(call: LiveCall): void {
@@ -313,6 +329,13 @@ export class VoiceCallFlow {
     const dupKey = `${provider.name}:${event.providerCallId}`;
     const dup = this.rejected.get(dupKey);
     if (dup) return { status: 200, markup: dup };
+    // A call id the store already knows and that is not live has ended: a later /inbound for it is a
+    // replay of a captured request (or a provider retry after the end). Refused before any cap is used.
+    if (this.d.store.byProviderCallId(provider.name, event.providerCallId)) {
+      this.log.warn({ provider: provider.name }, "inbound webhook for a call that already ended; refused");
+      this.d.audit?.("call.inbound-replay", { provider: provider.name });
+      return { status: 200, markup: provider.markup.reject("rejected") };
+    }
 
     const markup = this.decideInbound(provider, event);
     if (markup.rejected) {
@@ -350,9 +373,20 @@ export class VoiceCallFlow {
         this.finish(old, { reason: "superseded" });
       }
     }
-    const caps = this.checkCaps();
+    // Voicemails and calls that still have to pass the PIN use their own budget (unverified callers
+    // must not use up the owner's caps). A PIN call is offered only while the owner's caps have room.
+    const unverified = mode === "voicemail" || cfg.inbound.requirePin;
+    if (mode === "agent" && unverified) {
+      const owner = this.checkCaps("verified", { ignoreConcurrency: true });
+      if (!owner.ok) {
+        this.noticeCapOnce(owner.reason, "verified");
+        return reject("rejected", owner.reason);
+      }
+    }
+    const budget: CapBudget = unverified ? "unverified" : "verified";
+    const caps = this.checkCaps(budget);
     if (!caps.ok) {
-      if (!caps.busy) this.noticeCapOnce(caps.reason);
+      if (!caps.busy) this.noticeCapOnce(caps.reason, budget);
       return reject(caps.busy ? "busy" : "rejected", caps.reason);
     }
 
@@ -367,6 +401,7 @@ export class VoiceCallFlow {
       requestedBy: "inbound",
       state: "in-progress",
       answeredAt: now,
+      ...(unverified ? { unverified: true } : {}),
     });
     const call: LiveCall = {
       token: newCallToken(),
@@ -417,28 +452,47 @@ export class VoiceCallFlow {
     const digits = event.digits?.trim() ?? "";
     const remote = call.remote ?? "";
     if (digits && this.pinMatches(digits)) {
+      // The right PIN clears the failures and the lockout escalation.
+      if (remote) this.d.store.setPinState(remote, null);
+      // Verified from here on: the call moves to the owner's caps, which must still have room.
+      const caps = this.checkCaps("verified", { ignoreConcurrency: true });
+      if (!caps.ok) {
+        this.noticeCapOnce(caps.reason, "verified");
+        const xml = provider.markup.sayAndHangup(`Sorry, ${caps.reason}. Goodbye.`, this.speech(provider));
+        this.finish(call, { reason: "cap-reached" });
+        return { status: 200, markup: xml };
+      }
+      this.d.store.update(call.callId, { unverified: false });
+      const now = this.now();
+      call.deadline = Math.min((call.answeredAt ?? now) + cfg.limits.maxCallSeconds * 1000, now + caps.remainingSeconds * 1000);
+      this.scheduleWatchdog(call);
       call.phase = "listening";
-      this.pinFailures.delete(remote);
       this.log.info({ callId: call.callId }, "pin accepted");
       return { status: 200, markup: this.gather(provider, call, [cfg.inbound.greeting]) };
     }
     call.pinAttempts++;
     let failures = 0;
-    if (digits) {
-      const since = this.now() - PIN_FAILURE_WINDOW_MS;
-      const list = (this.pinFailures.get(remote) ?? []).filter((t) => t > since);
-      list.push(this.now());
-      this.pinFailures.set(remote, list);
+    let lockoutMinutes = 0;
+    if (digits && remote) {
+      const now = this.now();
+      const state = this.d.store.pinState(remote);
+      const list = [...state.failures.filter((t) => t > now - PIN_FAILURE_WINDOW_MS), now];
+      let lockouts = state.lockouts.filter((t) => t > now - PIN_LOCKOUT_HISTORY_MS);
+      let lockedUntil = state.lockedUntil !== undefined && state.lockedUntil > now ? state.lockedUntil : undefined;
       failures = list.length;
+      if (failures >= cfg.inbound.maxPinAttempts) {
+        lockouts = [...lockouts, now];
+        lockoutMinutes = Math.min(PIN_LOCKOUT_MAX_MINUTES, cfg.inbound.pinLockoutMinutes * 2 ** (lockouts.length - 1));
+        lockedUntil = now + lockoutMinutes * 60_000;
+      }
+      this.d.store.setPinState(remote, { failures: list, lockouts, ...(lockedUntil !== undefined ? { lockedUntil } : {}) });
       this.log.warn({ callId: call.callId, attempt: call.pinAttempts, failures }, "wrong pin");
     }
-    if (failures >= cfg.inbound.maxPinAttempts) {
-      this.pinFailures.delete(remote);
-      if (remote) this.lockouts.set(remote, this.now() + cfg.inbound.pinLockoutMinutes * 60_000);
-      this.d.audit?.("pin.lockout", { callId: call.callId, provider: provider.name, minutes: cfg.inbound.pinLockoutMinutes });
+    if (lockoutMinutes > 0) {
+      this.d.audit?.("pin.lockout", { callId: call.callId, provider: provider.name, minutes: lockoutMinutes });
       void this.d.notifyOwner(
         `Voice: ${failures} wrong PIN attempts within a day on calls from your number ${maskNumber(call.remote)} via ${provider.name}. ` +
-        `Calls from it are refused for ${cfg.inbound.pinLockoutMinutes} minutes. If this was not you, someone is spoofing your number.`,
+        `Calls from it are refused for ${lockoutMinutes} minutes. If this was not you, someone is spoofing your number.`,
       );
       const xml = provider.markup.sayAndHangup("Sorry, that is not right. Goodbye.", this.speech(provider));
       this.finish(call, { reason: "pin-failed" });

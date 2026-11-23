@@ -227,6 +227,8 @@ proactive:
 #     maxCallSeconds: 300
 #     maxCallsPerDay: 10
 #     maxMinutesPerDay: 20
+#     maxUnverifiedCallsPerDay: 10  # voicemails and calls at the PIN prompt, counted apart
+#     maxUnverifiedMinutesPerDay: 10
 #     maxConcurrentCalls: 1
 #     maxTurnsPerCall: 30
 #     maxThinkSeconds: 60         # then the answer comes on Telegram instead

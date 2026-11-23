@@ -5,6 +5,9 @@
  * on the local calendar day and is shared by both providers.
  *
  * Numbers of anyone who is not the owner are stored masked (last 4 digits).
+ *
+ * PIN guard state (wrong-PIN times, lockouts) is kept per owner number in
+ * <dir>/pin-guard.json (0600), so a restart does not clear a lockout.
  */
 
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -43,6 +46,22 @@ export interface CallRecord {
   capturedReply?: string;
   /** Length of the spoken message for outbound "say" calls. The text itself is not stored. */
   messageChars?: number;
+  /**
+   * An inbound call nobody has verified (voicemail, or still at the PIN prompt).
+   * Counted in its own daily budget, not in the main caps.
+   */
+  unverified?: boolean;
+}
+
+/** Wrong PINs and lockouts for one owner number (epoch ms). */
+export interface PinGuardState {
+  failures: number[];
+  lockouts: number[];
+  lockedUntil?: number;
+}
+
+function isNumberList(v: unknown): v is number[] {
+  return Array.isArray(v) && v.every((n) => typeof n === "number" && Number.isFinite(n));
 }
 
 export type NewCall = Omit<CallRecord, "id" | "createdAt" | "turns" | "state"> & { state?: CallState };
@@ -59,13 +78,57 @@ export class CallStore {
   private readonly file: string;
   private readonly now: () => number;
   private readonly records = new Map<string, CallRecord>();
+  private readonly pinFile: string;
+  private readonly pinGuard = new Map<string, PinGuardState>();
 
   constructor(dir: string, now: () => number = Date.now) {
     this.now = now;
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     try { chmodSync(dir, 0o700); } catch { /* best effort on foreign filesystems */ }
     this.file = join(dir, "calls.jsonl");
+    this.pinFile = join(dir, "pin-guard.json");
     this.load();
+    this.loadPinGuard();
+  }
+
+  private loadPinGuard(): void {
+    if (!existsSync(this.pinFile)) return;
+    try {
+      const raw = JSON.parse(readFileSync(this.pinFile, "utf8")) as unknown;
+      if (!raw || typeof raw !== "object") return;
+      for (const [remote, v] of Object.entries(raw as Record<string, unknown>)) {
+        if (!v || typeof v !== "object") continue;
+        const s = v as Record<string, unknown>;
+        if (!isNumberList(s.failures) || !isNumberList(s.lockouts)) continue;
+        const lockedUntil = typeof s.lockedUntil === "number" && Number.isFinite(s.lockedUntil) ? s.lockedUntil : undefined;
+        this.pinGuard.set(remote, { failures: s.failures, lockouts: s.lockouts, ...(lockedUntil !== undefined ? { lockedUntil } : {}) });
+      }
+    } catch {
+      // A corrupt file is ignored; the next write replaces it.
+    }
+  }
+
+  /** PIN guard state for one number (a copy; empty when none). */
+  pinState(remote: string): PinGuardState {
+    const s = this.pinGuard.get(remote);
+    return s ? { failures: [...s.failures], lockouts: [...s.lockouts], ...(s.lockedUntil !== undefined ? { lockedUntil: s.lockedUntil } : {}) } : { failures: [], lockouts: [] };
+  }
+
+  /** Replace the PIN guard state for one number (null clears it) and write the file. */
+  setPinState(remote: string, state: PinGuardState | null): void {
+    if (!state || (state.failures.length === 0 && state.lockouts.length === 0 && state.lockedUntil === undefined)) {
+      if (!this.pinGuard.delete(remote)) return;
+    } else {
+      this.pinGuard.set(remote, { failures: [...state.failures], lockouts: [...state.lockouts], ...(state.lockedUntil !== undefined ? { lockedUntil: state.lockedUntil } : {}) });
+    }
+    const tmp = `${this.pinFile}.tmp`;
+    try {
+      writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.pinGuard)), { mode: 0o600 });
+      renameSync(tmp, this.pinFile);
+      chmodSync(this.pinFile, 0o600);
+    } catch {
+      // In-memory state stays authoritative for this process.
+    }
   }
 
   private load(): void {
@@ -162,14 +225,20 @@ export class CallStore {
     return n;
   }
 
-  /** Calls created today and seconds used today (finished calls' durations plus live calls' elapsed time), both providers. */
-  usageToday(): { calls: number; seconds: number } {
+  /**
+   * Calls created today and seconds used today (finished calls' durations plus
+   * live calls' elapsed time), both providers. Unverified inbound calls are
+   * counted only with `{ unverified: true }`, everything else only without it.
+   */
+  usageToday(opts: { unverified?: boolean } = {}): { calls: number; seconds: number } {
     const now = this.now();
     const start = dayStart(now);
+    const wantUnverified = opts.unverified === true;
     let calls = 0;
     let seconds = 0;
     for (const r of this.records.values()) {
       if (r.createdAt < start) continue;
+      if ((r.unverified === true) !== wantUnverified) continue;
       calls++;
       if (r.durationSeconds !== undefined) seconds += r.durationSeconds;
       else if (!TERMINAL_CALL_STATES.has(r.state) && r.answeredAt) seconds += Math.max(0, Math.round((now - r.answeredAt) / 1000));
