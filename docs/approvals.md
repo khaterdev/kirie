@@ -6,16 +6,31 @@ how much it asks with `/approvals` in your DM.
 
 ## Modes
 
-- **yolo** (default): nothing is asked. This is Kirie's behaviour from before
-  the gate existed, with two exceptions that block in every mode:
+- **yolo** (default): nothing is asked. Compared with Kirie before the gates
+  existed, these still block in every mode:
   - the **hardline list**: catastrophic, irrecoverable commands only:
     recursive delete of `/`, your home folder, `/Users` or a system root
-    (also `find <root> -delete`), disk formatting and raw device writes, fork
-    bombs, recursive chmod/chown of those roots;
-  - your own **deny list** (`/approvals deny <pattern>`), empty by default.
+    (also `find <root> -delete`, and through the macOS aliases
+    `/System/Volumes/Data/...` and `/Volumes/Macintosh HD/...`), disk
+    formatting and raw device writes, fork bombs, recursive chmod/chown of
+    those roots. It also applies to commands sent to another machine or a
+    container (`ssh host 'rm -rf ~'`, `kubectl exec`, `docker exec`, the
+    docker sandbox shell), and to `Bash`, `Monitor` and `PowerShell` alike;
+  - your own **deny list** (`/approvals deny <pattern>`), if you set one
+    (empty by default);
+  - the **reserved MCP gate**: tools of MCP servers named `cua-driver` or
+    `cua-computer-use` are denied unless computer use is armed for your own
+    DM. It changes nothing if you have no such server;
+  - the **computer-use shell tripwire**, only while `computerUse.enabled` is
+    true (off by default): commands that run `cua-driver` or open
+    `CuaDriver.app` are denied unless computer use is armed (see
+    docs/computer-use-setup.md). Commands that only mention it pass;
+  - the **skill write guard** (`learning.skillWriteGuard`, default
+    `enforce`), which belongs to self-learning, not to this gate.
 
   `/approvals hardline off` (or `approvals.hardline: false` in config.yaml)
-  turns the hardline list off and restores the exact old behaviour.
+  turns the hardline list off: the approval gate then blocks nothing in yolo
+  except your deny list. The other items above are separate switches.
 - **ask**: risky actions wait for your Approve or Deny on a card in your DM.
   - scope **dangerous** (default): only commands that match a dangerous rule,
     sensitive tools, protected paths, and commands Kirie cannot read with
@@ -88,14 +103,30 @@ cannot see inside:
 - aliases or shell functions defined in an earlier command.
 
 Commands it cannot read with confidence (inline interpreter code, `eval` or
-`bash -c` of computed text, here-documents fed to a shell, piped input run as
-code, unbalanced quotes, invisible or direction-changing characters, very long
-commands) are treated as **uncertain**: they ask in `ask` mode and run in
-`yolo`. For an enforced boundary combine `ask` mode with the sandbox
-(`/sandbox`).
+`bash -c` of computed text, here-documents or substituted scripts fed to a
+shell or to `source`, piped input run as code, zsh glob qualifiers and
+`always` blocks, more wrappers or nested blocks than the parser follows,
+unbalanced quotes, invisible or direction-changing characters, very long
+commands, PowerShell) are treated as **uncertain**: they ask in `ask` mode and
+run in `yolo`. Where the text is literal (`bash <(echo '...')`,
+`trap '...' EXIT`) it is also read as a command, so the hardline list and
+your deny list still see it. For an enforced boundary combine `ask` mode with
+the sandbox (`/sandbox`).
 
-The agent cannot change any of this: there is no tool or HTTP route that
-approves, changes the mode or edits the lists (the `approval_status` tool only
-reads the mode, scope and pending count), scheduled or injected text never
-runs a command, and Kirie's own settings, config and state files are on the
-protected-write list.
+What the agent cannot do: there is no tool or HTTP route that approves,
+changes the mode or edits the lists (the `approval_status` tool only reads the
+mode, scope and pending count), and scheduled or injected text never runs a
+command.
+
+What it **can** do, and the residual risk: Kirie's own settings, config and
+state files are on the protected-write list, but a protected path only
+**asks in `ask` mode**. In **yolo** (the default) a write to a protected path
+is allowed and only recorded in the audit log. So in yolo the agent can edit
+the runtime settings file (`~/.kirie/state/runtime-settings.json`, where
+`/approvals`, `/goal on`, `/loop on`, learning and plugin switches are
+stored), `config.yaml` (also through `mcp_servers_add`) and the other state
+files, and restart the daemon (`gateway_restart` and killing the process are
+not asked in yolo); the edited settings take effect at the next start. Use
+`ask` mode (plus the sandbox) if that matters to you. In `ask` mode protected
+paths are matched after macOS path aliases, case folding and directory
+destinations (`cp x ~/.kirie/`) are resolved.
