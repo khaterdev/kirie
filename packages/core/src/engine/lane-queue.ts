@@ -95,6 +95,17 @@ export class LaneQueue<T = unknown> {
   }
 
   /**
+   * True when the lane has a running task, queued tasks, or a pending debounce.
+   *
+   * @param sessionKey - The session key to query
+   */
+  isBusy(sessionKey: string): boolean {
+    const lane = this.lanes.get(sessionKey);
+    if (!lane) return false;
+    return lane.running || lane.queue.length > 0 || lane.debounceTimer !== null;
+  }
+
+  /**
    * Clear all pending tasks for a session key.
    * The currently running task (if any) will still complete.
    * Pending tasks are rejected with an Error.

@@ -59,6 +59,7 @@ export * from "./config/backup.js";
 export * from "./security/gate.js";
 export * from "./routing/resolve-route.js";
 export * from "./routing/pipeline.js";
+export * from "./routing/scheduled-injection.js";
 // session-key: ChatType re-exported from normalizer already
 export {
   type SessionKeyParts,
