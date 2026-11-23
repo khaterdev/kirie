@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   CURATOR_INVENTORY_INITIALIZED_KEY,
@@ -332,3 +332,66 @@ describe("buildFixedSkillMd", () => {
   });
 });
 
+
+describe("review regressions", () => {
+  it("never proposes archiving or merging a skill bound to an agent", async () => {
+    kv.set(USAGE_TRACKING_STARTED_KEY, "2026-01-01T00:00:00.000Z");
+    mkdirSync(join(tree.root, "bound-hollow"));
+    tree.write("bound-a", { "SKILL.md": skillMd("shared") });
+    tree.write("bound-b", { "SKILL.md": skillMd("shared") });
+    const res = await curator({ protectedSkills: () => ["bound-hollow", "bound-a", "bound-b"] }).run({ trigger: "command" });
+    if (res.status !== "ok") throw new Error("busy");
+    expect(res.report.proposals).toEqual([]);
+  });
+
+  it("does not archive the kept copy of a duplicate in a later run, nor keep a copy that is waiting to be archived", async () => {
+    kv.set(USAGE_TRACKING_STARTED_KEY, "2026-01-01T00:00:00.000Z");
+    tree.write("copy-a", { "SKILL.md": skillMd("shared") });
+    tree.write("copy-b", { "SKILL.md": skillMd("shared") });
+    const c = curator();
+    const first = await c.run({ trigger: "command" });
+    if (first.status !== "ok") throw new Error("busy");
+    expect(first.report.proposals.map((p) => p.skill)).toEqual(["copy-b"]);
+    // Both become old and unused: copy-a is the kept copy of a pending archive, so it is not proposed.
+    db.prepare("UPDATE skill_state SET first_seen_at = '2026-01-02T00:00:00.000Z'").run();
+    const second = await c.run({ trigger: "command" });
+    if (second.status !== "ok") throw new Error("busy");
+    expect(second.report.proposals).toEqual([]);
+  });
+
+  it("does not ask the model again about a group whose merge the owner rejected", async () => {
+    kv.set(USAGE_TRACKING_STARTED_KEY, NOW.toISOString());
+    tree.write("git-commit", { "SKILL.md": skillMd("git-commit", "Write a git commit message for staged changes") });
+    tree.write("commit-git", { "SKILL.md": skillMd("commit-git", "Write git commit message for the staged changes") });
+    let n = 0;
+    const llm = vi.fn(async () => ({
+      value: { verdict: "merge", into: "git-commit", mergedSkillMd: skillMd("git-commit", `Merged ${++n}`), why: `attempt ${n}` },
+      costUsd: 0.001,
+    }));
+    const c = curator({ llm });
+    const first = await c.run({ trigger: "command", merge: true });
+    if (first.status !== "ok") throw new Error("busy");
+    // While pending: no second call.
+    await c.run({ trigger: "command", merge: true });
+    expect(llm).toHaveBeenCalledTimes(1);
+    store.markRejected(first.report.proposals[0]!.id, { by: "telegram:1001", via: "command", at: NOW.toISOString() }, "keep both");
+    const third = await c.run({ trigger: "command", merge: true });
+    if (third.status !== "ok") throw new Error("busy");
+    expect(llm).toHaveBeenCalledTimes(1);
+    expect(third.report.proposals).toEqual([]);
+  });
+
+  it("a symlinked or oversized SKILL.md is reported, never proposed as missing", async () => {
+    kv.set(USAGE_TRACKING_STARTED_KEY, NOW.toISOString());
+    const outside = join(tree.dir, "outside.md");
+    writeFileSync(outside, skillMd("linked-md"));
+    mkdirSync(join(tree.root, "linked-md"));
+    symlinkSync(outside, join(tree.root, "linked-md", "SKILL.md"));
+    tree.write("big", { "SKILL.md": "x".repeat(1_000_001) });
+    const res = await curator().run({ trigger: "command" });
+    if (res.status !== "ok") throw new Error("busy");
+    expect(res.report.proposals).toEqual([]);
+    expect(res.report.findings.filter((f) => f.detector === "unreadable").map((f) => f.skill).sort()).toEqual(["big", "linked-md"]);
+    expect(res.report.findings.some((f) => f.detector === "B1")).toBe(false);
+  });
+});

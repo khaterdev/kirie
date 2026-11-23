@@ -105,7 +105,19 @@ export function detectBroken(snapshots: readonly SkillSnapshot[], env: DetectorE
       out.push(finding(s, "nested", "broken", "warn", `Contains nested skills: ${s.nestedSkills.slice(0, 5).join(", ")}.`, { nested: s.nestedSkills.slice(0, 20) }));
     }
     if (s.raw === null) {
-      out.push(finding(s, "B1", "broken", "error", s.frontmatterError ?? "The directory has no SKILL.md."));
+      if (s.skillMdStatus === "missing") {
+        out.push(finding(s, "B1", "broken", "error", "The directory has no SKILL.md."));
+      } else {
+        const why = {
+          symlink: "SKILL.md is a symlink; the curator does not follow it",
+          not_file: "SKILL.md is not a regular file",
+          too_large: s.frontmatterError ?? "SKILL.md is too large to read",
+          unreadable: "SKILL.md could not be read",
+          ok: "",
+          missing: "",
+        }[s.skillMdStatus];
+        out.push(finding(s, "unreadable", "broken", "warn", `${why} (report only).`));
+      }
       continue;
     }
     if (s.frontmatter === null) {

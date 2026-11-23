@@ -7,6 +7,7 @@ import { TurnContextRegistry } from "../engine/turn-context.js";
 import { mintOwnerApproval, type OwnerApproval } from "./applier.js";
 import {
   CURATOR_ARCHIVE_MANIFEST,
+  createSkillArchiveHandler,
   curatorArchiveRoot,
   listArchivedSkills,
   moveSkillDir,
@@ -322,3 +323,64 @@ describe("persistence", () => {
     }
   });
 });
+
+describe("review regressions", () => {
+  it("refuses a skill that ships its own ARCHIVE.json (a symlink cannot be used to overwrite a file)", async () => {
+    const target = join(dir, "victim.txt");
+    writeFileSync(target, "keep me");
+    const d = writeSkill("tricky");
+    symlinkSync(target, join(d, CURATOR_ARCHIVE_MANIFEST));
+    const id = file("skill.archive", archivePayload("tricky"));
+    expect(await system.applier.approve(id, owner)).toMatchObject({ ok: false, code: "invalid" });
+    expect(readFileSync(target, "utf8")).toBe("keep me");
+    expect(existsSync(join(skillsRoot, "tricky", "SKILL.md"))).toBe(true);
+  });
+
+  it("never changes a forbidden root reached through a symlinked parent", async () => {
+    const userClaude = join(dir, "home", ".claude");
+    mkdirSync(join(userClaude, "skills", "personal"), { recursive: true });
+    writeFileSync(join(userClaude, "skills", "personal", "SKILL.md"), skillMd("personal"));
+    const otherData = join(dir, "other-kirie");
+    mkdirSync(otherData);
+    symlinkSync(userClaude, join(otherData, ".claude"));
+    const aliased: CuratorApplyDeps = { ...deps, skillsRoot: join(otherData, ".claude", "skills"), forbiddenRoots: [join(userClaude, "skills")] };
+    const handler = registerOn(aliased);
+    await expect(handler.apply({ name: "personal", reason: "x", evidence: { detector: "stale", useCount: 0 }, contentHash: sha256Hex(skillMd("personal")) }, { proposalId: 1, backupDir: dir }))
+      .rejects.toMatchObject({ code: "invalid" });
+    expect(existsSync(join(userClaude, "skills", "personal", "SKILL.md"))).toBe(true);
+    expect(restoreArchivedSkill(aliased, "personal")).toMatchObject({ ok: false });
+  });
+
+  it("moves the skill back when a step after the move fails", async () => {
+    writeSkill("fragile");
+    const failing = Object.create(system.skillState, { markArchived: { value: () => { throw new Error("database is locked"); } } }) as SkillStateStore;
+    const handler = registerOn({ ...deps, skillState: failing });
+    await expect(handler.apply(archivePayload("fragile"), { proposalId: 1, backupDir: dir })).rejects.toThrow("database is locked");
+    expect(readFileSync(join(skillsRoot, "fragile", "SKILL.md"), "utf8")).toBe(skillMd("fragile"));
+    expect(existsSync(join(skillsRoot, "fragile", CURATOR_ARCHIVE_MANIFEST))).toBe(false);
+    expect(listArchivedSkills(deps.archiveRoot)).toEqual([]);
+  });
+
+  it("refuses to archive the kept copy of an archived duplicate", async () => {
+    writeSkill("keep");
+    writeSkill("dupe", skillMd("keep"));
+    const dupeArchive = file("skill.archive", archivePayload("dupe", { absorbedInto: "keep" }));
+    expect((await system.applier.approve(dupeArchive, owner)).ok).toBe(true);
+    const keepArchive = file("skill.archive", archivePayload("keep"));
+    expect(await system.applier.approve(keepArchive, owner)).toMatchObject({ ok: false, code: "conflict" });
+    expect(existsSync(join(skillsRoot, "keep", "SKILL.md"))).toBe(true);
+  });
+
+  it("does not write approved copies through a symlinked directory", () => {
+    const elsewhere = join(dir, "elsewhere");
+    mkdirSync(elsewhere);
+    mkdirSync(deps.archiveRoot, { recursive: true });
+    symlinkSync(elsewhere, join(deps.archiveRoot, ".approved"));
+    expect(() => saveSkillApprovedCopy(deps.archiveRoot, "notes", skillMd("notes"))).toThrow(/symlink/);
+    expect(readdirSync(elsewhere)).toEqual([]);
+  });
+});
+
+function registerOn(d: CuratorApplyDeps) {
+  return createSkillArchiveHandler(d);
+}

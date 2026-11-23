@@ -34,5 +34,5 @@ export type {
 export { clusterPairs, jaccard, nameTokens, termCosine, vectorCosine, wordTokens } from "./similarity.js";
 export type { ScoredPair } from "./similarity.js";
 export { frontmatterDescription, frontmatterName, listSkillDirNames, sha256Text, snapshotSkill } from "./snapshot.js";
-export type { CuratorSkillRoot, CuratorSkillSource, SkillSnapshot, SnapshotOptions } from "./snapshot.js";
+export type { CuratorSkillRoot, CuratorSkillSource, SkillMdStatus, SkillSnapshot, SnapshotOptions } from "./snapshot.js";
 export { curatorReportHasNews, finalizeCuratorReport, newCuratorReport } from "./report.js";

@@ -8,7 +8,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { SkillStateRecord } from "@kirie/core";
 import { parseFrontmatter } from "../loader.js";
@@ -16,6 +16,7 @@ import type { SkillDefinition } from "../types.js";
 
 export type CuratorSkillRoot = "project" | "user";
 export type CuratorSkillSource = "bundled" | "learned" | "local" | "user";
+export type SkillMdStatus = "ok" | "missing" | "symlink" | "not_file" | "too_large" | "unreadable";
 
 export interface SkillSnapshot {
   name: string;
@@ -25,6 +26,12 @@ export interface SkillSnapshot {
   /** The skill directory itself is a symlink */
   isSymlink: boolean;
   skillMdPath: string | null;
+  /**
+   * `missing`: no SKILL.md at all (B1). `symlink`, `not_file`, `too_large`,
+   * `unreadable`: there is something, but the curator does not read it; these
+   * are reported and never proposed for any change.
+   */
+  skillMdStatus: SkillMdStatus;
   raw: string | null;
   contentHash: string | null;
   frontmatter: Record<string, unknown> | null;
@@ -121,6 +128,7 @@ export function snapshotSkill(dir: string, name: string, opts: SnapshotOptions):
     source: opts.source,
     isSymlink: link,
     skillMdPath: null,
+    skillMdStatus: "missing",
     raw: null,
     contentHash: null,
     frontmatter: null,
@@ -132,25 +140,34 @@ export function snapshotSkill(dir: string, name: string, opts: SnapshotOptions):
     ...(opts.bundledOriginal ? { bundledOriginal: opts.bundledOriginal } : {}),
   };
   const skillMd = join(dir, "SKILL.md");
+  let st: ReturnType<typeof lstatSync> | null = null;
   try {
-    const st = statSync(skillMd);
-    if (st.isFile()) {
-      base.skillMdPath = skillMd;
-      base.mtimeMs = st.mtimeMs;
-      if (st.size <= MAX_READ_BYTES) {
-        const raw = readFileSync(skillMd, "utf8");
-        base.raw = raw;
-        base.contentHash = sha256Text(raw);
-        const parsed = parseFrontmatter(raw);
-        base.frontmatter = parsed.frontmatter;
-        base.body = parsed.body;
-        if (parsed.error) base.frontmatterError = parsed.error;
-      } else {
-        base.frontmatterError = `SKILL.md is ${st.size} bytes; not read`;
-      }
-    }
+    st = lstatSync(skillMd);
   } catch {
-    // no SKILL.md: B1
+    st = null; // no SKILL.md: B1
+  }
+  if (st?.isSymbolicLink()) {
+    base.skillMdStatus = "symlink";
+  } else if (st && !st.isFile()) {
+    base.skillMdStatus = "not_file";
+  } else if (st && st.size > MAX_READ_BYTES) {
+    base.skillMdStatus = "too_large";
+    base.frontmatterError = `SKILL.md is ${st.size} bytes; not read`;
+  } else if (st) {
+    base.skillMdPath = skillMd;
+    base.mtimeMs = st.mtimeMs;
+    try {
+      const raw = readFileSync(skillMd, "utf8");
+      base.skillMdStatus = "ok";
+      base.raw = raw;
+      base.contentHash = sha256Text(raw);
+      const parsed = parseFrontmatter(raw);
+      base.frontmatter = parsed.frontmatter;
+      base.body = parsed.body;
+      if (parsed.error) base.frontmatterError = parsed.error;
+    } catch {
+      base.skillMdStatus = "unreadable";
+    }
   }
   if (!link) {
     const w = walk(dir);

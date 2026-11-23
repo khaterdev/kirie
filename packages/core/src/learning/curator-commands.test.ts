@@ -28,6 +28,7 @@ let runs: CuratorRunStore;
 let skillsRoot: string;
 let applyDeps: CuratorApplyDeps;
 let runImpl: ReturnType<typeof vi.fn>;
+let resetSchedule: ReturnType<typeof vi.fn>;
 let sent: CommandReply[];
 
 function report(over: Partial<CuratorReport> = {}): CuratorReport {
@@ -56,6 +57,7 @@ beforeEach(() => {
   runs = new CuratorRunStore(env.db);
   applyDeps = { skillsRoot, archiveRoot: curatorArchiveRoot(env.dir), skillState, db: env.db, audit };
   const cfg = CuratorConfigSchema.parse({});
+  resetSchedule = vi.fn();
   runImpl = vi.fn(async (): Promise<CuratorCommandRunResult> => {
     const r = report();
     const id = runs.start("command", r.startedAt);
@@ -80,6 +82,7 @@ beforeEach(() => {
     nextRunAt: () => null,
     pendingCount: () => 1,
     llmAvailable: () => false,
+    resetSchedule,
   }));
 });
 afterEach(() => {
@@ -137,8 +140,11 @@ describe("/curator", () => {
     expect((await run("/curator run now")).reply).toContain("Usage");
   });
 
-  it("on, off and reset write the runtime override", async () => {
+  it("on, off and reset write the runtime override; turning it on again restarts the weekly clock", async () => {
     await run("/curator on");
+    expect(resetSchedule).toHaveBeenCalledTimes(1);
+    await run("/curator on");
+    expect(resetSchedule).toHaveBeenCalledTimes(1);
     expect(settings.get(CURATOR_ENABLED_SETTING, BOOL)).toBe(true);
     expect((await run("/curator status")).reply).toContain("weekly run: on (runtime override)");
     await run("/curator off");

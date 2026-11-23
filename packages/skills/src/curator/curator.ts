@@ -235,6 +235,17 @@ export type CuratorRunResult =
   | { status: "ok"; runId: number; report: CuratorReport; hasNews: boolean }
   | { status: "busy" };
 
+interface PlanGuard {
+  taken: Set<string>;
+  reserved: ReadonlySet<string>;
+  clusterKeys: ReadonlySet<string>;
+}
+
+/** Stable identity of a duplicate group: its members and their content hashes. */
+function clusterKey(hashes: Readonly<Record<string, string>>): string {
+  return Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b)).map(([n, h]) => `${n}=${h}`).join(",");
+}
+
 interface PlannedProposal {
   kind: ProposalKind;
   skill: string;
@@ -486,9 +497,9 @@ export class SkillCurator {
     }
 
     // Proposals, most important first.
-    const taken = new Set<string>();
-    const planned = this.planProposals(taken, project, broken, dupes.exact, stale.archive, drift.propose);
-    if (merge) planned.push(...(await this.planMerges(dupes.clusters, byName, taken, report)));
+    const guard = this.planGuard(report);
+    const planned = this.planProposals(guard, project, broken, dupes.exact, stale.archive, drift.propose);
+    if (merge) planned.push(...(await this.planMerges(dupes.clusters, byName, guard, report)));
     else report.possibleDuplicates = dupes.clusters.map((c) => c.members);
     this.submit(planned, cfg.maxProposalsPerRun, report);
 
@@ -518,6 +529,39 @@ export class SkillCurator {
     }
   }
 
+  /**
+   * What earlier runs and the config rule out for this run:
+   * - `taken`: skills with a pending curator archive or merge (no second proposal for them);
+   * - `reserved`: skills that must not be archived: kept copies of archived or
+   *   pending-archive duplicates, and skills bound to an agent (config.agents[].skills);
+   * - `clusterKeys`: duplicate groups (members and content hashes) that already
+   *   have a pending or rejected merge decision, so the model is not asked again.
+   */
+  private planGuard(report: CuratorReport): PlanGuard {
+    const taken = new Set<string>();
+    const reserved = new Set<string>(this.safeList(this.deps.protectedSkills, report, "agent skill bindings"));
+    const clusterKeys = new Set<string>();
+    for (const row of this.deps.skillState.list({ root: "project", state: "archived" })) if (row.absorbedInto) reserved.add(row.absorbedInto);
+    for (const rec of this.deps.store.list({ status: ["pending", "rejected"], limit: 2000 })) {
+      if (rec.origin !== "curator") continue;
+      const p = (rec.payload ?? {}) as Record<string, unknown>;
+      if (rec.kind === "skill.archive" || rec.kind === "skill.merge") {
+        const hashes = (rec.kind === "skill.merge" ? p.baseHashes : p.cluster) as Record<string, string> | undefined;
+        if (hashes && typeof hashes === "object") clusterKeys.add(clusterKey(hashes));
+      }
+      if (rec.status !== "pending") continue;
+      if (rec.kind === "skill.archive" && typeof p.name === "string") {
+        taken.add(p.name);
+        if (typeof p.absorbedInto === "string") reserved.add(p.absorbedInto);
+      }
+      if (rec.kind === "skill.merge") {
+        if (typeof p.into === "string") taken.add(p.into);
+        if (Array.isArray(p.from)) for (const f of p.from) if (typeof f === "string") taken.add(f);
+      }
+    }
+    return { taken, reserved, clusterKeys };
+  }
+
   private archivePayload(s: SkillSnapshot, detector: string, reason: string, absorbedInto?: string): Record<string, unknown> {
     return {
       name: s.name,
@@ -533,7 +577,7 @@ export class SkillCurator {
   }
 
   private planProposals(
-    taken: Set<string>,
+    guard: PlanGuard,
     project: readonly SkillSnapshot[],
     broken: readonly CuratorFinding[],
     exact: ReadonlyArray<{ archive: string; keep: string }>,
@@ -544,10 +588,13 @@ export class SkillCurator {
     const byName = new Map(project.map((s) => [s.name, s]));
     const out: PlannedProposal[] = [];
     // The surviving side of an exact duplicate is never archived in the same run.
-    const reserved = new Set(exact.map((d) => d.keep));
+    const { taken } = guard;
+    const reserved = new Set([...guard.reserved, ...exact.map((d) => d.keep)]);
     const eligible = (name: string, forArchive = true): SkillSnapshot | null => {
       const s = byName.get(name);
-      if (!s || taken.has(name) || (forArchive && reserved.has(name)) || s.isSymlink || !SKILL_NAME_RE.test(name) || s.state?.state === "archived" || s.state?.pinned) return null;
+      if (!s || taken.has(name) || (forArchive && reserved.has(name)) || s.isSymlink || !SKILL_NAME_RE.test(name)) return null;
+      if (s.state?.state === "archived" || s.state?.pinned) return null;
+      if (s.skillMdStatus !== "ok" && s.skillMdStatus !== "missing") return null;
       return s;
     };
     const archive = (s: SkillSnapshot, detector: string, reason: string, absorbedInto?: string): void => {
@@ -592,7 +639,8 @@ export class SkillCurator {
     // D1: exact duplicates.
     for (const d of exact) {
       const s = eligible(d.archive);
-      if (!s || !byName.has(d.keep)) continue;
+      // The kept copy must stay: not when it is itself waiting to be archived.
+      if (!s || !byName.has(d.keep) || taken.has(d.keep)) continue;
       archive(s, "D1", `identical to skill ${d.keep}`, d.keep);
     }
     // Stale past archiveAfterDays (bundled only with pruneBundled, already filtered by the detector).
@@ -633,7 +681,7 @@ export class SkillCurator {
   private async planMerges(
     clusters: ReadonlyArray<{ members: string[]; likely: boolean }>,
     byName: ReadonlyMap<string, SkillSnapshot>,
-    taken: ReadonlySet<string>,
+    guard: PlanGuard,
     report: CuratorReport,
   ): Promise<PlannedProposal[]> {
     const out: PlannedProposal[] = [];
@@ -642,8 +690,14 @@ export class SkillCurator {
     let calls = 0;
     for (const cluster of clusters) {
       const members = cluster.members.map((n) => byName.get(n)).filter((s): s is SkillSnapshot => !!s);
+      const hashes: Record<string, string> = {};
+      for (const s of members) if (s.contentHash) hashes[s.name] = s.contentHash;
+      if (members.length === cluster.members.length && guard.clusterKeys.has(clusterKey(hashes))) {
+        // Already decided (rejected) or waiting for the owner: do not ask the model again.
+        continue;
+      }
       const usable = members.length === cluster.members.length && members.every((s) =>
-        !taken.has(s.name) && s.source !== "bundled" && !s.isSymlink && s.raw !== null && s.contentHash !== null && !s.state?.pinned && SKILL_NAME_RE.test(s.name));
+        !guard.taken.has(s.name) && !guard.reserved.has(s.name) && s.source !== "bundled" && !s.isSymlink && s.raw !== null && s.contentHash !== null && !s.state?.pinned && SKILL_NAME_RE.test(s.name));
       if (!usable || calls >= MAX_LLM_CLUSTERS) {
         report.possibleDuplicates.push(cluster.members);
         continue;
@@ -675,15 +729,14 @@ export class SkillCurator {
           skill: s.name,
           title: `Archive skill ${s.name}: covered by ${advice.into}`.slice(0, 120),
           rationale: reason,
-          payload: this.archivePayload(s, "D3", reason, advice.into),
+          payload: { ...this.archivePayload(s, "D3", reason, advice.into), cluster: hashes },
           trust: "mixed",
         });
         continue;
       }
       const into = advice.into!;
       const from = cluster.members.filter((m) => m !== into);
-      const baseHashes: Record<string, string> = {};
-      for (const s of members) baseHashes[s.name] = s.contentHash!;
+      const baseHashes = hashes;
       out.push({
         kind: "skill.merge",
         skill: into,

@@ -24,6 +24,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -72,6 +73,12 @@ export interface CuratorApplyDeps {
   audit?: LearningAuditSink;
   now?: () => Date;
   fs?: CuratorFs;
+  /**
+   * Roots the curator must never change, whatever path aliases lead there
+   * (`~/.claude/skills`). Compared by real path: a skills root equal to,
+   * inside or containing one of these is refused.
+   */
+  forbiddenRoots?: readonly string[];
 }
 
 export interface CuratorArchiveManifest {
@@ -204,9 +211,31 @@ function ensureArchiveRoot(archiveRoot: string): string {
   return root;
 }
 
-function skillDirFor(deps: Pick<CuratorApplyDeps, "skillsRoot">, name: string): string {
+function realOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function overlaps(a: string, b: string): boolean {
+  return a === b || a.startsWith(b + sep) || b.startsWith(a + sep);
+}
+
+function skillDirFor(deps: Pick<CuratorApplyDeps, "skillsRoot" | "forbiddenRoots">, name: string): string {
   const dir = resolveSkillDir(deps.skillsRoot, name);
   if (isSymlink(resolve(deps.skillsRoot))) throw new ProposalApplyError("invalid", "the skills root is a symlink");
+  const realRoot = realOrSelf(deps.skillsRoot);
+  for (const forbidden of deps.forbiddenRoots ?? []) {
+    if (overlaps(realRoot, realOrSelf(forbidden))) {
+      throw new ProposalApplyError("invalid", "the skills root is (or overlaps) a root the curator never changes");
+    }
+  }
+  // A parent directory that is a symlink must not lead the skill path elsewhere.
+  if (pathExists(dir) && dirname(realOrSelf(dir)) !== realRoot && !isSymlink(dir)) {
+    throw new ProposalApplyError("invalid", "the skill path resolves outside the skills root");
+  }
   return dir;
 }
 
@@ -233,10 +262,15 @@ export function skillApprovedCopyPath(archiveRoot: string, name: string, hash: s
 export function saveSkillApprovedCopy(archiveRoot: string, name: string, content: string): boolean {
   const hash = sha256Hex(content);
   const file = skillApprovedCopyPath(archiveRoot, name, hash);
-  if (existsSync(file)) return true;
-  ensureArchiveRoot(archiveRoot);
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  writeFileSync(file, content, { encoding: "utf8", mode: 0o600 });
+  const root = ensureArchiveRoot(archiveRoot);
+  // Every directory on the way must be a real directory, never a symlink.
+  for (const d of [join(root, APPROVED_DIR), dirname(file)]) {
+    if (isSymlink(d)) throw new ProposalApplyError("invalid", "the approved-copy directory is a symlink");
+    mkdirSync(d, { recursive: true, mode: 0o700 });
+  }
+  if (pathExists(file)) return !isSymlink(file) && readSkillApprovedCopy(archiveRoot, name, hash) !== null;
+  // "wx" fails on any existing entry, including a symlink planted in between.
+  writeFileSync(file, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
   return true;
 }
 
@@ -310,14 +344,43 @@ function archiveOne(deps: CuratorApplyDeps, input: ArchiveInput): ArchivedRecord
   if (!pathExists(from)) throw new ProposalApplyError("stale", `skill "${input.name}" no longer exists`);
   if (isSymlink(from)) throw new ProposalApplyError("invalid", `skill "${input.name}" is a symlink; the curator never moves symlinks`);
   if (!lstatSync(from).isDirectory()) throw new ProposalApplyError("invalid", `skill "${input.name}" is not a directory`);
+  if (pathExists(join(from, CURATOR_ARCHIVE_MANIFEST))) {
+    throw new ProposalApplyError("invalid", `skill "${input.name}" contains its own ${CURATOR_ARCHIVE_MANIFEST}; archive it by hand`);
+  }
   const root = ensureArchiveRoot(deps.archiveRoot);
   const at = nowOf(deps);
   const to = uniqueArchiveTarget(root, input.name, at);
   const row = deps.skillState.get("project", input.name);
   moveSkillDir(from, to, deps.fs);
+  try {
+    return finishArchive(deps, input, { from, to, at, source: row?.source ?? "local", hadRow: row !== null });
+  } catch (err) {
+    // Put everything back: the manifest we wrote goes to .restored, the directory to its place.
+    try {
+      const manifestFile = join(to, CURATOR_ARCHIVE_MANIFEST);
+      if (pathExists(manifestFile) && !isSymlink(manifestFile)) {
+        const keep = join(root, RESTORED_DIR);
+        mkdirSync(keep, { recursive: true, mode: 0o700 });
+        renameSync(manifestFile, join(keep, `${to.slice(root.length + 1)}.failed.json`));
+      }
+      moveSkillDir(to, from, deps.fs);
+    } catch (rollbackErr) {
+      const msg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+      throw new ProposalApplyError("conflict", `archiving "${input.name}" failed and moving it back failed too (${msg}); it is at ${to}`);
+    }
+    throw err;
+  }
+}
+
+function finishArchive(
+  deps: CuratorApplyDeps,
+  input: ArchiveInput,
+  m: { from: string; to: string; at: Date; source: string; hadRow: boolean },
+): ArchivedRecord {
+  const { from, to, at } = m;
   const manifest: CuratorArchiveManifest = {
     name: input.name,
-    source: row?.source ?? "local",
+    source: m.source,
     reason: input.reason,
     detector: input.detector,
     proposalId: input.proposalId,
@@ -325,8 +388,9 @@ function archiveOne(deps: CuratorApplyDeps, input: ArchiveInput): ArchivedRecord
     originalPath: from,
     absorbedInto: input.absorbedInto,
   };
-  writeFileSync(join(to, CURATOR_ARCHIVE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  if (!row) ensureStateRow(deps, input.name);
+  // "wx": never through a symlink, never over an existing file.
+  writeFileSync(join(to, CURATOR_ARCHIVE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  if (!m.hadRow) ensureStateRow(deps, input.name);
   deps.skillState.markArchived("project", input.name, { archivedAt: manifest.archivedAt, archivePath: to, absorbedInto: input.absorbedInto });
   return { name: input.name, from, to, archivedAt: manifest.archivedAt };
 }
@@ -416,6 +480,13 @@ export function createSkillArchiveHandler(deps: CuratorApplyDeps): ProposalKindH
       if (extra.contentHash !== undefined && skillMdHash(dir) !== extra.contentHash) {
         throw new ProposalApplyError("stale", `skill "${p.name}" changed since the proposal was made`);
       }
+      if (extra.contentHash === null && pathExists(join(dir, "SKILL.md"))) {
+        throw new ProposalApplyError("stale", `skill "${p.name}" has a SKILL.md now`);
+      }
+      const keeperOf = deps.skillState.list({ root: "project", state: "archived" }).filter((r) => r.absorbedInto === p.name).map((r) => r.name);
+      if (keeperOf.length > 0) {
+        throw new ProposalApplyError("conflict", `skill "${p.name}" is the copy kept for ${keeperOf.join(", ")}; restore those first if you want to archive it`);
+      }
       if (deps.skillState.get("project", p.name)?.pinned) {
         throw new ProposalApplyError("stale", `skill "${p.name}" is pinned`);
       }
@@ -491,6 +562,11 @@ export function createSkillMergeHandler(deps: CuratorApplyDeps): ProposalKindHan
         if (skillMdHash(dir) !== expected) throw new ProposalApplyError("stale", `skill "${name}" changed since the proposal was made`);
         if (deps.skillState.get("project", name)?.pinned && name !== p.into) throw new ProposalApplyError("stale", `skill "${name}" is pinned`);
       }
+      const archivedRows = deps.skillState.list({ root: "project", state: "archived" });
+      for (const name of from) {
+        const kept = archivedRows.filter((r) => r.absorbedInto === name).map((r) => r.name);
+        if (kept.length > 0) throw new ProposalApplyError("conflict", `skill "${name}" is the copy kept for ${kept.join(", ")}`);
+      }
 
       const file = join(skillDirFor(deps, p.into), "SKILL.md");
       if (isSymlink(file)) throw new ProposalApplyError("invalid", "SKILL.md is a symlink");
@@ -512,10 +588,15 @@ export function createSkillMergeHandler(deps: CuratorApplyDeps): ProposalKindHan
           }));
         }
       } catch (err) {
+        const stuck: string[] = [];
         for (const rec of archived.reverse()) {
-          try { unarchiveOne(deps, rec); } catch { /* the original error is the one to report; the archive keeps the copy */ }
+          try { unarchiveOne(deps, rec); } catch { stuck.push(`${rec.name} (at ${rec.to})`); }
         }
         writeFileAtomic(file, readFileSync(backupFile, "utf8"));
+        if (stuck.length > 0) {
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new ProposalApplyError("conflict", `merge failed (${msg}) and these stayed archived: ${stuck.join(", ")}; restore them with /curator restore`);
+        }
         throw err;
       }
       const hash = sha256Hex(p.mergedSkillMd);

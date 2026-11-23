@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
   CURATOR_ENABLED_SETTING,
+  CURATOR_LAST_RUN_KEY,
   CuratorRunStore,
   CuratorScheduler,
   createCuratorCommands,
@@ -90,12 +91,15 @@ export function createCuratorSetup(opts: CuratorFeatureOptions = {}): FeatureSet
     const cfg = ctx.config.curator;
     const enabled = (): boolean => effectiveSettingFlag(ctx.settings, CURATOR_ENABLED_SETTING, cfg.enabled);
     const archiveRoot = curatorArchiveRoot(ctx.dataDir);
+    const userSkillsRoot = opts.userSkillsRoot ?? join(homedir(), ".claude", "skills");
     const applyDeps: CuratorApplyDeps = {
       skillsRoot: system.skillsRoot,
       archiveRoot,
       skillState: system.skillState,
       db: system.db,
       audit: ctx.audit,
+      // ~/.claude/skills belongs to the owner's interactive Claude Code: never changed, whatever path leads there.
+      forbiddenRoots: [userSkillsRoot],
       ...(opts.now ? { now: opts.now } : {}),
     };
     registerCuratorKindHandlers(system.applier, applyDeps);
@@ -134,7 +138,7 @@ export function createCuratorSetup(opts: CuratorFeatureOptions = {}): FeatureSet
       intake: system.intake,
       runs,
       skillsRoot: system.skillsRoot,
-      userSkillsRoot: opts.userSkillsRoot ?? join(homedir(), ".claude", "skills"),
+      userSkillsRoot,
       archiveRoot,
       bundled,
       config: () => cfg,
@@ -198,6 +202,7 @@ export function createCuratorSetup(opts: CuratorFeatureOptions = {}): FeatureSet
       nextRunAt: () => scheduler.nextEligibleAt(),
       pendingCount: () => system.store.list({ status: "pending", limit: 1000 }).filter((p) => p.origin === "curator").length,
       llmAvailable: () => llm !== null,
+      resetSchedule: () => system.kv.delete(CURATOR_LAST_RUN_KEY),
     }));
 
     return {

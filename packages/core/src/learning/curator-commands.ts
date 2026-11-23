@@ -43,6 +43,8 @@ export interface CuratorCommandDeps {
   pendingCount: () => number;
   /** The LLM merge pass can run (a model call is wired) */
   llmAvailable: () => boolean;
+  /** Forget the weekly clock, so turning the run back on starts with a seeding check (no immediate run). */
+  resetSchedule?: () => void;
   now?: () => number;
 }
 
@@ -249,6 +251,7 @@ export function createCuratorCommands(deps: CuratorCommandDeps): CommandDefiniti
         case "on":
         case "off": {
           const on = sub === "on";
+          if (on && !deps.enabled()) deps.resetSchedule?.();
           deps.settings.set(CURATOR_ENABLED_SETTING, on, actorOf(ctx));
           deps.audit.record({ feature: "curator", action: on ? "curator.enabled" : "curator.disabled", actor: actorOf(ctx) });
           return on
