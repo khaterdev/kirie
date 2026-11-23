@@ -60,15 +60,28 @@ function agentProposal(kind: "memory" | "skill", key: string, sessionKey = OWNER
 }
 
 describe("trust labels", () => {
+  const dm = { chatType: "dm", context: [] as string[] };
   it("owner, mixed, untrusted from turn provenance", () => {
-    expect(trustOfTurn({ origin: "owner_message", untrustedInput: false })).toBe("owner");
-    expect(trustOfTurn({ origin: "owner_message", untrustedInput: true })).toBe("mixed");
+    expect(trustOfTurn({ origin: "owner_message", untrustedInput: false, ...dm })).toBe("owner");
+    expect(trustOfTurn({ origin: "owner_message", untrustedInput: true, ...dm })).toBe("mixed");
     for (const origin of ["schedule", "webhook", "other_user", "background", "system", "loop", "goal"] as const) {
-      expect(trustOfTurn({ origin, untrustedInput: false })).toBe("untrusted");
+      expect(trustOfTurn({ origin, untrustedInput: false, ...dm })).toBe("untrusted");
     }
-    expect(trustOfWindow([{ origin: "owner_message", untrustedInput: false }, { origin: "owner_message", untrustedInput: true }])).toBe("mixed");
-    expect(trustOfWindow([{ origin: "owner_message", untrustedInput: false }, { origin: "webhook", untrustedInput: false }])).toBe("untrusted");
+    expect(trustOfWindow([{ origin: "owner_message", untrustedInput: false, ...dm }, { origin: "owner_message", untrustedInput: true, ...dm }])).toBe("mixed");
+    expect(trustOfWindow([{ origin: "owner_message", untrustedInput: false, ...dm }, { origin: "webhook", untrustedInput: false, ...dm }])).toBe("untrusted");
     expect(trustOfWindow([])).toBe("untrusted");
+  });
+
+  // LEARN-B4: what was in the prompt, not only which tools ran.
+  it("group and forwarded turns are never owner; replied-to text, task results, attachments and earlier context make it mixed", () => {
+    const owner = { origin: "owner_message" as const, untrustedInput: false };
+    expect(trustOfTurn({ ...owner, chatType: "group", context: [] })).toBe("untrusted");
+    expect(trustOfTurn({ ...owner, chatType: "dm", context: ["forwarded"] })).toBe("untrusted");
+    for (const reason of ["reply", "task_results", "attachment", "earlier_turn", "unknown_inputs"]) {
+      expect(trustOfTurn({ ...owner, chatType: "dm", context: [reason] })).toBe("mixed");
+    }
+    // A row recorded before provenance existed is not known to be clean.
+    expect(trustOfTurn({ ...owner, chatType: null, context: [] })).toBe("mixed");
   });
 });
 
@@ -142,6 +155,55 @@ describe("TurnRecorder", () => {
     expect(store.get(id)!.trust).toBe("untrusted");
   });
 
+  // LEARN-B4, reviewer proof: turn 1 read a web page, turn 2 (same session) only filed a proposal.
+  it("a proposal filed after an earlier untrusted turn of the same session is not owner", () => {
+    recorder.record(turn({ sdkSessionId: "sdk-1", toolUse: summary({ WebFetch: 1 }) }));
+    const id = agentProposal("memory", "k:after-web");
+    const t2 = recorder.record(turn({ sdkSessionId: "sdk-1", toolUse: claiming([id]) }));
+    expect(t2.context).toContain("earlier_turn");
+    expect(store.get(id)!.trust).toBe("mixed");
+  });
+
+  it("the earlier untrusted turn counts while it is in the same SDK session, however long ago", () => {
+    recorder.record(turn({ sdkSessionId: "sdk-old", origin: "schedule" }));
+    for (let i = 0; i < 30; i++) recorder.record(turn({ sdkSessionId: "sdk-old" }));
+    const id = agentProposal("memory", "k:long-session");
+    recorder.record(turn({ sdkSessionId: "sdk-old", toolUse: claiming([id]) }));
+    expect(store.get(id)!.trust).toBe("mixed");
+  });
+
+  it("after a session reset, an untrusted turn counts only while it is within the last 20 turns (the history window)", () => {
+    recorder.record(turn({ sdkSessionId: "sdk-a", origin: "schedule" }));
+    const near = agentProposal("memory", "k:near");
+    recorder.record(turn({ sdkSessionId: "sdk-b", toolUse: claiming([near]) }));
+    expect(store.get(near)!.trust).toBe("mixed");
+    for (let i = 0; i < 20; i++) recorder.record(turn({ sdkSessionId: "sdk-b" }));
+    const far = agentProposal("memory", "k:far");
+    recorder.record(turn({ sdkSessionId: "sdk-c", toolUse: claiming([far]) }));
+    expect(store.get(far)!.trust).toBe("owner");
+  });
+
+  // LEARN-B4, reviewer proof: an owner message in a group.
+  it("an owner turn in a group finalizes as untrusted and its skill proposal is dropped", () => {
+    const group = "telegram:group:-100777";
+    const mem = agentProposal("memory", "k:group", group);
+    const sk = agentProposal("skill", "group-skill", group);
+    recorder.record(turn({ sessionKey: group, toolUse: claiming([mem, sk]), inputs: { chatType: "group", forwarded: false, replyContext: false, taskResults: false, attachments: false } }));
+    expect(store.get(mem)!.trust).toBe("untrusted");
+    expect(store.get(sk)).toMatchObject({ trust: "untrusted", status: "rejected" });
+  });
+
+  it.each([
+    ["forwarded", "untrusted", { forwarded: true }],
+    ["replied-to text", "mixed", { replyContext: true }],
+    ["background task results", "mixed", { taskResults: true }],
+    ["an attachment", "mixed", { attachments: true }],
+  ] as const)("an owner DM turn with %s in its prompt is %s", (label, expected, over) => {
+    const id = agentProposal("memory", `k:${label.replace(/\s+/g, "-")}`);
+    recorder.record(turn({ toolUse: claiming([id]), inputs: { chatType: "dm", forwarded: false, replyContext: false, taskResults: false, attachments: false, ...over } }));
+    expect(store.get(id)!.trust).toBe(expected);
+  });
+
   it("an overflowing tool map counts as untrusted input", () => {
     const sum = summary({ Skill: 1 });
     sum.overflow = true;
@@ -180,11 +242,30 @@ describe("LearningTurnTracker", () => {
       sessionKey: OWNER_DM_KEY, origin: "owner_message", channel: "telegram", senderId: "1001", senderRole: "owner",
       userMsgId: 5, assistantMsgId: 6, startedAt: now - 1000, endedAt: now, durationMs: 1000,
       result: { response: "ok", sessionId: "s", costUsd: 0.02, numTurns: 4, isError: false } as ExecutionResult,
+      inputs: { chatType: "dm", forwarded: false, replyContext: false, taskResults: false, attachments: false },
     });
     const t = recorder.lastTurn(OWNER_DM_KEY)!;
     expect(t).toMatchObject({ source: "main", origin: "owner_message", userMsgId: 5, tools: { Bash: 1, Skill: 1 }, skills: ["tmux"] });
     expect(JSON.stringify(t)).not.toContain("secret-cmd");
     // Bash is not a trusted tool, so the proposal this turn filed is mixed.
+    expect(store.get(filed)!.trust).toBe("mixed");
+  });
+
+  it("a chat turn completion without its inputs is recorded as mixed (fails closed)", () => {
+    const tracker = new LearningTurnTracker({ recorder, turns: new TurnContextRegistry(), skillRoots: () => [] });
+    const filed = agentProposal("memory", "k:no-inputs");
+    tracker.observe({ type: "turn_start", ctx: chatCtx, accountId: null });
+    tracker.observe({ type: "message", ctx: chatCtx, message: { type: "assistant", message: { content: [{ type: "tool_use", id: "tu-q", name: "mcp__kirie-tools__learning_propose", input: {} }] } } as unknown as SDKMessage });
+    tracker.observe({ type: "message", ctx: chatCtx, message: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-q", content: [{ type: "text", text: JSON.stringify({ id: filed, status: "pending" }) }] }] } } as unknown as SDKMessage });
+    tracker.observe({ type: "turn_end", ctx: chatCtx, accountId: null, result });
+    const now = Date.now();
+    const ev = {
+      sessionKey: OWNER_DM_KEY, origin: "owner_message", channel: "telegram", senderId: "1001", senderRole: "owner",
+      startedAt: now - 1000, endedAt: now, durationMs: 1000,
+      result: { response: "ok", sessionId: "s", costUsd: 0.02, numTurns: 1, isError: false } as ExecutionResult,
+    } as unknown as Parameters<LearningTurnTracker["onTurnComplete"]>[0];
+    tracker.onTurnComplete(ev);
+    expect(recorder.lastTurn(OWNER_DM_KEY)!.context).toContain("unknown_inputs");
     expect(store.get(filed)!.trust).toBe("mixed");
   });
 

@@ -26,6 +26,18 @@ describe("learning.db", () => {
     expect(names).not.toContain("learning_audit");
   });
 
+  // LEARN-B4: provenance columns are added to an existing turn_log; older rows keep chat_type NULL (unknown).
+  it("adds the turn_log provenance columns to a database created before them", () => {
+    env = tempLearningEnv();
+    env.db.exec("ALTER TABLE turn_log DROP COLUMN context; ALTER TABLE turn_log DROP COLUMN chat_type;");
+    env.db.prepare(`INSERT INTO turn_log (session_key, source, origin, started_at, ended_at) VALUES ('telegram:dm:1', 'main', 'owner_message', 'x', 'x')`).run();
+    migrateLearningDb(env.db);
+    migrateLearningDb(env.db);
+    const cols = (env.db.prepare("PRAGMA table_info(turn_log)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(["chat_type", "context"]));
+    expect(env.db.prepare("SELECT chat_type, context FROM turn_log").get()).toEqual({ chat_type: null, context: "[]" });
+  });
+
   it("migration is idempotent", () => {
     env = tempLearningEnv();
     migrateLearningDb(env.db);

@@ -315,6 +315,10 @@ export class ReflectionEngine {
     const unknown = kept.some((m) => (m.role === "user" ? !byUser.has(m.id) : !byAssistant.has(m.id)));
     // Forwarded text is someone else's words, not the owner's: the window is untrusted.
     const forwarded = kept.some((m) => m.role === "user" && m.forwarded === 1);
+    // Each turn's trust includes what its own prompt held (forwarded, replied-to, attachments, task results,
+    // group) and any earlier turn still in its context (TurnRecorder: the same SDK session, or the last
+    // RECENT_CONTEXT_TURNS turns of the session). So an untrusted source just before the window, which the
+    // model in these turns saw, keeps the window from being owner (LEARN-B4). When unsure: not owner.
     const trust = unknown || forwarded ? "untrusted" : trustOfWindow(turns);
 
     const lines = kept.map((m) => {
@@ -476,6 +480,9 @@ export class ReflectionEngine {
     for (const s of output.skills) {
       if (!validEvidence(s.evidence)) { dropped.push("evidence_outside_window"); continue; }
       if (s.evidence.every((id) => abortedIds.has(id))) { dropped.push("evidence_interrupted"); continue; }
+      // Like memories: owner trust needs an owner-authored user message among the evidence (LEARN-B4).
+      let trust = window.trust;
+      if (trust === "owner" && !s.evidence.some((id) => msgById.get(id)?.role === "user" && ownerUserIds.has(id))) trust = "mixed";
       const name = s.name.trim();
       const current = s.kind === "improvement" ? this.deps.context.readSkill(name) : null;
       submit(
@@ -485,7 +492,7 @@ export class ReflectionEngine {
               kind: "skill.patch",
               title: `Improve skill ${name}`,
               rationale: s.why,
-              trust: window.trust,
+              trust,
               payload: { name, baseHash: sha256Hex(current), newSkillMd: s.skillMd },
             }
           : {
@@ -493,7 +500,7 @@ export class ReflectionEngine {
               kind: "skill.create",
               title: `New skill ${name}`,
               rationale: s.why,
-              trust: window.trust,
+              trust,
               payload: { name, description: s.description.trim(), skillMd: s.skillMd },
             },
       );

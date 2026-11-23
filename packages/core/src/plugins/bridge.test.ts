@@ -71,7 +71,8 @@ function result(response: string): ExecutionResult {
 function complete(over: Partial<TurnCompleteEvent> = {}): TurnCompleteEvent {
   return {
     sessionKey: "telegram:dm:1001", origin: "owner_message", channel: "telegram", senderId: "1001", senderRole: "owner",
-    startedAt: 0, endedAt: 10, durationMs: 10, result: result("the reply"), ...over,
+    startedAt: 0, endedAt: 10, durationMs: 10, result: result("the reply"),
+    inputs: { chatType: "dm", forwarded: false, replyContext: false, taskResults: false, attachments: false }, ...over,
   };
 }
 

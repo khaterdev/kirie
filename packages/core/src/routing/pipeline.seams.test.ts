@@ -224,6 +224,24 @@ describe("MessagePipeline seams", () => {
     });
   });
 
+  // LEARN-B4: the turn event says what besides the sender's own text was in the prompt.
+  describe("turn inputs", () => {
+    it("report chat type, forwarded, replied-to text and none of them for a plain owner DM", async () => {
+      const events: TurnCompleteEvent[] = [];
+      pipeline.onTurnComplete((ev) => events.push(ev));
+      pipeline.start();
+      await sendFromChannel(makeMessage({ id: "700", text: "plain" }));
+      await vi.waitFor(() => expect(events).toHaveLength(1));
+      await sendFromChannel(makeMessage({ id: "701", text: "fwd", isForwarded: true }));
+      await vi.waitFor(() => expect(events).toHaveLength(2));
+      await sendFromChannel(makeMessage({ id: "702", text: "what about this?", replyTo: { messageId: "9", senderName: "Someone", text: "quoted text from someone else" } }));
+      await vi.waitFor(() => expect(events).toHaveLength(3));
+      expect(events[0]!.inputs).toEqual({ chatType: "dm", forwarded: false, replyContext: false, taskResults: false, attachments: false });
+      expect(events[1]!.inputs).toMatchObject({ forwarded: true });
+      expect(events[2]!.inputs).toMatchObject({ replyContext: true, forwarded: false });
+    });
+  });
+
   describe("forwarded messages", () => {
     it("are stored in chat history with the forwarded flag; typed ones without it", async () => {
       pipeline.start();

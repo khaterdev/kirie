@@ -280,6 +280,31 @@ describe("reflection input and output", () => {
     expect(store.get(r.filed[0]!)!.trust).toBe("untrusted");
   });
 
+  // LEARN-B4: the session's recent context counts, not only the window's own turns.
+  it.each([
+    ["a web-reading owner turn", "owner_message", { WebFetch: 1 }],
+    ["a scheduled turn", "schedule", {}],
+  ] as const)("%s just before the window keeps a clean window from being owner", async (_label, origin, tools) => {
+    exchange("earlier context", origin, { tools });
+    output = { memories: [], skills: [] };
+    await engine.runNow(OWNER_DM_KEY); // the watermark moves past the earlier turn
+    const clean = exchange("I prefer short answers");
+    output = {
+      memories: [{ key: "owner:style", content: "Prefers short answers", tags: [], why: "stated", evidence: [clean.user] }],
+      skills: [{ kind: "new", name: "short-answers", description: "Answer briefly", skillMd: skillMd("short-answers", "Answer briefly"), why: "", evidence: [clean.user, clean.assistant] }],
+    };
+    const r = await engine.runNow(OWNER_DM_KEY);
+    expect(r.filed.length).toBeGreaterThan(0);
+    for (const id of r.filed) expect(store.get(id)!.trust).toBe("mixed");
+  });
+
+  it("a skill proposal needs an owner-authored user message among its evidence to be owner trust", async () => {
+    const { assistant } = exchange("thanks");
+    output = { memories: [], skills: [{ kind: "new", name: "from-reply", description: "From a reply", skillMd: skillMd("from-reply", "From a reply"), why: "", evidence: [assistant] }] };
+    const r = await engine.runNow(OWNER_DM_KEY);
+    expect(store.get(r.filed[0]!)!.trust).toBe("mixed");
+  });
+
   it("history from before tracking (no turn rows) is untrusted", async () => {
     history.push({ id: 5, role: "user", content: "old message", created_at: "2026-01-01T00:00:00Z" });
     output = { memories: [{ key: "owner:old", content: "Old fact", tags: [], why: "", evidence: [5] }], skills: [] };

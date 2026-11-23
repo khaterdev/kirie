@@ -164,9 +164,30 @@ CREATE TABLE IF NOT EXISTS user_fact_tombstones (
 );
 `;
 
-/** Idempotent: CREATE ... IF NOT EXISTS for every table, index and trigger. */
+/**
+ * Columns added after the first release. `turn_log.chat_type` and
+ * `turn_log.context` record what was in a turn's prompt besides the sender's
+ * own text (LEARN-B4); rows from before have chat_type NULL and are treated as
+ * of unknown provenance.
+ */
+const ADDED_COLUMNS: ReadonlyArray<{ table: string; column: string; ddl: string }> = [
+  { table: "turn_log", column: "chat_type", ddl: "ALTER TABLE turn_log ADD COLUMN chat_type TEXT" },
+  { table: "turn_log", column: "context", ddl: "ALTER TABLE turn_log ADD COLUMN context TEXT NOT NULL DEFAULT '[]'" },
+];
+
+/** Idempotent: CREATE ... IF NOT EXISTS for every table, index and trigger, then any missing added column. */
 export function migrateLearningDb(db: LearningDb): void {
   db.exec(MIGRATION_SQL);
+  for (const { table, column, ddl } of ADDED_COLUMNS) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (cols.some((c) => c.name === column)) continue;
+    try {
+      db.exec(ddl);
+    } catch (err) {
+      // Another process (the stdio MCP server) added it between the check and the ALTER.
+      if (!/duplicate column/i.test(err instanceof Error ? err.message : String(err))) throw err;
+    }
+  }
 }
 
 function tightenModes(path: string): void {

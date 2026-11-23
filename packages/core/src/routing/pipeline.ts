@@ -96,9 +96,28 @@ export interface InjectMessageResult {
   costUsd?: number;
 }
 
+/**
+ * What the pipeline put into the model's prompt besides the sender's own
+ * text, so learning can label trust by what the model actually saw
+ * (LEARN-B4). Earlier turns of the session are judged from the turn log.
+ */
+export interface TurnInputs {
+  chatType: ChatType;
+  /** The message was forwarded from someone else: its text is not the sender's words */
+  forwarded: boolean;
+  /** Replied-to text or a reaction target's text was put in the prompt */
+  replyContext: boolean;
+  /** Results of background tasks were put in the prompt */
+  taskResults: boolean;
+  /** Attachments other than voice notes and stickers (their content is not the sender's words) */
+  attachments: boolean;
+}
+
 export interface TurnCompleteEvent {
   sessionKey: string;
   origin: TurnOrigin;
+  /** What besides the sender's own text was in the prompt */
+  inputs: TurnInputs;
   channel: string;
   senderId: string;
   senderRole: string;
@@ -668,6 +687,13 @@ export class MessagePipeline {
         : "other_user";
     let userMsgId: number | undefined;
     let assistantMsgId: number | undefined;
+    const inputs: TurnInputs = {
+      chatType: message.chatType,
+      forwarded: message.isForwarded === true,
+      replyContext: !!reactionContext?.targetContent,
+      taskResults: false,
+      attachments: (resolvedMedia ?? []).some((m) => m.type !== "voice" && m.type !== "sticker"),
+    };
     let silent = false;
     let suppressed = false;
     let startedAt = Date.now();
@@ -740,9 +766,11 @@ export class MessagePipeline {
 
         // Inject completed background task results as context
         const taskContext = this.buildBackgroundTaskContext(route.sessionKey);
+        if (taskContext) inputs.taskResults = true;
 
         // Prepend rich reply context so the agent sees what message is being replied to
         const replyPrefix = formatReplyContext(route.message.replyTo);
+        if (replyPrefix) inputs.replyContext = true;
 
         // One-shot notes registered by features for this session's next turn
         const notes = this.takeNextTurnNotes(route.sessionKey);
@@ -970,6 +998,7 @@ export class MessagePipeline {
       this.emitTurnComplete({
         sessionKey: route.sessionKey,
         origin,
+        inputs: { ...inputs },
         channel: message.channel,
         senderId: message.senderId,
         senderRole: sender.role,
