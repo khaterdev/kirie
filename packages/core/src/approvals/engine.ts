@@ -182,6 +182,17 @@ export interface ApprovalEnvironment {
   originOf?: (ctx: SdkCallContext) => TurnOrigin;
   sandbox?: ApprovalSandboxInfo;
   realpath?: (p: string) => string;
+  /** `/Volumes` entries that link to `/` (tests). Default: read from `/Volumes`. */
+  volumeRootAliases?: () => readonly string[];
+  /** Directory probe for cp/mv destinations (tests). Default `fs.statSync`. */
+  isDirectory?: (p: string) => boolean;
+  /** The daemon's own command line, for `sys.kill-kirie`. Default: this process's. */
+  daemonCommandLine?: string;
+}
+
+/** This process's command line (`node .../apps/daemon/dist/index.js`) plus its launchd label, lower case. */
+export function defaultApprovalDaemonCommandLine(): string {
+  return [process.execPath, ...process.argv.slice(1), process.env.XPC_SERVICE_NAME ?? ""].join(" ").trim();
 }
 
 interface CompiledLists {
@@ -304,11 +315,12 @@ function addParseMismatch(parsed: ParsedShell, command: string, real: { hardline
   if (extra) parsed.uncertain.push({ code: "parse-mismatch", detail: `read without quoting, the command looks like ${extra.ruleId} (${extra.reason})` });
 }
 
-function makeRuleEnv(lists: CompiledLists, pathEnv: ApprovalPathEnv, cwd: string, gatewayPort: number): ApprovalRuleEnv {
+function makeRuleEnv(lists: CompiledLists, pathEnv: ApprovalPathEnv, cwd: string, gatewayPort: number, daemonCommandLine?: string): ApprovalRuleEnv {
   return {
     path: pathEnv,
     cwd,
     gatewayPort,
+    daemonCommandLine: (daemonCommandLine ?? defaultApprovalDaemonCommandLine()).toLowerCase(),
     write: lists.write,
     read: lists.read,
     history: lists.history,
@@ -363,6 +375,8 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
     home: env.home,
     ...(env.dataDir !== undefined ? { dataDir: env.dataDir } : {}),
     ...(env.realpath ? { realpath: env.realpath } : {}),
+    ...(env.volumeRootAliases ? { volumeRootAliases: env.volumeRootAliases } : {}),
+    ...(env.isDirectory ? { isDirectory: env.isDirectory } : {}),
   };
   const cwd = call.cwd || call.ctx?.cwd || "";
   const isShell = isApprovalShellCall(call.tool, call.input);
@@ -376,7 +390,7 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
   // ── Floors: hardline and denylist, in their own guarded block ─────────
   try {
     lists = compiledFor(policy, env, pathEnv);
-    ruleEnv = makeRuleEnv(lists, pathEnv, cwd, env.gatewayPort ?? 18789);
+    ruleEnv = makeRuleEnv(lists, pathEnv, cwd, env.gatewayPort ?? 18789, env.daemonCommandLine);
     const disabled = new Set(policy.disabledRules);
     const sandboxed = call.tool === APPROVAL_SANDBOX_SHELL_TOOL && env.sandbox?.mode === "docker" && env.sandbox.network === "none";
     if (isShell) {
@@ -679,6 +693,8 @@ export interface ApprovalEngineDeps {
   realpath?: (p: string) => string;
   /** Called on an evaluator error (the feature rate-limits an owner notice). */
   onError?: (err: unknown) => void;
+  /** The daemon's command line for `sys.kill-kirie`. Default: this process's. */
+  daemonCommandLine?: string;
 }
 
 export class ApprovalEngine {
@@ -765,6 +781,7 @@ export class ApprovalEngine {
       ...(this.deps.isOwnerChat ? { isOwnerChat: this.deps.isOwnerChat } : {}),
       ...(this.deps.originOf ? { originOf: this.deps.originOf } : {}),
       ...(this.deps.realpath ? { realpath: this.deps.realpath } : {}),
+      ...(this.deps.daemonCommandLine ? { daemonCommandLine: this.deps.daemonCommandLine } : {}),
       sandbox,
     };
   }

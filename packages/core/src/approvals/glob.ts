@@ -12,9 +12,23 @@
  * literal. Classic two-pointer wildcard matching: O(text * stars) in the worst
  * case, linear in practice.
  */
+/**
+ * Case folding for path comparison on APFS (case-insensitive and
+ * normalization-insensitive by default): NFD, then upper and lower case, which
+ * also folds `ſ` to `s`, `ß` to `ss` and ligatures. Used on both the pattern
+ * and the path, so every comparison folds the same way.
+ */
+export function foldApprovalCase(s: string): string {
+  // Fast path: plain ASCII folds with toLowerCase alone.
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) > 0x7f) return s.normalize("NFD").toUpperCase().toLowerCase();
+  }
+  return s.toLowerCase();
+}
+
 export function matchApprovalGlob(pattern: string, text: string, opts: { caseInsensitive?: boolean } = {}): boolean {
-  const p = opts.caseInsensitive ? pattern.toLowerCase() : pattern;
-  const t = opts.caseInsensitive ? text.toLowerCase() : text;
+  const p = opts.caseInsensitive ? foldApprovalCase(pattern) : pattern;
+  const t = opts.caseInsensitive ? foldApprovalCase(text) : text;
   let pi = 0;
   let ti = 0;
   let starP = -1;
@@ -45,8 +59,8 @@ export function matchApprovalGlob(pattern: string, text: string, opts: { caseIns
  * `**` matches at any depth.
  */
 export function matchApprovalPathGlob(pattern: string, path: string): boolean {
-  const pSegs = splitPath(pattern.toLowerCase());
-  const tSegs = splitPath(path.toLowerCase());
+  const pSegs = splitPath(foldApprovalCase(pattern));
+  const tSegs = splitPath(foldApprovalCase(path));
   // memo[i][j]: pattern from i matches path from j. Sizes are tiny (path depth).
   const memo = new Map<number, boolean>();
   const width = tSegs.length + 1;
@@ -80,8 +94,8 @@ function splitPath(p: string): string[] {
  * to overlap. Case-insensitive.
  */
 export function approvalPathGlobsIntersect(a: string, b: string): boolean {
-  const as = a.toLowerCase().split("/").filter((x) => x.length > 0);
-  const bs = b.toLowerCase().split("/").filter((x) => x.length > 0);
+  const as = foldApprovalCase(a).split("/").filter((x) => x.length > 0);
+  const bs = foldApprovalCase(b).split("/").filter((x) => x.length > 0);
   const memo = new Map<number, boolean>();
   const width = bs.length + 1;
   const segOk = (x: string, y: string): boolean => {

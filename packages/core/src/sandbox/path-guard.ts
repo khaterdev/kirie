@@ -26,7 +26,7 @@
  */
 
 import type { ToolGate, ToolGateCall, ToolGateVerdict } from "../engine/sdk-options.js";
-import { approvalPathMatches, compileApprovalPathList, type ApprovalPathList } from "../approvals/paths.js";
+import { approvalPathMatches, canonicalizeApprovalPath, compileApprovalPathList, type ApprovalPathList } from "../approvals/paths.js";
 import type { AuditTrail } from "../security/audit-trail.js";
 import {
   SANDBOX_PROTECTED_READ_PATHS,
@@ -133,7 +133,7 @@ export function createSandboxPathGuard(deps: SandboxPathGuardDeps): ToolGate {
     const env = source.pathEnv();
     const key = `${env.home}|${env.dataDir}`;
     if (!protectedWrite || !protectedRead || key !== compiledKey) {
-      const aenv = { home: env.home, dataDir: env.dataDir, ...(env.realpath ? { realpath: env.realpath } : {}) };
+      const aenv = { home: env.home, dataDir: env.dataDir, ...(env.realpath ? { realpath: env.realpath } : {}), ...(env.volumeRootAliases ? { volumeRootAliases: env.volumeRootAliases } : {}) };
       protectedWrite = compileApprovalPathList(SANDBOX_PROTECTED_WRITE_PATHS, aenv);
       protectedRead = compileApprovalPathList(SANDBOX_PROTECTED_READ_PATHS, aenv);
       compiledKey = key;
@@ -168,7 +168,8 @@ export function createSandboxPathGuard(deps: SandboxPathGuardDeps): ToolGate {
       if (typeof call.input.pattern === "string" && sandboxPathHasDotDot(call.input.pattern)) {
         return { rule: "path.dotdot", reason: "The sandbox does not accept patterns with \"..\" in them." };
       }
-      const glob = globPatternRoot(call.input.pattern, env.home);
+      const raw = globPatternRoot(call.input.pattern, env.home);
+      const glob = raw ? { pattern: canonicalizeApprovalPath(raw.pattern, env), root: raw.root } : null;
       if (glob) {
         // The pattern itself counts when it could reach a protected file (`~/.ssh/id_*`).
         if (approvalPathMatches({ lexical: glob.pattern, real: glob.pattern }, read)) {

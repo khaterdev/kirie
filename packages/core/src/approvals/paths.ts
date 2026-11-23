@@ -8,9 +8,9 @@
  * path and the path with symlinks resolved.
  */
 
-import { realpathSync } from "node:fs";
+import { readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { approvalPathGlobsIntersect, hasGlobChars, matchApprovalPathGlob } from "./glob.js";
+import { approvalPathGlobsIntersect, foldApprovalCase, hasGlobChars, matchApprovalPathGlob } from "./glob.js";
 
 /** Writes (file tools, redirects, tee, cp, mv, ln, sed -i, rm, ...) to these ask in `ask` mode. */
 export const APPROVALS_PROTECTED_WRITE_PATHS: readonly string[] = [
@@ -115,6 +115,104 @@ export interface ApprovalPathEnv {
   dataDir?: string;
   /** Resolve symlinks of an existing path. Default `fs.realpathSync.native`. Must throw for a missing path. */
   realpath?: (p: string) => string;
+  /** Names of `/Volumes` entries that are symlinks to `/` (the startup disk). Default: read from `/Volumes`. */
+  volumeRootAliases?: () => readonly string[];
+  /** True for an existing directory. Default `fs.statSync`, never under network mount points. */
+  isDirectory?: (p: string) => boolean;
+}
+
+// ── macOS path aliases (GATES-B3) ───────────────────────────────────────────
+
+const DATA_VOLUME = "/system/volumes/data";
+const VOLUMES = "/volumes/";
+const VOLUME_ALIAS_TTL_MS = 60_000;
+let volumeAliasCache: { at: number; names: string[] } | null = null;
+
+/**
+ * Entries of `/Volumes` that are symlinks to `/` (on a Mac, the startup disk:
+ * `/Volumes/Macintosh HD`). Reads the directory listing and the link text of
+ * symlink entries only, so a network volume mounted there is never touched.
+ */
+export function defaultApprovalVolumeRootAliases(): string[] {
+  const now = Date.now();
+  if (volumeAliasCache && now - volumeAliasCache.at < VOLUME_ALIAS_TTL_MS) return volumeAliasCache.names;
+  const names: string[] = [];
+  try {
+    for (const entry of readdirSync("/Volumes", { withFileTypes: true }).slice(0, 256)) {
+      if (!entry.isSymbolicLink()) continue;
+      try {
+        if (readlinkSync(join("/Volumes", entry.name)) === "/") names.push(entry.name);
+      } catch {
+        // unreadable link: not an alias we can map
+      }
+    }
+  } catch {
+    // no /Volumes (not macOS): no aliases
+  }
+  volumeAliasCache = { at: now, names };
+  return names;
+}
+
+/**
+ * The one canonical spelling of an absolute path for protected-path checks,
+ * shared by the approval gate and the sandbox: a leading
+ * `/System/Volumes/Data` (the APFS firmlink to the data volume, which
+ * `realpath` does not undo) is removed, and `/Volumes/<name>/...` becomes
+ * `/...` when that entry is a symlink to `/`. Prefixes compare
+ * case-insensitively (APFS). A `..` right after a prefix is left alone (the
+ * kernel applies it to the alias, not to the root). Other paths are unchanged.
+ */
+export function canonicalizeApprovalPath(p: string, env: Pick<ApprovalPathEnv, "volumeRootAliases"> = {}): string {
+  let out = p;
+  for (let i = 0; i < 8; i++) {
+    const head = out.slice(0, DATA_VOLUME.length + 1).toLowerCase();
+    if (head.startsWith(DATA_VOLUME) && (out.length === DATA_VOLUME.length || out[DATA_VOLUME.length] === "/")) {
+      const rest = out.slice(DATA_VOLUME.length);
+      if (rest === "/.." || rest.startsWith("/../")) break;
+      out = rest === "" || rest === "/" ? "/" : rest;
+      continue;
+    }
+    if (out.slice(0, VOLUMES.length).toLowerCase() === VOLUMES) {
+      const end = out.indexOf("/", VOLUMES.length);
+      const name = end === -1 ? out.slice(VOLUMES.length) : out.slice(VOLUMES.length, end);
+      const rest = end === -1 ? "" : out.slice(end);
+      if (!name || rest === "/.." || rest.startsWith("/../")) break;
+      let aliases: readonly string[] = [];
+      try {
+        aliases = (env.volumeRootAliases ?? defaultApprovalVolumeRootAliases)();
+      } catch {
+        aliases = [];
+      }
+      const folded = foldApprovalCase(name);
+      if (!aliases.some((a) => foldApprovalCase(a) === folded)) break;
+      out = rest === "" || rest === "/" ? "/" : rest;
+      continue;
+    }
+    break;
+  }
+  return out;
+}
+
+/** True when the path (either form) is an existing directory. Never throws; never stats under network mount points. */
+export function approvalPathIsDirectory(path: NormalizedApprovalPath, env: ApprovalPathEnv): boolean {
+  const isDir = env.isDirectory ?? defaultIsDirectory;
+  for (const form of path.real === path.lexical ? [path.lexical] : [path.real, path.lexical]) {
+    if (NO_REALPATH_PREFIXES.some((prefix) => `${form}/`.startsWith(prefix))) continue;
+    try {
+      if (isDir(form)) return true;
+    } catch {
+      // treat as not a directory
+    }
+  }
+  return false;
+}
+
+function defaultIsDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** A path in both forms: as written (expanded, absolute, normalized) and with symlinks resolved. */
@@ -140,6 +238,13 @@ export function expandApprovalHome(p: string, home: string): string {
     if (rest === "" || rest.startsWith("/")) return home + rest;
   }
   if (p.startsWith("${HOME}")) return home + p.slice(7);
+  // ${NAME:-word}, ${NAME-word}, ${NAME:=word}, ${NAME=word}: HOME is set; for any other name assume the default applies.
+  const dm = /^\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[-=])([^{}]*)\}/.exec(p);
+  if (dm) {
+    const rest = p.slice(dm[0].length);
+    if (dm[1] === "HOME") return home + rest;
+    if (rest === "" || rest.startsWith("/")) return expandApprovalHome(dm[3]! + rest, home);
+  }
   if (p.startsWith("~") && !p.startsWith("~+") && !p.startsWith("~-")) {
     const slash = p.indexOf("/");
     const user = slash === -1 ? p.slice(1) : p.slice(1, slash);
@@ -171,8 +276,8 @@ export function expandApprovalPattern(pattern: string, env: ApprovalPathEnv): st
  */
 export function normalizeApprovalPath(p: string, cwd: string, env: ApprovalPathEnv, cache?: Map<string, string>): NormalizedApprovalPath {
   const expanded = expandApprovalHome(p, env.home);
-  const lexical = stripTrailingSep(isAbsolute(expanded) ? normalize(expanded) : resolve(cwd || "/", expanded));
-  return { lexical, real: realpathDeepest(lexical, env.realpath ?? defaultRealpath, cache) };
+  const lexical = canonicalizeApprovalPath(stripTrailingSep(isAbsolute(expanded) ? normalize(expanded) : resolve(cwd || "/", expanded)), env);
+  return { lexical, real: canonicalizeApprovalPath(realpathDeepest(lexical, env.realpath ?? defaultRealpath, cache), env) };
 }
 
 /** Mount points where a stalled network volume could block a realpath call. Never resolved. */
@@ -255,9 +360,9 @@ export function approvalPathMatches(path: NormalizedApprovalPath, list: Approval
 /** True when the path is, or is an ancestor directory of, one of the list's rooted patterns. */
 export function approvalPathIsAncestorOf(path: NormalizedApprovalPath, list: ApprovalPathList): boolean {
   for (const form of path.real === path.lexical ? [path.lexical] : [path.lexical, path.real]) {
-    const dir = form === "/" ? "/" : `${form.toLowerCase()}/`;
+    const dir = form === "/" ? "/" : `${foldApprovalCase(form)}/`;
     for (const root of list.roots) {
-      const r = root === "/" ? "/" : `${root.toLowerCase()}/`;
+      const r = root === "/" ? "/" : `${foldApprovalCase(root)}/`;
       if (dir === "/" || r.startsWith(dir)) return true;
     }
   }
@@ -266,14 +371,14 @@ export function approvalPathIsAncestorOf(path: NormalizedApprovalPath, list: App
 
 /** True when the path is a hardline root target (`/`, home, `/Users`, `/System`, ...). */
 export function isApprovalRootTarget(path: NormalizedApprovalPath, env: ApprovalPathEnv): boolean {
-  const targets = ROOT_TARGETS.map((t) => (t === "~" ? stripTrailingSep(env.home) : t).toLowerCase());
-  return [path.lexical, path.real].some((form) => targets.includes(form.toLowerCase()));
+  const targets = ROOT_TARGETS.map((t) => foldApprovalCase(t === "~" ? stripTrailingSep(env.home) : t));
+  return [path.lexical, path.real].some((form) => targets.includes(foldApprovalCase(form)));
 }
 
 /** True when the path is inside a system directory (`/etc`, `/System`, `/Library`, `/usr` except `/usr/local`, ...). */
 export function isApprovalSystemPath(path: NormalizedApprovalPath): boolean {
   return [path.lexical, path.real].some((form) => {
-    const f = form.toLowerCase();
+    const f = foldApprovalCase(form);
     if (f === "/usr/local" || f.startsWith("/usr/local/")) return false;
     return SYSTEM_WRITE_DIRS.some((d) => {
       const dl = d.toLowerCase();

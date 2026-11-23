@@ -14,7 +14,9 @@
 import { basename } from "node:path";
 import {
   approvalPathIsAncestorOf,
+  approvalPathIsDirectory,
   approvalPathMatches,
+  expandApprovalHome,
   isApprovalRawDevice,
   isApprovalRootTarget,
   isApprovalSystemPath,
@@ -31,6 +33,8 @@ export interface ApprovalRuleEnv {
   /** The tool call's working directory (used when a segment's own cwd is unknown or unset). */
   cwd: string;
   gatewayPort: number;
+  /** The daemon's own command line and launchd label, lower case (`sys.kill-kirie`). */
+  daemonCommandLine: string;
   write: ApprovalPathList;
   read: ApprovalPathList;
   history: ApprovalPathList;
@@ -136,7 +140,7 @@ function startsWithAny(a: string, prefixes: readonly string[]): boolean {
 /** Normalizes a path argument for the segment. Returns null when the path cannot be placed (relative, cwd unknown). */
 function norm(seg: ShellSegment, p: string, env: ApprovalRuleEnv): NormalizedApprovalPath | null {
   if (!p) return null;
-  const absoluteish = p.startsWith("/") || p.startsWith("~") || p.startsWith("$HOME") || p.startsWith("${HOME}");
+  const absoluteish = expandApprovalHome(p, env.path.home).startsWith("/");
   // A null cwd means "unknown" (after `cd "$X"`, or on a remote host): relative paths cannot be placed.
   if (!absoluteish && seg.cwd === null) return null;
   const cwd = seg.cwd ?? env.cwd;
@@ -156,8 +160,38 @@ const CP_LIKE = new Set(["cp", "install", "ditto", "rsync"]);
 const DELETE_LIKE = new Set(["rm", "unlink", "shred", "srm", "rmdir", "truncate", "touch"]);
 const PERM_LIKE = new Set(["chmod", "chown", "chgrp", "chflags", "xattr"]);
 
+/** `dest/name`, keeping a trailing slash of `dest` from doubling. */
+function joinTarget(dest: string, name: string): string {
+  return dest.endsWith("/") ? `${dest}${name}` : `${dest}/${name}`;
+}
+
+/** A destination that is a directory by its spelling alone: `dir/`, `.`, `..`, `~`, `$HOME`. */
+function spelledAsDirectory(dest: string): boolean {
+  return dest.endsWith("/") || dest === "." || dest === ".." || dest === "~" || dest === "$HOME" || dest === "${HOME}" || dest.endsWith("/.") || dest.endsWith("/..");
+}
+
+export interface SegmentWriteOptions {
+  /** True when a destination argument names an existing directory (resolved against the segment's cwd by the caller). */
+  isDirectory?: (dest: string) => boolean;
+}
+
+/**
+ * cp, mv, ln, install, rsync, ditto into a directory write `dest/basename(source)`
+ * (GATES-B3): those are added for every source.
+ */
+function intoDirectory(out: string[], dest: string | undefined, sources: readonly string[], opts: SegmentWriteOptions, forceDir = false): void {
+  if (!dest || sources.length === 0) return;
+  if (!forceDir && !spelledAsDirectory(dest) && !(opts.isDirectory?.(dest) ?? false)) return;
+  for (const src of sources.slice(0, 200)) {
+    const trimmed = src.replace(/\/+$/, "");
+    const name = basename(trimmed);
+    if (!name || name === "." || name === ".." || /^[^/]*:/.test(src)) continue;
+    out.push(joinTarget(dest, name));
+  }
+}
+
 /** Paths this segment writes to (redirects and the write targets of common commands). */
-export function segmentWriteTargets(seg: ShellSegment): string[] {
+export function segmentWriteTargets(seg: ShellSegment, opts: SegmentWriteOptions = {}): string[] {
   const out: string[] = [];
   for (const r of seg.redirects) {
     if (isOutputRedirect(r.op) && r.target && !(r.op === ">&" && isFdTarget(r.target))) out.push(r.target);
@@ -168,15 +202,39 @@ export function segmentWriteTargets(seg: ShellSegment): string[] {
   else if (CP_LIKE.has(cmd)) {
     const p = parseArgs(argv, 1, new Set(["-t", "--target-directory", "-m", "--mode", "-o", "-g", "-S", "--suffix", "-e", "--exclude", "--include", "--filter", "--rsh"]));
     const t = p.values.get("-t") ?? p.values.get("--target-directory");
-    if (t) out.push(...t);
+    if (t) {
+      out.push(...t);
+      for (const dir of t) intoDirectory(out, dir, p.positionals, opts, true);
+    }
     const last = p.positionals[p.positionals.length - 1];
-    if (last && p.positionals.length >= 2 && !(cmd === "rsync" && /^[^/]*:/.test(last))) out.push(last);
+    if (last && p.positionals.length >= 2 && !(cmd === "rsync" && /^[^/]*:/.test(last))) {
+      out.push(last);
+      if (!t) intoDirectory(out, last, p.positionals.slice(0, -1), opts);
+    }
   } else if (cmd === "mv") {
-    out.push(...parseArgs(argv, 1, new Set(["-t", "--target-directory", "-S", "--suffix"])).positionals);
+    const p = parseArgs(argv, 1, new Set(["-t", "--target-directory", "-S", "--suffix"]));
+    out.push(...p.positionals);
+    const t = p.values.get("-t") ?? p.values.get("--target-directory");
+    if (t) {
+      out.push(...t);
+      for (const dir of t) intoDirectory(out, dir, p.positionals, opts, true);
+    } else if (p.positionals.length >= 2) {
+      intoDirectory(out, p.positionals[p.positionals.length - 1], p.positionals.slice(0, -1), opts);
+    }
   } else if (cmd === "ln") {
     const p = parseArgs(argv, 1, new Set(["-t", "--target-directory", "-S", "--suffix"]));
+    const t = p.values.get("-t") ?? p.values.get("--target-directory");
     const last = p.positionals[p.positionals.length - 1];
-    if (last) out.push(last);
+    if (t) {
+      out.push(...t);
+      for (const dir of t) intoDirectory(out, dir, p.positionals, opts, true);
+    } else if (p.positionals.length === 1 && last) {
+      // ln -s TARGET: the link is created in the working directory under the target's name.
+      intoDirectory(out, ".", [last], opts, true);
+    } else if (last) {
+      out.push(last);
+      intoDirectory(out, last, p.positionals.slice(0, -1), opts);
+    }
   } else if (cmd === "dd") {
     for (const a of argv.slice(1)) if (a.startsWith("of=")) out.push(a.slice(3));
   } else if (cmd === "sed" || cmd === "perl" || cmd === "ruby") {
@@ -206,6 +264,48 @@ export function segmentWriteTargets(seg: ShellSegment): string[] {
     const p = parseArgs(argv, 1, new Set(["-C", "--directory", "-f", "--file"]));
     const extracting = p.short.has("x") || p.long.has("--extract") || /^[a-z]*x[a-z]*$/.test(argv[1] ?? "");
     if (extracting) out.push(...(p.values.get("-C") ?? []), ...(p.values.get("--directory") ?? []));
+  }
+  return out.filter((t) => t.length > 0);
+}
+
+/**
+ * Directories this segment fills with content it cannot name: the destination
+ * of a recursive copy (cp -r/-a, rsync -r/-a, ditto) and the target of an
+ * archive extraction (tar x, unzip, 7z x, ditto -x; the working directory when
+ * none is given). A protected path below one of them may be overwritten.
+ */
+export function segmentRecursiveWriteDirs(seg: ShellSegment): string[] {
+  const cmd = seg.cmd;
+  const argv = seg.argv;
+  const out: string[] = [];
+  if (cmd === "cp" || cmd === "rsync" || cmd === "ditto") {
+    const p = parseArgs(argv, 1, new Set(["-t", "--target-directory", "-e", "--rsh", "--exclude", "--include", "--filter", "-f", "--suffix", "-S", "--bom", "--arch"]));
+    const recursive = cmd === "ditto" || p.short.has("r") || p.short.has("R") || p.short.has("a") || p.long.has("--recursive") || p.long.has("--archive");
+    if (!recursive) return out;
+    const t = p.values.get("-t") ?? p.values.get("--target-directory");
+    if (t) out.push(...t);
+    else if (p.positionals.length >= 2) {
+      const last = p.positionals[p.positionals.length - 1]!;
+      if (!(cmd === "rsync" && /^[^/]*:/.test(last))) out.push(last);
+    }
+  } else if (cmd === "tar" || cmd === "bsdtar" || cmd === "gtar") {
+    const p = parseArgs(argv, 1, new Set(["-C", "--directory", "-f", "--file"]));
+    const extracting = p.short.has("x") || p.long.has("--extract") || p.long.has("--get") || /^[a-z]*x[a-z]*$/.test(argv[1] ?? "");
+    if (extracting) {
+      const dirs = [...(p.values.get("-C") ?? []), ...(p.values.get("--directory") ?? [])];
+      out.push(...(dirs.length > 0 ? dirs : ["."]));
+    }
+  } else if (cmd === "unzip") {
+    const p = parseArgs(argv, 1, new Set(["-d", "-x", "-P"]));
+    if (["l", "t", "p", "v", "Z", "z"].some((f) => p.short.has(f))) return out;
+    out.push(...(p.values.get("-d") ?? ["."]));
+  } else if (cmd === "7z" || cmd === "7za" || cmd === "7zz") {
+    const sub = argv[1] ?? "";
+    if (sub !== "x" && sub !== "e") return out;
+    const o = argv.slice(2).find((a) => a.startsWith("-o"));
+    out.push(o ? o.slice(2) : ".");
+  } else if (cmd === "cpio") {
+    if (argv.slice(1).some((a) => /^-[a-z]*i/.test(a) || a === "--extract")) out.push(".");
   }
   return out.filter((t) => t.length > 0);
 }
@@ -516,9 +616,22 @@ function segmentText(seg: ShellSegment): string {
 }
 
 function writesTo(seg: ShellSegment, env: ApprovalRuleEnv, test: (n: NormalizedApprovalPath, raw: string) => boolean): string | null {
-  for (const t of segmentWriteTargets(seg)) {
+  const isDirectory = (dest: string): boolean => {
+    const n = norm(seg, dest, env);
+    return n !== null && approvalPathIsDirectory(n, env.path);
+  };
+  for (const t of segmentWriteTargets(seg, { isDirectory })) {
     const n = norm(seg, t, env);
     if (n && test(n, t)) return t;
+  }
+  return null;
+}
+
+/** A recursive copy or extraction into a protected path or one of its ancestors. */
+function fillsAncestorOf(seg: ShellSegment, env: ApprovalRuleEnv, list: ApprovalPathList): string | null {
+  for (const d of segmentRecursiveWriteDirs(seg)) {
+    const n = norm(seg, d, env);
+    if (n && (approvalPathMatches(n, list) || approvalPathIsAncestorOf(n, list))) return d;
   }
   return null;
 }
@@ -529,6 +642,50 @@ function mentionsGatewayPort(seg: ShellSegment, port: number): boolean {
 }
 
 const GATEWAY_MUTATING = ["/restart", "/shutdown", "/config/reload", "/channels/", "/api/", "/webhooks"];
+
+// ── The daemon itself (sys.kill-kirie) ───────────────────────────────────
+
+/** Text that names the daemon whatever its command line is. */
+const KIRIE_MARKERS = ["kirie", "codingjet", "apps/daemon"];
+const PGREP_VALUE_OPTS = new Set(["-g", "-G", "-P", "-s", "-t", "-u", "-U", "-F", "--signal", "-signal", "--pidfile", "--ns", "--nslist"]);
+
+/** The daemon's process name (what pkill without -f and killall match): the basename of its first word. */
+function daemonProcessName(env: ApprovalRuleEnv): string {
+  const first = env.daemonCommandLine.split(" ")[0] ?? "";
+  return basename(first) || "node";
+}
+
+/**
+ * True when a pkill/pgrep pattern can match the daemon. A pattern is a
+ * regular expression, which is never compiled here: its literal parts must all
+ * appear in the daemon's command line (with -f) or process name; a pattern of
+ * metacharacters only matches everything.
+ */
+function pkillPatternHitsDaemon(pattern: string, full: boolean, env: ApprovalRuleEnv): boolean {
+  const p = lower(pattern);
+  if (KIRIE_MARKERS.some((m) => p.includes(m))) return true;
+  const haystack = full ? env.daemonCommandLine : daemonProcessName(env);
+  const parts = p.split(/[\s.*+?^${}()|[\]\\]+/).filter((x) => x.length > 0);
+  return parts.length === 0 ? p.length > 0 : parts.every((x) => haystack.includes(x));
+}
+
+/** True when the text is a pid source that finds the daemon: `pgrep [-f] <pattern>`, `pidof node`, `lsof -t -i :<gateway port>`. */
+function pidSourceHitsDaemon(text: string, env: ApprovalRuleEnv): boolean {
+  const t = lower(text);
+  // The port is a number from config, never input text.
+  if (new RegExp(`(^|[^0-9])${Math.trunc(env.gatewayPort)}([^0-9]|$)`).test(t) && /\b(lsof|fuser|ss|netstat|sockstat)\b/.test(t)) return true;
+  const words = t.replace(/[$()`'"]/g, " ").split(/\s+/).filter(Boolean);
+  for (let i = 0; i < words.length; i++) {
+    const w = basename(words[i]!);
+    if (w !== "pgrep" && w !== "pidof" && w !== "pkill") continue;
+    const rest: string[] = [];
+    for (let j = i + 1; j < words.length && !["|", ";", "&&", "||"].includes(words[j]!); j++) rest.push(words[j]!);
+    const p = parseArgs(["pgrep", ...rest], 1, PGREP_VALUE_OPTS);
+    const full = p.short.has("f") || p.long.has("--full");
+    if (p.positionals.some((pat) => (w === "pidof" ? lower(pat) === daemonProcessName(env) || KIRIE_MARKERS.some((m) => pat.includes(m)) : pkillPatternHitsDaemon(pat, full, env)))) return true;
+  }
+  return KIRIE_MARKERS.some((m) => t.includes(m)) && /\b(pgrep|pidof|ps|lsof|grep)\b/.test(t);
+}
 
 // ── Segment rules ─────────────────────────────────────────────────────────
 
@@ -662,7 +819,9 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     description: "Writes to a protected path (SSH keys, shell rc files, LaunchAgents, Kirie's own config and state)",
     check(seg, env) {
       const t = writesTo(seg, env, (n) => approvalPathMatches(n, env.write));
-      return t ? `writes to the protected path ${t}` : null;
+      if (t) return `writes to the protected path ${t}`;
+      const d = fillsAncestorOf(seg, env, env.write);
+      return d ? `${seg.cmd} writes unnamed files into ${d}, which holds protected files` : null;
     },
   },
 
@@ -973,17 +1132,35 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     id: "sys.kill-kirie",
     group: "system",
     severity: "dangerous",
-    description: "Killing the Kirie daemon (kill/pkill/killall aimed at kirie or node, kill -1)",
+    description: "Killing the Kirie daemon (kill/pkill/killall aimed at kirie, its command line, node or its gateway port; launchctl on its job; kill -1)",
     commands: ["kill", "pkill", "killall", "killall5", "launchctl"],
-    check(seg) {
+    check(seg, env) {
       const text = lower(seg.raw + " " + seg.argv.join(" "));
-      const aimed = text.includes("kirie") || text.includes("codingjet");
-      if (seg.cmd === "launchctl") return aimed && ["kickstart", "bootout", "unload", "kill", "stop", "remove"].includes(seg.argv[1] ?? "") ? "stops or restarts Kirie's launchd job" : null;
+      const aimed = KIRIE_MARKERS.some((m) => text.includes(m));
+      if (seg.cmd === "launchctl") {
+        const sub = seg.argv[1] ?? "";
+        if (aimed && ["kickstart", "bootout", "unload", "kill", "stop", "remove", "disable"].includes(sub)) return "stops or restarts Kirie's launchd job";
+        if (sub === "bootout" && /^(gui|user|login)\/[0-9]+\/?$/.test(seg.argv[2] ?? "")) return "launchctl bootout of the whole user domain stops Kirie";
+        if (sub === "reboot") return "launchctl reboot restarts every job, Kirie included";
+        return null;
+      }
       if (seg.cmd === "killall5") return "killall5 kills every process";
       if (aimed) return `${seg.cmd} aimed at Kirie`;
       const targets = seg.argv.slice(1).filter((x) => !x.startsWith("-") || x === "-1");
       if (seg.cmd === "kill" && targets.includes("-1")) return "kill -1 kills every process";
-      if ((seg.cmd === "pkill" || seg.cmd === "killall") && targets.some((t) => t === "node" || t === "Node")) return `${seg.cmd} node kills the Kirie daemon`;
+      if (seg.cmd === "killall" && targets.some((t) => lower(t) === daemonProcessName(env))) return `killall ${daemonProcessName(env)} kills the Kirie daemon`;
+      if (seg.cmd === "pkill") {
+        const p = parseArgs(seg.argv, 1, PGREP_VALUE_OPTS);
+        const full = p.short.has("f") || p.long.has("--full");
+        if (p.positionals.some((pat) => pkillPatternHitsDaemon(pat, full, env))) return `pkill ${full ? "-f " : ""}matches the Kirie daemon's ${full ? "command line" : "process name"}`;
+        return null;
+      }
+      if (seg.cmd === "kill") {
+        // kill $(pgrep -f ...), kill $(lsof -ti :<gateway port>)
+        for (const a of seg.args.slice(1)) {
+          if (a.expansion && pidSourceHitsDaemon(a.value, env)) return "kill of a process found by pgrep or lsof that is the Kirie daemon";
+        }
+      }
       return null;
     },
   },
@@ -1093,6 +1270,8 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
     check(seg, env) {
       const t = writesTo(seg, env, (n) => approvalPathMatches(n, env.kirieControl));
       if (t) return `writes to Kirie's control file ${t}`;
+      const d = fillsAncestorOf(seg, env, env.kirieControl);
+      if (d) return `${seg.cmd} writes unnamed files into ${d}, which holds Kirie's control files`;
       if (seg.cmd === "sqlite3" || seg.cmd === "sqlite") {
         const p = parseArgs(seg.argv, 1, new Set(["-cmd", "-separator", "-newline", "-nullvalue", "-init", "-vfs"]));
         const dbIdx = p.positionals.findIndex((x) => {
@@ -1121,6 +1300,22 @@ export const APPROVAL_RULES: readonly ApprovalRule[] = [
 // ── Whole-command rules ───────────────────────────────────────────────────
 
 export const APPROVAL_COMMAND_RULES: readonly ApprovalCommandRule[] = [
+  {
+    id: "sys.kill-kirie",
+    group: "system",
+    severity: "dangerous",
+    description: "Killing the Kirie daemon with pids from an earlier pipeline stage (pgrep ... | xargs kill, lsof -ti :<gateway port> | xargs kill)",
+    check(parsed, env) {
+      const out: Array<{ reason: string; segment?: number }> = [];
+      parsed.segments.forEach((seg, i) => {
+        if (seg.cmd !== "kill" && seg.cmd !== "pkill") return;
+        if (seg.stage === 0 && !seg.dynamicArgs) return;
+        const source = parsed.segments.find((s) => s.group === seg.group && s.stage < seg.stage && pidSourceHitsDaemon(s.argv.join(" "), env));
+        if (source) out.push({ reason: `${source.cmd} finds the Kirie daemon and its pids are killed`, segment: i });
+      });
+      return out;
+    },
+  },
   {
     id: "hard.forkbomb",
     group: "hardline",

@@ -12,6 +12,7 @@ import {
   APPROVALS_PROTECTED_WRITE_PATHS,
   approvalPathIsAncestorOf,
   approvalPathMatches,
+  canonicalizeApprovalPath,
   compileApprovalPathList,
   expandApprovalHome,
   expandApprovalPattern,
@@ -20,7 +21,7 @@ import {
   type ApprovalPathList,
   type NormalizedApprovalPath,
 } from "../approvals/paths.js";
-import { hasGlobChars, matchApprovalGlob } from "../approvals/glob.js";
+import { foldApprovalCase, hasGlobChars, matchApprovalGlob } from "../approvals/glob.js";
 
 export interface SandboxPathEnv {
   home: string;
@@ -32,6 +33,8 @@ export interface SandboxPathEnv {
   readdir?: (dir: string) => string[];
   /** The agent's working directory (where the SDK loads project settings from). Default: the data directory. */
   agentCwd?: string;
+  /** `/Volumes` entries that link to `/` (see `canonicalizeApprovalPath`). Default: read from `/Volumes`. */
+  volumeRootAliases?: () => readonly string[];
 }
 
 /**
@@ -78,7 +81,7 @@ function defaultReaddir(dir: string): string[] {
 }
 
 function approvalEnv(env: SandboxPathEnv): ApprovalPathEnv {
-  return { home: env.home, dataDir: env.dataDir, realpath: env.realpath ?? defaultRealpath };
+  return { home: env.home, dataDir: env.dataDir, realpath: env.realpath ?? defaultRealpath, ...(env.volumeRootAliases ? { volumeRootAliases: env.volumeRootAliases } : {}) };
 }
 
 function stripTrailingSep(p: string): string {
@@ -105,7 +108,8 @@ export function resolveSandboxPath(p: string, cwd: string, env: SandboxPathEnv):
   const realpath = env.realpath ?? defaultRealpath;
   const expanded = expandApprovalHome(p, env.home);
   // String concatenation on purpose: path.join would apply `..` before the symlinks are seen.
-  const absolute = isAbsolute(expanded) ? expanded : `${cwd || "/"}/${expanded}`;
+  // macOS aliases (`/System/Volumes/Data/...`, `/Volumes/<startup disk>/...`) become their canonical form first (GATES-B3).
+  const absolute = canonicalizeApprovalPath(isAbsolute(expanded) ? expanded : `${cwd || "/"}/${expanded}`, env);
   const lexical = stripTrailingSep(resolve(absolute));
   const segments = absolute.split("/").filter((s) => s.length > 0).slice(0, MAX_SEGMENTS);
   let current = "/";
@@ -129,7 +133,7 @@ export function resolveSandboxPath(p: string, cwd: string, env: SandboxPathEnv):
     }
     current = next;
   }
-  return { lexical, real: stripTrailingSep(current) };
+  return { lexical, real: canonicalizeApprovalPath(stripTrailingSep(current), env) };
 }
 
 /**
@@ -170,8 +174,8 @@ function defaultIsLink(p: string): boolean | null {
 
 /** Case-insensitive (APFS default) "is `path` equal to or inside `root`". */
 export function sandboxPathInside(path: string, root: string): boolean {
-  const p = stripTrailingSep(path).toLowerCase();
-  const r = stripTrailingSep(root).toLowerCase();
+  const p = foldApprovalCase(stripTrailingSep(path));
+  const r = foldApprovalCase(stripTrailingSep(root));
   if (r === "/") return true;
   return p === r || p.startsWith(`${r}/`);
 }
@@ -210,8 +214,8 @@ const TEMP_PREFIXES = ["/private/tmp/", "/private/var/folders/", "/var/folders/"
 
 /** `~/.claude`, `~/.claude2`,`~/.claude-work`, ...: any home entry whose name starts with `.claude`. */
 function isClaudeConfigPath(p: string, home: string): boolean {
-  const h = stripTrailingSep(home).toLowerCase();
-  const lower = p.toLowerCase();
+  const h = foldApprovalCase(stripTrailingSep(home));
+  const lower = foldApprovalCase(p);
   if (!lower.startsWith(`${h}/`)) return false;
   return lower.slice(h.length + 1).split("/")[0]!.startsWith(".claude");
 }
