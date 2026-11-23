@@ -34,6 +34,10 @@ const log = createModuleLogger("background-task-manager");
 /** A result that arrives while a subagent is still running is intermediate; give up waiting after this. */
 export const SUBAGENT_RESULT_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Stored error of a task whose `meta.profile` resolves to no profile (it is never run with the default one). */
+export const TASK_PROFILE_UNAVAILABLE_ERROR =
+  "The task was not run: the feature that owns its task profile is off or failed to start";
+
 /** First-message prefix for a task restarted on another account or model (PLAN C.1). */
 export const TASK_ROTATION_NOTE =
   "<system_note>The previous attempt at this task stopped because the Claude account or model reached a limit. Kirie restarted it on another account or model. If work on this task already appears above, continue from where it stopped instead of starting over.</system_note>";
@@ -407,6 +411,27 @@ export class BackgroundTaskManager {
   private runTask(task: BackgroundTask, resumed = false): void {
     log.info({ taskId: task.id, description: task.description, resumed }, "starting background task");
 
+    // A task that names a profile runs with that profile or not at all: never
+    // with the default (all tools) options. Resolved before the row is touched.
+    let profile: TaskProfile | undefined;
+    const profileName = task.meta?.profile;
+    if (profileName) {
+      try {
+        profile = this.config.profileFor?.(task);
+      } catch (err) {
+        log.error({ taskId: task.id, profile: profileName, err }, "task profile factory threw");
+        profile = undefined;
+      }
+      if (!profile) {
+        log.error({ taskId: task.id, profile: profileName }, "task names a profile that is not available; failing it instead of running with default tools");
+        this.store.markFailed(task.id, `${TASK_PROFILE_UNAVAILABLE_ERROR} (profile "${profileName}")`);
+        void this.notifyFailed(task.id);
+        return;
+      }
+    } else {
+      profile = this.safeHook("profileFor", task, this.config.profileFor && (() => this.config.profileFor!(task)));
+    }
+
     // A row cancelled or finished between the poll and here stays as it is.
     if (!this.store.markRunning(task.id, task.sdk_session_id ?? undefined)) {
       log.info({ taskId: task.id }, "task is no longer pending or running; not starting it");
@@ -414,7 +439,6 @@ export class BackgroundTaskManager {
     }
 
     const controller = this.safeHook("controllerFor", task, this.config.controllerFor && (() => this.config.controllerFor!(task)));
-    const profile = this.safeHook("profileFor", task, this.config.profileFor && (() => this.config.profileFor!(task)));
 
     // A task restarted after a limit is a resumption of the same conversation.
     const rotated = (task.rotation_attempts ?? 0) > 0;

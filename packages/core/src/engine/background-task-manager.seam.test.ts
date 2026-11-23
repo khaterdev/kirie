@@ -335,6 +335,8 @@ describe("BackgroundTaskManager: leak fix, subagents, controllers, profiles", ()
     const initialMessage = vi.fn((_t: BackgroundTask, resumed: boolean) => `continue (resumed=${resumed})`);
     const m = makeManager({
       controllerFor: (t) => (t.meta?.profile === "goal" ? { initialMessage, onTurnResult: async () => ({ action: "finish" }) } : undefined),
+      // A task that names a profile needs it registered (it fails closed otherwise).
+      profileFor: (t) => (t.meta?.profile === "goal" ? { kind: "goal" } : undefined),
     });
 
     m.resumeOnStartup();
