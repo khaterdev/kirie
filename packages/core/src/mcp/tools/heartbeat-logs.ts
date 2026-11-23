@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { EmbeddingProvider } from "./chat-history.js";
 import { getScrubber, SCRUB_WITHHELD } from "../../security/secret-scrubber.js";
+import { sanitizeFTS5Query } from "./memory.js";
 
 const DEFAULT_DB_PATH = join(homedir(), ".kirie", "heartbeat-logs.db");
 
@@ -253,13 +254,16 @@ export class HeartbeatLogStore {
   }
 
   /**
-   * FTS5 keyword search.
+   * FTS5 keyword search. The query is treated as plain words (each token quoted), the same as
+   * memory and chat-history search, so FTS5 operators cannot cause syntax errors.
    */
   search(
-    query: string,
+    rawQuery: string,
     opts?: { limit?: number; tier?: HeartbeatLogTier; category?: string; level?: HeartbeatLogLevel },
   ): HeartbeatLogEntry[] {
     const limit = opts?.limit ?? 20;
+    const query = sanitizeFTS5Query(rawQuery);
+    if (!query) return [];
     const conditions: string[] = ["heartbeat_logs_fts MATCH ?"];
     const params: unknown[] = [query];
 

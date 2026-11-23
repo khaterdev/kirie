@@ -60,3 +60,15 @@ describe("HeartbeatLogStore secret scrubbing", () => {
     });
   });
 });
+
+describe("HeartbeatLogStore search query", () => {
+  it("treats FTS5 operators and stray quotes as plain words instead of throwing", () => {
+    store.log({ tick_number: 1, tier: "tier2", category: "triage", level: "info", title: "telegram degraded", content: "channel NOT responding" });
+    for (const q of ['"unbalanced', "telegram OR", "NOT", "title:telegram", "tele*", "(degraded", "AND AND"]) {
+      expect(() => store.search(q)).not.toThrow();
+    }
+    expect(store.search("telegram degraded").map((e) => e.title)).toEqual(["telegram degraded"]);
+    expect(store.search("NOT")).toHaveLength(1);
+    expect(store.search("   ")).toEqual([]);
+  });
+});

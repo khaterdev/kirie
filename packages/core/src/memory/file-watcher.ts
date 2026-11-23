@@ -11,6 +11,7 @@ import { readFile } from "node:fs/promises";
 import { extname, relative, resolve } from "node:path";
 import type { MemoryManager } from "@kirie/memory";
 import type { ChunkingConfig } from "@kirie/memory";
+import { scrubForMemory } from "../mcp/tools/memory.js";
 
 export interface FileWatcherOptions {
   /** Directory to watch for file changes */
@@ -125,7 +126,9 @@ export class MemoryFileWatcher {
     }
 
     try {
-      const content = await readFile(absPath, "utf-8");
+      // Scrubbed before it is chunked, stored and embedded (a remote embedding provider would
+      // otherwise receive the raw file text), the same as the memory tools.
+      const content = scrubForMemory(await readFile(absPath, "utf-8")).text;
       const key = this.buildKey(absPath);
       this.log(`Syncing file: ${key}`);
 
