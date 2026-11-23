@@ -525,7 +525,7 @@ export async function startDaemon(): Promise<void> {
 
   const agentCwd = config.agent.workspace || dataDir;
   const sdkSkillsDir = resolve(join(agentCwd, ".claude", "skills"));
-  const skillSync = syncBundledSkills({ skills: eligibleSkills, sdkSkillsDir });
+  const skillSync = syncBundledSkills({ skills: eligibleSkills, sdkSkillsDir, dataDir });
   log.info({ sdkSkillsDir, count: skillSync.written.length }, "skills written as Claude Code skills");
 
   // 4b. Create agent registry

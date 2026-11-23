@@ -17,6 +17,8 @@ export interface SkillSyncOptions {
   sdkSkillsDir: string;
   /** Return true to leave a skill out. Default: skip nothing. */
   shouldSkip?: (skill: SkillSyncInput) => boolean;
+  /** ~/.kirie, for a default skip rule that reads Kirie state (the curator's archived skills) */
+  dataDir?: string;
 }
 
 export interface SkillSyncResult {
