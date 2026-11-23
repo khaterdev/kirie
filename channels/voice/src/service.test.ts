@@ -396,7 +396,7 @@ describe("internal API /api/voice", () => {
     expect(bad.status).toBe(400);
   });
 
-  it("GET /calls lists with numbers masked; GET /calls/:id shows the reply as untrusted", async () => {
+  it("GET /calls lists with numbers masked; GET /calls/:id says a reply exists but never carries its text (VOICE-B1)", async () => {
     h = await makeHarness({ approval: "approved" });
     const api = createVoiceInternalApi(h.service);
     const placed = await api.request("/calls", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ to: "mom", message: "hi" }) });
@@ -405,8 +405,14 @@ describe("internal API /api/voice", () => {
     const list = await (await api.request("/calls")).text();
     expect(list).not.toContain(MOM);
     expect(list).toContain('"to":"mom"');
-    const one = (await (await api.request(`/calls/${callId}`)).json()) as { reply: unknown; provider: string };
-    expect(one.reply).toEqual({ text: "ok thanks", trust: "untrusted-transcript" });
+    expect(list).not.toContain("ok thanks");
+    const oneText = await (await api.request(`/calls/${callId}`)).text();
+    expect(oneText).not.toContain("ok thanks");
+    const one = JSON.parse(oneText) as { reply?: unknown; replyCaptured?: boolean; provider: string };
+    expect(one.reply).toBeUndefined();
+    expect(one.replyCaptured).toBe(true);
+    expect(h.service.getCall(callId)).not.toHaveProperty("reply");
+    expect(JSON.stringify(h.service.listCalls())).not.toContain("ok thanks");
     expect(one.provider).toBe("twilio");
     expect((await api.request("/calls/nope")).status).toBe(404);
     const hung = await api.request(`/calls/${callId}/hangup`, { method: "POST" });

@@ -110,7 +110,13 @@ export interface VoiceCallView {
   turns: number;
   endReason?: string;
   createdAt: string;
-  reply?: { text: string; trust: "untrusted-transcript" };
+  /**
+   * A one-way reply or voicemail was captured. Its text is never in this view:
+   * views reach the agent (voice_call_status, voice_call_list), and those
+   * transcripts never enter an agent prompt (PLAN E.7). The owner gets the
+   * text in the DM when the call ends.
+   */
+  replyCaptured?: true;
 }
 
 const PROVIDER_LABEL: Record<VoiceProviderName, string> = { twilio: "Twilio", plivo: "Plivo" };
@@ -515,7 +521,7 @@ export class VoiceService {
       turns: rec.turns,
       ...(rec.endReason ? { endReason: rec.endReason } : {}),
       createdAt: new Date(rec.createdAt).toISOString(),
-      ...(rec.capturedReply ? { reply: { text: rec.capturedReply, trust: "untrusted-transcript" as const } } : {}),
+      ...(rec.capturedReply ? { replyCaptured: true as const } : {}),
     };
   }
 

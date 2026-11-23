@@ -11,7 +11,7 @@ Kirie can phone you (and allowlisted contacts) and, if you allow it, take calls 
 - Outbound:
   - `/call <alias> <message>` speaks a one-way message, captures one optional spoken reply, and reports it back to you in Telegram as an *unverified transcript*.
   - `/call me --talk [goal]` starts a spoken conversation with Kirie. This works only with your own number.
-- Inbound is **off** by default (`inbound.mode: reject`). With `agent` mode, only your own number gets through, and only after a DTMF PIN. Anyone else is rejected, or leaves one voicemail that you get as quoted text. A voicemail never reaches the agent.
+- Inbound is **off** by default (`inbound.mode: reject`). With `agent` mode, only your own number gets through, and only after a DTMF PIN. Anyone else is rejected, or leaves one voicemail that you get as quoted text. Voicemails and one-way replies never reach the agent: they are sent only to your DM, and the agent's call tools say only that a reply was captured, never what it says.
 - Kirie records no audio. Your speech is processed by the provider and its speech vendors, and transcripts are stored in Kirie's chat history like any other chat.
 
 ## Off by default
@@ -190,6 +190,7 @@ Speech can never run a command: a leading `/` is stripped from transcripts, and 
 When voice is active, the agent gets `voice_call_initiate`, `voice_call_status`, `voice_call_list` and `voice_call_hangup`. Every call goes through the daemon's loopback API, where the rules are enforced:
 
 - Calls go only to aliases in `voice.contacts`, plus `me`. Raw numbers are refused.
+- `voice_call_status` and `voice_call_list` (and the loopback routes behind them) never return a transcript. A one-way call's reply and a voicemail show only as `replyCaptured: true`; the text goes to your DM when the call ends and is not written to chat history. It is kept in the call log (`~/.kirie/voice-calls/calls.jsonl`), which no tool hands to the agent; an agent with shell access could still open that file itself.
 - `talk` mode works only with your own number. Messages are limited to 1000 characters.
 - With `outbound.agentCalls: ask` (the default), you get an Approve / Deny card for each call. It shows the alias, the last 4 digits, the provider and the exact words. No answer within `outbound.approvalTimeoutSeconds` (120 s) means deny.
 - During a call, the agent runs with a reduced tool set (`agent.toolProfile: chat`): no shell, no file edits, no subagents, no browser, no restarts, no MCP-server changes, no background tasks, no placing calls, and never computer use. It also gets nothing that would run later with full tools: no relaying into another session, no scheduling, no background-task messages, no proactive triggers, and no external MCP servers from `config.yaml`. A misheard sentence must not become a command. The claude.ai connectors that load from your user settings are only excluded when `agent.strictMcpConfig` is on.
