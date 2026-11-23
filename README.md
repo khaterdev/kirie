@@ -84,7 +84,7 @@ YAML-driven extensible skills loaded at runtime:
 
 **Media** - Spotify player, Sonos, Bluesound, GIF search (Giphy/Tenor), Image generation (DALL-E, Gemini), ElevenLabs TTS
 
-**Audio** - Whisper transcription (local + API), Sherpa ONNX TTS (offline), Voice calls
+**Audio** - Whisper transcription (local + API), Sherpa ONNX TTS (offline)
 
 **Smart Home** - Philips Hue (OpenHue), System health checks
 
@@ -98,12 +98,42 @@ YAML-driven extensible skills loaded at runtime:
 - **Browser Automation** - Playwright integration with auto-setup for headless Chrome control
 - **Canvas UI** - Live-reload HTML canvas served over HTTP with SSE and WebSocket bridge
 - **Docker Sandbox** - Isolated code execution with resource limits, capability dropping, and read-only root
-- **Gateway API** - HTTP control plane (Hono) for status, config reload, channel control, usage analytics, webhooks
-- **Auto-Reply Commands** - Fast pattern-matched commands (`/status`, `/sessions`, `/usage`, `/restart`, etc.) before agent invocation
-- **Plugin System** - Third-party plugins with hooks, MCP tools, and channel adapter factories
-- **Voice Calls** - Twilio VoIP with TTS provider chaining (ElevenLabs > OpenAI > Edge TTS)
+- **Gateway API** - HTTP control plane (Hono, loopback only) for status, config reload, channel control and usage analytics. Webhooks and voice use a separate public listener (`ingress`)
+- **Slash Commands** - A command registry answers `/help`, `/status`, `/stop` and the feature commands before the agent runs. Owner-only commands are checked centrally, and `/help` hides them from anyone else
+- **Plugins** - Small JavaScript plugins that observe messages, replies, tool calls and errors, and may rewrite incoming text. They cannot add tools or channels or block tool calls. Off by default; each plugin is approved by its file hash (see [docs/plugins.md](docs/plugins.md))
+- **Voice Calls** - Turn-based phone calls over Twilio or Plivo webhooks, using the provider's own speech-to-text and text-to-speech. Off by default; tested only against mocked provider APIs so far (see [docs/voice-setup.md](docs/voice-setup.md))
 - **Broadcast Groups** - Named multi-target message delivery across channels
 - **Hot Reload** - Config file watching with debounced, diff-based reloading
+
+### Hermes-parity features
+
+Everything below ships **off** unless the Default column says otherwise. Each feature has an owner-only command in your DM; most toggle at runtime with `on`/`off`, which overrides the config value until you `reset` it.
+
+| Feature | Default | Config key | Owner command |
+|---|---|---|---|
+| Slash commands and generated `/help` | on | `commands.*` | `/help`, `/pending`, `/approve`, `/deny`, `/answer` |
+| Secret scrubbing (channels, logs, stores) | on | `security.scrubbing.*` (read once at start) | `/secrets status`, `/secrets scan` |
+| Hardline blocklist for catastrophic commands | on | `approvals.hardline` | `/approvals hardline off` |
+| Approval prompts before risky commands | off (`yolo`) | `approvals.mode`, `approvals.askScope` | `/approvals mode ask` |
+| Account rotation on usage limits | off | `accounts.rotation.enabled` | `/accounts`, `/rotation on` |
+| Model fallback | off | `agent.fallback.enabled`, `agent.fallback.models` | `/fallback` |
+| Self-learning proposals | off | `learning.enabled`, `learning.memoryPolicy` | `/learn on`, `/proposals` |
+| Skill curator | off | `curator.enabled` | `/curator` |
+| User model (local profile of you) | off | `userModel.enabled` | `/profile on` |
+| Goals (work until a judge says done) | off | `goals.enabled` | `/goal on` |
+| Loops (re-run a prompt, quiet unless changed) | off | `loops.enabled` | `/loop on` |
+| Heartbeat control | follows `proactive.enabled` | `proactive.*` | `/heartbeat` (alias `/hb`) |
+| Webhook triggers | off | `webhooks.enabled`, `ingress.publicBaseUrl` | `/webhook on` |
+| Undo file edits | off | `undo.enabled` | `/undo on` (see [docs/undo.md](docs/undo.md)) |
+| Sandboxed shell commands* | off | `sandbox.mode` | `/sandbox` |
+| Plugins | off | `plugins.enabled` | `/plugins on`, `/plugins enable <name>` |
+| Computer use (desktop control)* | off | `computerUse.enabled` (config, restart) | `/computer on` |
+| Voice calls (Twilio or Plivo) | off | `voice.enabled`, `voice.provider` (config, restart) | `/voice`, `/call` |
+| Strict MCP config | off | `agent.strictMcpConfig` (config) | none |
+
+\* Built in a workstream that merges separately; its command and doc arrive with it.
+
+When bound to loopback (the default), the control plane on port 18789 also refuses requests whose `Host` header is not a loopback name (a DNS-rebinding guard); add names to `gateway.extraAllowedHosts` if you need them. Every key, with its default, is in [`config.example.yaml`](config.example.yaml). Feature docs: [approvals](docs/approvals.md), [plugins](docs/plugins.md), [secret scrubbing](docs/secret-scrubbing.md), [undo](docs/undo.md), [voice](docs/voice-setup.md), [webhooks](docs/webhooks.md).
 
 ---
 
@@ -294,7 +324,7 @@ packages/
   core/          Core engine, security, routing, config, MCP tools, gateway
   memory/        Vector store, embeddings (local ONNX / OpenAI), semantic search
   media/         Media file handling
-  voice/         Voice calls (Twilio), TTS provider chaining
+  voice/         Voice call providers (Twilio, Plivo) and call store
   canvas/        Canvas UI file serving with live reload
   plugin-sdk/    Stable types for third-party plugin developers
   skills/        Skill loader, scanner, workspace manager
