@@ -18,6 +18,11 @@ export const UserModelConfigSchema = z.object({
   batchMaxChars: z.number().int().min(2000).default(40_000),
   maxBatchesPerRun: z.number().int().min(1).default(4),
   maxCostUsdPerDay: z.number().min(0).default(0.3),
+  /**
+   * Reserved, not read: facts are derived only from messages the owner wrote in
+   * their DM. Agent-written memory entries can carry tool or web content, so
+   * they are not an input (W3-UM handoff).
+   */
   memoryPrefixes: z.array(z.string()).default(["owner:", "person:", "rule:"]),
   /** Route new or changed facts through the proposals store. */
   requireApproval: z.boolean().default(false),
@@ -25,6 +30,7 @@ export const UserModelConfigSchema = z.object({
     "health", "sexuality", "religion", "politics", "ethnicity", "legal_status",
     "finances", "government_id", "credentials", "home_address", "third_party_private",
   ]),
+  /** Use the daemon's remote embedding provider (OpenAI) for fact statements. Off: local ONNX model or none. */
   allowRemoteEmbeddings: z.boolean().default(false),
 }).default({});
 
