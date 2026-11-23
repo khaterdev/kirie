@@ -118,7 +118,8 @@ describe("setupGoals", () => {
     });
     await run("/goal on");
     expect(await run("/goal clean --check \"rm -rf build\"")).toContain("denied by the tool gates (hardline)");
-    expect(await run("/goal fix --check \"pnpm test\"")).toBe("");
+    // The reply echoes the checks and caps as parsed (RUNTIME-B1).
+    expect(await run("/goal fix --check \"pnpm test\"")).toMatch(/^Goal g-[a-z2-7]{6} accepted\.\nChecks \(each must exit 0 before the judge is asked\):\n  1\. pnpm test\nCaps: /);
     const store = new GoalStore(join(dir, "goals.db"));
     expect(store.listRecent().map((g) => g.goal)).toEqual(["fix"]);
     store.close();
