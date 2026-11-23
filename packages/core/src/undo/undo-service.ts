@@ -25,8 +25,8 @@ import {
   type RewindFilesResult,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { statSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createModuleLogger } from "../logging/logger.js";
 import { scrubSecrets } from "../security/secret-scrubber.js";
 import { ACCOUNT_AUTH_OVERRIDES } from "../accounts/account-env.js";
@@ -78,8 +78,10 @@ export interface UndoPlan {
   remove: string[];
   /** Paths edited by subagents that the SDK will not restore */
   notCovered: string[];
-  /** Restored or deleted paths modified after the newest selected turn ended */
+  /** Restored or deleted paths modified after the last selected turn that touched them ended */
   modifiedAfter: string[];
+  /** Background tasks started from this chat that are still pending or running (chat scope) */
+  runningTasks: number;
   bashCount: number;
   bashSamples: string[];
   createdAt: number;
@@ -94,11 +96,20 @@ export type UndoPreviewOutcome =
 export type UndoApplyOutcome =
   | { status: "refused"; message: string }
   | { status: "failed"; message: string; result: UndoRewindOutcome }
-  | { status: "applied"; plan: UndoPlan; result: UndoRewindOutcome };
+  | {
+      status: "applied";
+      plan: UndoPlan;
+      result: UndoRewindOutcome;
+      /** Paths the rewind reported, split into restored and deleted (created) files */
+      restored: string[];
+      removed: string[];
+      /** A turn started in the chat while the rewind ran: it may have read or written those files */
+      raced: boolean;
+    };
 
 export interface UndoServiceDeps {
   store: UndoCheckpointStore;
-  recorder: Pick<UndoRecorder, "turnEpoch" | "liveBinding">;
+  recorder: Pick<UndoRecorder, "turnEpoch" | "liveBinding" | "isStreamActive">;
   config: () => UndoConfig;
   isEnabled: () => boolean;
   /** pipeline.isBusy(key) || v2.isBusy(key) */
@@ -107,6 +118,12 @@ export interface UndoServiceDeps {
   v2: { getIdleQuery(sessionKey: string): Query | undefined; closeAndWait(sessionKey: string, timeoutMs?: number): Promise<void> } | null;
   /** Status of a background task, null when unknown */
   taskStatus: (taskId: string) => string | null;
+  /** Background tasks started from this chat that are pending or running */
+  runningTaskCount?: (sessionKey: string) => number;
+  /** The SDK session the chat is mapped to (SessionStore), a cross-check for reusing the live query */
+  currentSdkSessionId?: (sessionKey: string) => string | null;
+  /** Resolve symlinks (e.g. /tmp vs /private/tmp) before comparing paths */
+  canonicalPath?: (path: string) => string;
   sdkOptions?: SdkOptionsPipeline;
   query?: QueryFn;
   baseEnv?: () => NodeJS.ProcessEnv;
@@ -172,6 +189,18 @@ function errorText(err: unknown): string {
   return scrubSecrets(raw, { sink: "prompt-card" }).slice(0, 300);
 }
 
+function defaultCanonical(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    try {
+      return join(realpathSync(dirname(path)), basename(path));
+    } catch {
+      return path;
+    }
+  }
+}
+
 function defaultMtime(path: string): number | null {
   try {
     return statSync(path).mtimeMs;
@@ -185,6 +214,7 @@ export class UndoService {
   private readonly now: () => number;
   private readonly runQuery: QueryFn;
   private readonly mtimeOf: (path: string) => number | null;
+  private readonly canonical: (path: string) => string;
   /** One undo at a time per scope */
   private readonly busyScopes = new Set<string>();
 
@@ -193,6 +223,7 @@ export class UndoService {
     this.now = deps.now ?? Date.now;
     this.runQuery = deps.query ?? (sdkQuery as unknown as QueryFn);
     this.mtimeOf = deps.mtimeOf ?? defaultMtime;
+    this.canonical = deps.canonicalPath ?? defaultCanonical;
   }
 
   /** Dry run: what an undo of the last `turns` turns (chat) or of a task's edits would do. Changes nothing. */
@@ -205,7 +236,7 @@ export class UndoService {
     try {
       const sel = this.select(scope, turns);
       if ("message" in sel) return sel.nothing ? { status: "nothing", message: sel.message } : { status: "refused", message: sel.message };
-      const epoch = this.deps.recorder.turnEpoch(scope.kind === "chat" ? { sessionKey: scope.sessionKey } : { taskId: scope.taskId });
+      const epoch = this.deps.recorder.turnEpoch(sel.sessionKey);
       const dryRun = await this.rewind(sel.sessionKey, scope, sel.target, true);
       if (!dryRun.canRewind) {
         return { status: "refused", message: `Cannot undo: ${dryRun.error ?? "the SDK has no checkpoint for that turn"}.` };
@@ -229,8 +260,7 @@ export class UndoService {
     if (this.now() - plan.createdAt > maxAgeMs) {
       return { status: "refused", message: "That preview has expired. Send /undo again." };
     }
-    const epoch = this.deps.recorder.turnEpoch(scope.kind === "chat" ? { sessionKey: scope.sessionKey } : { taskId: scope.taskId });
-    if (epoch !== plan.epoch) {
+    if (this.deps.recorder.turnEpoch(plan.sessionKey) !== plan.epoch) {
       return { status: "refused", message: "A new turn ran since the preview, so it no longer applies. Send /undo again." };
     }
     const key = scopeKey(scope);
@@ -246,10 +276,16 @@ export class UndoService {
         log.warn({ scope: key, error: result.error }, "rewind failed; ledger rows left as they were");
         return { status: "failed", message: `Undo failed: ${result.error ?? "the SDK could not restore the files"}. Nothing was marked undone.`, result };
       }
+      const raced =
+        this.deps.recorder.turnEpoch(plan.sessionKey) !== plan.epoch ||
+        this.deps.isChatBusy(plan.sessionKey) ||
+        this.deps.recorder.isStreamActive(plan.sessionKey);
       this.deps.store.markUndone(plan.rows.map((r) => r.id), this.now());
-      this.tellConversation(plan, result);
+      const { restored, removed } = this.classify(plan, result.filesChanged);
+      this.tellConversation(plan, restored, removed);
+      if (raced) log.warn({ scope: key }, "a turn started while the undo ran");
       log.info({ scope: key, rows: plan.rows.length, files: result.filesChanged.length, via: result.via }, "undo applied");
-      return { status: "applied", plan, result };
+      return { status: "applied", plan, result, restored, removed, raced };
     } finally {
       this.busyScopes.delete(key);
     }
@@ -275,13 +311,20 @@ export class UndoService {
   // ── internals ───────────────────────────────────────────────────────────
 
   /** After a real undo: one chat-history line and a one-shot note for the model's next turn. */
-  private tellConversation(plan: UndoPlan, result: UndoRewindOutcome): void {
-    const when = formatUndoTime(plan.target.createdAt, this.deps.timezone, this.now());
+  /** Split the rewind's paths into restored files and deleted (created) ones; absolute, as the SDK named them. */
+  private classify(plan: UndoPlan, files: readonly string[]): { restored: string[]; removed: string[] } {
     const abs = (p: string): string => (isAbsolute(p) ? p : resolve(plan.target.cwd, p));
-    const removed = new Set(plan.remove);
-    const paths = [...new Set(result.filesChanged.map(abs))];
-    const restored = paths.filter((p) => !removed.has(p));
-    const deleted = paths.filter((p) => removed.has(p));
+    const created = new Set(plan.remove.map((p) => this.canonical(p)));
+    const paths = [...new Set(files.map(abs))];
+    return {
+      restored: paths.filter((p) => !created.has(this.canonical(p))),
+      removed: paths.filter((p) => created.has(this.canonical(p))),
+    };
+  }
+
+  /** After a real undo: one chat-history line and a one-shot note for the model's next turn. */
+  private tellConversation(plan: UndoPlan, restored: string[], deleted: string[]): void {
+    const when = formatUndoTime(plan.target.createdAt, this.deps.timezone, this.now());
     const list = (ps: string[]): string => ps.slice(0, 20).join(", ") + (ps.length > 20 ? `, and ${ps.length - 20} more` : "");
     const count = (n: number, what: string): string => `${n} ${what}${n === 1 ? "" : "s"}`;
     const turnWord =
@@ -312,7 +355,7 @@ export class UndoService {
     if (!this.deps.v2) return UNDO_NEEDS_V2_TEXT;
     if (!this.deps.isEnabled()) return "Undo is off. Turn it on with /undo on; only turns after that can be undone.";
     if (scope.kind === "chat") {
-      if (this.deps.isChatBusy(scope.sessionKey)) return UNDO_BUSY_TEXT;
+      if (this.deps.isChatBusy(scope.sessionKey) || this.deps.recorder.isStreamActive(scope.sessionKey)) return UNDO_BUSY_TEXT;
       return null;
     }
     const status = this.deps.taskStatus(scope.taskId);
@@ -320,7 +363,7 @@ export class UndoService {
       return `Task ${scope.taskId.slice(0, 8)} is still ${status}. Wait for it to finish (or cancel it), then undo.`;
     }
     const chatKey = this.deps.store.taskSessionKey(scope.taskId);
-    if (chatKey && this.deps.isChatBusy(chatKey)) return UNDO_BUSY_TEXT;
+    if (chatKey && (this.deps.isChatBusy(chatKey) || this.deps.recorder.isStreamActive(chatKey))) return UNDO_BUSY_TEXT;
     return null;
   }
 
@@ -355,20 +398,27 @@ export class UndoService {
     if (!newest.sdkSessionId) {
       return { message: "That turn has no SDK session id recorded (it ended before the session started), so it cannot be undone." };
     }
+    // A gap marker (a turn that ran with checkpointing off) between two
+    // selected turns would be rewound too, without being listed: stop there.
+    const source = scope.kind === "chat" ? "chat" : `task:${scope.taskId}`;
     let valid = 0;
+    let gap = false;
     for (const row of candidates) {
       if (row.sdkSessionId !== newest.sdkSessionId || row.configDir !== newest.configDir) break;
+      if (valid > 0 && this.deps.store.gapBetween(sessionKey, source, row.id, candidates[valid - 1]!.id)) {
+        gap = true;
+        break;
+      }
       valid++;
     }
     if (valid < candidates.length) {
-      const what = scope.kind === "chat" ? `Those ${candidates.length} turns` : "That task's turns";
-      return {
-        message:
-          `${what} span an account switch or a /clear, and one undo can only use one account's backups. ` +
-          (scope.kind === "chat"
-            ? `Undo at most ${valid} at a time (/undo ${valid}), newest first.`
-            : `Only its last ${valid} turn${valid === 1 ? "" : "s"} could be undone together; undo the chat's turns one at a time instead.`),
-      };
+      const why = gap
+        ? "a turn that ran while undo was off lies between them, and rewinding past it would revert its edits unseen"
+        : "they span an account switch or a /clear, and one undo can only use one account's backups";
+      if (scope.kind === "chat") {
+        return { message: `Those ${candidates.length} turns cannot be undone together: ${why}. Undo at most ${valid} at a time (/undo ${valid}), newest first.` };
+      }
+      return { message: `Task ${scope.taskId.slice(0, 8)}'s edits cannot be undone in one step: ${why}.` };
     }
     return { rows: candidates, target: candidates[candidates.length - 1]!, sessionKey };
   }
@@ -376,20 +426,27 @@ export class UndoService {
   private buildPlan(scope: UndoScope, sessionKey: string, rows: UndoCheckpoint[], dryRun: UndoRewindOutcome, epoch: number): UndoPlan {
     const target = rows[rows.length - 1]!;
     const abs = (p: string): string => (isAbsolute(p) ? p : resolve(target.cwd, p));
-    const created = new Set(rows.flatMap((r) => r.filesCreated.map(abs)));
+    const canon = (p: string): string => this.canonical(abs(p));
+    const created = new Set(rows.flatMap((r) => r.filesCreated.map(canon)));
     const changed = [...new Set(dryRun.filesChanged.map(abs))];
-    const restore = changed.filter((p) => !created.has(p));
-    const remove = changed.filter((p) => created.has(p));
-    const changedSet = new Set(changed);
-    const notCovered = [...new Set(rows.flatMap((r) => r.subagentFiles.map(abs)))].filter((p) => !changedSet.has(p));
-    const newestEnd = rows[0]!.completedAt;
-    const modifiedAfter =
-      newestEnd === null
-        ? []
-        : changed.filter((p) => {
-            const m = this.mtimeOf(p);
-            return m !== null && m > newestEnd + MTIME_SLACK_MS;
-          });
+    const restore = changed.filter((p) => !created.has(this.canonical(p)));
+    const remove = changed.filter((p) => created.has(this.canonical(p)));
+    const changedSet = new Set(changed.map((p) => this.canonical(p)));
+    const notCovered = [...new Set(rows.flatMap((r) => r.subagentFiles.map(abs)))].filter((p) => !changedSet.has(this.canonical(p)));
+
+    // A file counts as changed since when its mtime is later than the end of
+    // the last selected turn that touched it (or the newest turn, if none listed it).
+    const lastTouch = new Map<string, number>();
+    for (const r of [...rows].reverse()) {
+      const end = r.completedAt ?? r.createdAt;
+      for (const f of [...r.filesChanged, ...r.subagentFiles]) lastTouch.set(canon(f), end);
+    }
+    const newestEnd = rows[0]!.completedAt ?? rows[0]!.createdAt;
+    const modifiedAfter = changed.filter((p) => {
+      const m = this.mtimeOf(p);
+      const since = lastTouch.get(this.canonical(p)) ?? newestEnd;
+      return m !== null && m > since + MTIME_SLACK_MS;
+    });
     const bashSamples: string[] = [];
     for (const r of rows) for (const s of r.bashSamples) if (bashSamples.length < 3) bashSamples.push(s);
     return {
@@ -402,6 +459,7 @@ export class UndoService {
       remove,
       notCovered,
       modifiedAfter,
+      runningTasks: scope.kind === "chat" ? (this.deps.runningTaskCount?.(sessionKey) ?? 0) : 0,
       bashCount: rows.reduce((n, r) => n + r.bashCount, 0),
       bashSamples,
       createdAt: this.now(),
@@ -409,25 +467,51 @@ export class UndoService {
     };
   }
 
+  /** True when nothing runs in the chat (or the task) right now. */
+  private idle(sessionKey: string, scope: UndoScope): boolean {
+    if (this.deps.isChatBusy(sessionKey) || this.deps.recorder.isStreamActive(sessionKey)) return false;
+    if (scope.kind === "task") {
+      const status = this.deps.taskStatus(scope.taskId);
+      if (status === "pending" || status === "running") return false;
+    }
+    return true;
+  }
+
   /** Run rewindFiles on the live query when it is safe, else on a temporary resumed query. */
   private async rewind(sessionKey: string, scope: UndoScope, target: UndoCheckpoint, dryRun: boolean): Promise<UndoRewindOutcome> {
     const v2 = this.deps.v2!;
     if (scope.kind === "chat") {
       const live = v2.getIdleQuery(sessionKey);
-      const binding = this.deps.recorder.liveBinding(sessionKey);
-      if (live && binding?.checkpointing && binding.sdkSessionId === target.sdkSessionId && binding.configDir === target.configDir) {
-        return this.callRewind(live, target.userMessageUuid, dryRun, "live");
-      }
-      // A process that may hold this SDK session open must exit before
-      // another one resumes it. A live process on another session is left alone.
-      if (live && (!binding || binding.sdkSessionId === null || binding.sdkSessionId === target.sdkSessionId)) {
+      if (live) {
+        const binding = this.deps.recorder.liveBinding(sessionKey);
+        const mapped = this.deps.currentSdkSessionId?.(sessionKey);
+        const reusable =
+          binding?.checkpointing === true &&
+          binding.sdkSessionId === target.sdkSessionId &&
+          binding.configDir === target.configDir &&
+          (mapped === undefined || mapped === null || mapped === target.sdkSessionId);
+        if (reusable) {
+          // No await between the busy check and this call: no turn can start in between.
+          const res = await this.callRewind(live, target.userMessageUuid, dryRun, "live");
+          // A timed-out control request may still be running in that process: end it.
+          if (res.timedOut) await v2.closeAndWait(sessionKey, UNDO_CLOSE_TIMEOUT_MS);
+          return res;
+        }
+        // The live process may hold the SDK session open; it must exit before
+        // another process resumes that session. It is resumed on the next message.
         await v2.closeAndWait(sessionKey, UNDO_CLOSE_TIMEOUT_MS);
       }
     }
-    return this.rewindInTemporaryQuery(target, dryRun);
+    return this.rewindInTemporaryQuery(sessionKey, scope, target, dryRun);
   }
 
-  private async rewindInTemporaryQuery(target: UndoCheckpoint, dryRun: boolean): Promise<UndoRewindOutcome> {
+  private async rewindInTemporaryQuery(sessionKey: string, scope: UndoScope, target: UndoCheckpoint, dryRun: boolean): Promise<UndoRewindOutcome> {
+    const fail = (error: string): UndoRewindOutcome => ({
+      canRewind: false, error, filesChanged: [], insertions: 0, deletions: 0, skippedLinks: 0, via: "temporary",
+    });
+    const startedTurn = "a turn started in this chat before the rewind could run; nothing was changed";
+    if (!this.idle(sessionKey, scope)) return fail(startedTurn);
+
     const input = neverYielding();
     const options: Options = {
       resume: target.sdkSessionId!,
@@ -437,17 +521,17 @@ export class UndoService {
       // No user settings, hooks or MCP servers: nothing here needs tools (E3 ran this way)
       settingSources: [],
     };
-    this.deps.sdkOptions?.apply(options, {
-      kind: "utility",
-      sessionKey: target.sessionKey,
-      ownerDm: false,
-      interactive: false,
-      label: dryRun ? "undo preview" : "undo rewind",
-      cwd: target.cwd,
-    });
 
     let q: Query | undefined;
     try {
+      this.deps.sdkOptions?.apply(options, {
+        kind: "utility",
+        sessionKey: target.sessionKey,
+        ownerDm: false,
+        interactive: false,
+        label: dryRun ? "undo preview" : "undo rewind",
+        cwd: target.cwd,
+      });
       q = this.runQuery({ prompt: input.iterable, options });
       const stream = q;
       void (async () => {
@@ -459,9 +543,11 @@ export class UndoService {
           // closing the query ends the stream with an error
         }
       })();
+      // Spawning takes a moment: check again right before the files change.
+      if (!this.idle(sessionKey, scope)) return fail(startedTurn);
       return await this.callRewind(stream, target.userMessageUuid, dryRun, "temporary");
     } catch (err) {
-      return { canRewind: false, error: errorText(err), filesChanged: [], insertions: 0, deletions: 0, skippedLinks: 0, via: "temporary" };
+      return fail(errorText(err));
     } finally {
       input.end();
       try {
@@ -472,7 +558,7 @@ export class UndoService {
     }
   }
 
-  private async callRewind(q: Query, uuid: string, dryRun: boolean, via: "live" | "temporary"): Promise<UndoRewindOutcome> {
+  private async callRewind(q: Query, uuid: string, dryRun: boolean, via: "live" | "temporary"): Promise<UndoRewindOutcome & { timedOut?: boolean }> {
     const timeoutMs = this.deps.rewindTimeoutMs ?? UNDO_REWIND_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -483,7 +569,11 @@ export class UndoService {
         }),
       ]);
       if (res === "timeout") {
-        return { canRewind: false, error: `the rewind timed out after ${Math.round(timeoutMs / 1000)} s`, filesChanged: [], insertions: 0, deletions: 0, skippedLinks: 0, via };
+        return {
+          canRewind: false,
+          error: `the rewind timed out after ${Math.round(timeoutMs / 1000)} s`,
+          filesChanged: [], insertions: 0, deletions: 0, skippedLinks: 0, via, timedOut: true,
+        };
       }
       return normalizeResult(res, via);
     } catch (err) {

@@ -11,7 +11,8 @@ import type { UnifiedMessage } from "../channels/normalizer.js";
 import { OwnerDirectory } from "../interaction/owners.js";
 import { UndoCheckpointStore } from "./checkpoint-store.js";
 import { UndoService } from "./undo-service.js";
-import { createUndoCommands, displayUndoPath, UNDO_HELP_TEXT, type UndoCommandDeps } from "./commands.js";
+import { createUndoCommands, displayUndoPath, renderUndoApplied, renderUndoPreview, UNDO_HELP_TEXT, type UndoCommandDeps } from "./commands.js";
+import type { UndoPlan } from "./undo-service.js";
 
 const OWNER = "1001";
 const KEY = `telegram:dm:${OWNER}`;
@@ -48,7 +49,7 @@ function fakeQuery(): Query {
 function makeService(): UndoService {
   return new UndoService({
     store,
-    recorder: { turnEpoch: () => epoch, liveBinding: () => undefined },
+    recorder: { turnEpoch: () => epoch, liveBinding: () => undefined, isStreamActive: () => false },
     config: () => config,
     isEnabled: () => enabled,
     isChatBusy: () => busy,
@@ -289,5 +290,20 @@ describe("/undo", () => {
   it("shows paths relative to the turn's cwd or home", () => {
     expect(displayUndoPath("/work/src/a.ts", "/work")).toBe("src/a.ts");
     expect(displayUndoPath("/elsewhere/b.ts", "/work")).toBe("/elsewhere/b.ts");
+  });
+
+  it("notes running tasks in the preview and warns when a turn raced the undo", () => {
+    const id = turn({ uuid: "u1", files: ["/work/a.ts"] });
+    const row = store.get(id)!;
+    const plan: UndoPlan = {
+      scope: { kind: "chat", sessionKey: KEY }, sessionKey: KEY, rows: [row], target: row,
+      dryRun: { canRewind: true, filesChanged: ["/work/a.ts"], insertions: 1, deletions: 1, skippedLinks: 0, via: "temporary" },
+      restore: ["/work/a.ts"], remove: [], notCovered: [], modifiedAfter: [], runningTasks: 2,
+      bashCount: 0, bashSamples: [], createdAt: T0, epoch: 1,
+    };
+    expect(renderUndoPreview(plan)).toContain("Note: 2 background tasks started from this chat are still running");
+    const out = renderUndoApplied({ status: "applied", plan, result: plan.dryRun, restored: ["/work/a.ts"], removed: [], raced: true });
+    expect(out).toContain("Undone. Restored 1 file:\n  a.ts");
+    expect(out).toContain("Warning: a turn started in this chat while the undo ran");
   });
 });

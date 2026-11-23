@@ -61,6 +61,12 @@ interface OpenTurn {
   bashSamples: string[];
 }
 
+/** Per process: whether its stream is between turns, and whether an unsolicited turn is running. */
+interface ProcessState {
+  ended: boolean;
+  unsolicited: boolean;
+}
+
 /** The binding of a chat's live process, as its latest turn reported it. */
 export interface UndoLiveBinding {
   /** False when the process was spawned with checkpointing off */
@@ -122,7 +128,8 @@ export class UndoRecorder {
   private readonly openByUuid = new Map<string, OpenTurn>();
   /** Latest chat process per session key */
   private readonly liveChat = new Map<string, SdkCallContext>();
-  /** Turns started per ledger scope ("chat:<sessionKey>", "task:<id>") */
+  private readonly procs = new WeakMap<SdkCallContext, ProcessState>();
+  /** Turns started per chat session key, counting the chat's own turns, its tasks' turns and unsolicited turns */
   private readonly epochs = new Map<string, number>();
   private stopped = false;
 
@@ -140,15 +147,18 @@ export class UndoRecorder {
 
   /** The `checkpointing` contributor. */
   readonly contributor = (options: Options, ctx: SdkCallContext): void => {
-    if (this.stopped || !this.deps.isEnabled()) return;
-    const isChat = ctx.kind === "chat";
-    const isTask = UNDO_TASK_KINDS.has(ctx.kind);
-    if (!isChat && !(isTask && this.deps.backgroundTasks())) return;
-    options.enableFileCheckpointing = true;
-    this.spawns.set(ctx, {
-      configDir: undoConfigDirOf(options.env, this.deps.baseEnv?.() ?? process.env),
-      sdkSessionId: typeof options.resume === "string" ? options.resume : null,
-    });
+    // A throw here would fail every chat and task spawn: log and leave the options alone.
+    try {
+      if (this.stopped || !this.deps.isEnabled()) return;
+      const isChat = ctx.kind === "chat";
+      const isTask = UNDO_TASK_KINDS.has(ctx.kind);
+      if (!isChat && !(isTask && this.deps.backgroundTasks())) return;
+      const configDir = undoConfigDirOf(options.env, this.deps.baseEnv?.() ?? process.env);
+      options.enableFileCheckpointing = true;
+      this.spawns.set(ctx, { configDir, sdkSessionId: typeof options.resume === "string" ? options.resume : null });
+    } catch (err) {
+      log.warn({ label: ctx.label, err: err instanceof Error ? err.message : String(err) }, "checkpointing contributor failed; spawning without checkpoints");
+    }
   };
 
   /** The stream observer. Never throws (the pipeline would log it anyway). */
@@ -163,9 +173,23 @@ export class UndoRecorder {
     }
   };
 
-  /** Turns started so far in a scope; a confirm is refused when this moved since the preview. */
-  turnEpoch(scope: { sessionKey: string } | { taskId: string }): number {
-    return this.epochs.get("taskId" in scope ? `task:${scope.taskId}` : `chat:${scope.sessionKey}`) ?? 0;
+  /**
+   * Turns started so far for a chat session key: its own turns, turns of tasks
+   * it started, and unsolicited turns (an async subagent's result after the
+   * turn ended). A confirm is refused when this moved since the preview.
+   */
+  turnEpoch(sessionKey: string): number {
+    return this.epochs.get(sessionKey) ?? 0;
+  }
+
+  /** True while the chat's live process is running a turn nobody asked for (no turn_start, so not "busy"). */
+  isStreamActive(sessionKey: string): boolean {
+    const ctx = this.liveChat.get(sessionKey);
+    return ctx ? this.procs.get(ctx)?.unsolicited === true : false;
+  }
+
+  private bump(sessionKey: string): void {
+    this.epochs.set(sessionKey, (this.epochs.get(sessionKey) ?? 0) + 1);
   }
 
   /** What the chat's live process was spawned with, per its latest turn. Undefined when no turn was seen. */
@@ -183,13 +207,32 @@ export class UndoRecorder {
     const { ctx } = ev;
     const source = undoSourceOf(ctx);
     if (!source || !ctx.sessionKey) return;
-    const scope = source === "chat" ? `chat:${ctx.sessionKey}` : source;
-    this.epochs.set(scope, (this.epochs.get(scope) ?? 0) + 1);
+    this.bump(ctx.sessionKey);
+    this.procs.set(ctx, { ended: false, unsolicited: false });
     if (source === "chat") this.liveChat.set(ctx.sessionKey, ctx);
 
     this.current.delete(ctx);
     const spawn = this.spawns.get(ctx);
-    if (!spawn || !ev.userMessageUuid) return;
+    if (!ev.userMessageUuid) return;
+    if (!spawn) {
+      // A turn without checkpoints in a session with undo history: leave a gap
+      // marker so a multi-turn undo never silently rewinds across it.
+      if (this.deps.store.hasRows(ctx.sessionKey)) {
+        this.deps.store.insert({
+          sessionKey: ctx.sessionKey,
+          sdkSessionId: ev.sdkSessionId ?? null,
+          userMessageUuid: ev.userMessageUuid,
+          accountId: ev.accountId,
+          configDir: null,
+          cwd: ctx.cwd,
+          source,
+          promptPreview: null,
+          createdAt: this.now(),
+          checkpointed: false,
+        });
+      }
+      return;
+    }
     if (ev.sdkSessionId) spawn.sdkSessionId = ev.sdkSessionId;
 
     const rawPreview = source === "chat"
@@ -228,6 +271,14 @@ export class UndoRecorder {
   }
 
   private onMessage(ctx: SdkCallContext, msg: SDKMessage): void {
+    const proc = this.procs.get(ctx);
+    if (proc?.ended && ctx.sessionKey) {
+      if (msg.type === "result") proc.unsolicited = false;
+      else if ((msg.type === "assistant" || msg.type === "user") && !proc.unsolicited) {
+        proc.unsolicited = true;
+        this.bump(ctx.sessionKey);
+      }
+    }
     const spawn = this.spawns.get(ctx);
     if (!spawn) return;
     const sid = (msg as { session_id?: unknown }).session_id;
@@ -281,13 +332,23 @@ export class UndoRecorder {
   }
 
   private onTurnEnd(ev: Extract<SdkStreamEvent, { type: "turn_end" }>): void {
+    const proc = this.procs.get(ev.ctx);
+    if (proc) {
+      proc.ended = true;
+      proc.unsolicited = false;
+    }
     const spawn = this.spawns.get(ev.ctx);
     if (spawn && ev.sdkSessionId) spawn.sdkSessionId = ev.sdkSessionId;
     if (!ev.userMessageUuid) return;
     const turn = this.openByUuid.get(ev.userMessageUuid);
     if (!turn) return;
     this.openByUuid.delete(ev.userMessageUuid);
-    if (!turn.hasSessionId && spawn?.sdkSessionId) {
+    // The engine's own session id at turn end wins over ids read from the
+    // stream (a closed process's late messages can carry an older one).
+    if (ev.sdkSessionId) {
+      this.deps.store.correctSdkSessionId(turn.rowId, ev.sdkSessionId);
+      turn.hasSessionId = true;
+    } else if (!turn.hasSessionId && spawn?.sdkSessionId) {
       this.deps.store.setSdkSessionId(turn.rowId, spawn.sdkSessionId);
       turn.hasSessionId = true;
     }

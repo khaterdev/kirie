@@ -85,6 +85,9 @@ export const setupUndo: FeatureSetup = (ctx) => {
     isChatBusy: (sessionKey) => ctx.pipeline.isBusy(sessionKey) || v2.isBusy(sessionKey),
     v2,
     taskStatus: (taskId) => ctx.backgroundTaskStore.get(taskId)?.status ?? null,
+    runningTaskCount: (sessionKey) =>
+      ctx.backgroundTaskStore.list(sessionKey, "running").length + ctx.backgroundTaskStore.list(sessionKey, "pending").length,
+    currentSdkSessionId: (sessionKey) => ctx.sessionStore.get(sessionKey),
     sdkOptions: ctx.sdkOptions,
     addNextTurnNote: (sessionKey, note) => ctx.pipeline.addNextTurnNote(sessionKey, note),
     appendHistory: (sessionKey, text) => {

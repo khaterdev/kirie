@@ -135,19 +135,21 @@ export function renderUndoPreview(plan: UndoPlan): string {
   if (plan.modifiedAfter.length > 0) {
     lines.push(`Warning: ${plural(plan.modifiedAfter.length, "file")} changed after that turn; undo will overwrite those changes.`);
   }
+  if (plan.runningTasks > 0) {
+    lines.push(`Note: ${plural(plan.runningTasks, "background task")} started from this chat ${plan.runningTasks === 1 ? "is" : "are"} still running and may be editing the same files.`);
+  }
   return scrub(lines.join("\n"));
 }
 
 /** The reply after a real undo (scrubbed). */
 export function renderUndoApplied(outcome: Extract<UndoApplyOutcome, { status: "applied" }>): string {
-  const { plan, result } = outcome;
-  const restored = plan.restore.length;
-  const deleted = plan.remove.length;
-  const parts = [`Undone. Restored ${plural(restored, "file")}${deleted > 0 ? ` and deleted ${plural(deleted, "created file")}` : ""}:`];
-  parts.push(...listPaths([...plan.restore, ...plan.remove], plan.target.cwd));
+  const { plan, result, restored, removed } = outcome;
+  const parts = [`Undone. Restored ${plural(restored.length, "file")}${removed.length > 0 ? ` and deleted ${plural(removed.length, "created file")}` : ""}:`];
+  parts.push(...listPaths([...restored, ...removed], plan.target.cwd));
   if (result.skippedLinks > 0) parts.push(`Skipped ${plural(result.skippedLinks, "file")} (symlink, hard link or moved path): not restored.`);
   parts.push(shellLine(plan));
   if (plan.notCovered.length > 0) parts.push(`Not restored: ${plural(plan.notCovered.length, "file")} edited by a subagent.`);
+  if (outcome.raced) parts.push("Warning: a turn started in this chat while the undo ran; it may have read or changed those files. Check them.");
   parts.push("The conversation was not rewound; I will be told about this undo on your next message.");
   return scrub(parts.join("\n"));
 }

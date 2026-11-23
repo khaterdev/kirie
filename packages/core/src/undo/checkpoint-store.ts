@@ -44,6 +44,8 @@ export interface UndoCheckpoint {
   createdAt: number;
   completedAt: number | null;
   undoneAt: number | null;
+  /** False for a gap marker: a turn of this session that ran with checkpointing off */
+  checkpointed: boolean;
 }
 
 export interface NewUndoCheckpoint {
@@ -56,6 +58,8 @@ export interface NewUndoCheckpoint {
   source: UndoTurnSource;
   promptPreview: string | null;
   createdAt: number;
+  /** Default true. False records a gap marker (see UndoCheckpoint.checkpointed) */
+  checkpointed?: boolean;
 }
 
 export interface UndoTurnActivity {
@@ -84,6 +88,7 @@ interface Row {
   created_at: number;
   completed_at: number | null;
   undone_at: number | null;
+  checkpointed: number;
 }
 
 function parseList(text: string): string[] {
@@ -114,6 +119,7 @@ function toCheckpoint(r: Row): UndoCheckpoint {
     createdAt: r.created_at,
     completedAt: r.completed_at,
     undoneAt: r.undone_at,
+    checkpointed: r.checkpointed !== 0,
   };
 }
 
@@ -123,6 +129,7 @@ function capList(list: readonly string[], max: number): string {
 
 /** A row counts as "changed files" when the turn wrote a file itself or through a subagent. */
 const HAS_FILES = "(files_changed <> '[]' OR subagent_files <> '[]')";
+const CHECKPOINTED = "checkpointed = 1";
 
 export class UndoCheckpointStore {
   private readonly db: Database.Database;
@@ -165,7 +172,8 @@ export class UndoCheckpointStore {
         bash_samples      TEXT NOT NULL DEFAULT '[]',
         created_at        INTEGER NOT NULL,
         completed_at      INTEGER,
-        undone_at         INTEGER
+        undone_at         INTEGER,
+        checkpointed      INTEGER NOT NULL DEFAULT 1
       );
       CREATE INDEX IF NOT EXISTS turn_checkpoints_session ON turn_checkpoints(session_key, id DESC);
       CREATE INDEX IF NOT EXISTS turn_checkpoints_source ON turn_checkpoints(source, id DESC);
@@ -185,8 +193,8 @@ export class UndoCheckpointStore {
     const res = this.db
       .prepare(
         `INSERT INTO turn_checkpoints
-           (session_key, sdk_session_id, user_message_uuid, account_id, config_dir, cwd, source, prompt_preview, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (session_key, sdk_session_id, user_message_uuid, account_id, config_dir, cwd, source, prompt_preview, created_at, checkpointed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.sessionKey,
@@ -198,6 +206,7 @@ export class UndoCheckpointStore {
         row.source,
         row.promptPreview,
         row.createdAt,
+        row.checkpointed === false ? 0 : 1,
       );
     return Number(res.lastInsertRowid);
   }
@@ -207,6 +216,27 @@ export class UndoCheckpointStore {
     this.db
       .prepare("UPDATE turn_checkpoints SET sdk_session_id = ? WHERE id = ? AND sdk_session_id IS NULL")
       .run(sdkSessionId, id);
+  }
+
+  /** Overwrite the SDK session id with the one the engine reported at turn end (authoritative). */
+  correctSdkSessionId(id: number, sdkSessionId: string): void {
+    this.db.prepare("UPDATE turn_checkpoints SET sdk_session_id = ? WHERE id = ?").run(sdkSessionId, id);
+  }
+
+  /** True when this session has any row (gap markers are written only for sessions with undo history). */
+  hasRows(sessionKey: string): boolean {
+    return this.db.prepare("SELECT 1 FROM turn_checkpoints WHERE session_key = ? LIMIT 1").get(sessionKey) !== undefined;
+  }
+
+  /** True when a gap marker of this session and source lies strictly between two row ids. */
+  gapBetween(sessionKey: string, source: UndoTurnSource, olderId: number, newerId: number): boolean {
+    return (
+      this.db
+        .prepare(
+          "SELECT 1 FROM turn_checkpoints WHERE session_key = ? AND source = ? AND checkpointed = 0 AND id > ? AND id < ? LIMIT 1",
+        )
+        .get(sessionKey, source, olderId, newerId) !== undefined
+    );
   }
 
   /** Replace what the turn did so far. */
@@ -245,7 +275,7 @@ export class UndoCheckpointStore {
   /** Newest first: every row of a chat session (chat turns and its tasks' turns). */
   recent(sessionKey: string, limit: number): UndoCheckpoint[] {
     const rows = this.db
-      .prepare("SELECT * FROM turn_checkpoints WHERE session_key = ? ORDER BY id DESC LIMIT ?")
+      .prepare(`SELECT * FROM turn_checkpoints WHERE session_key = ? AND ${CHECKPOINTED} ORDER BY id DESC LIMIT ?`)
       .all(sessionKey, limit) as Row[];
     return rows.map(toCheckpoint);
   }
@@ -255,7 +285,7 @@ export class UndoCheckpointStore {
     const rows = this.db
       .prepare(
         `SELECT * FROM turn_checkpoints
-          WHERE session_key = ? AND source = ? AND undone_at IS NULL AND ${HAS_FILES}
+          WHERE session_key = ? AND source = ? AND undone_at IS NULL AND ${CHECKPOINTED} AND ${HAS_FILES}
           ORDER BY id DESC LIMIT ?`,
       )
       .all(sessionKey, source, limit) as Row[];
@@ -268,7 +298,7 @@ export class UndoCheckpointStore {
     const rows = this.db
       .prepare(
         `SELECT source, MAX(id) AS last FROM turn_checkpoints
-          WHERE source LIKE ? ESCAPE '\\'
+          WHERE source LIKE ? ESCAPE '\\' AND ${CHECKPOINTED}
           GROUP BY source ORDER BY last DESC LIMIT ?`,
       )
       .all(`task:${escaped}%`, limit) as Array<{ source: string }>;

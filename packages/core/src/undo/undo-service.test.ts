@@ -54,11 +54,15 @@ let notes: Array<[string, string]>;
 let history: Array<[string, string]>;
 let mtimes: Record<string, number>;
 let taskStatus: string | null;
+let streamActive: boolean;
+let mappedSid: string | null;
 
 function service(over: Partial<UndoServiceDeps> = {}): UndoService {
   return new UndoService({
     store,
-    recorder: { turnEpoch: () => epoch, liveBinding: () => binding },
+    recorder: { turnEpoch: () => epoch, liveBinding: () => binding, isStreamActive: () => streamActive },
+    currentSdkSessionId: () => mappedSid,
+    runningTaskCount: () => 0,
     config: () => config,
     isEnabled: () => enabled,
     isChatBusy: () => busy,
@@ -91,6 +95,7 @@ function turn(opts: {
   bash?: string[];
   source?: string;
   at?: number;
+  gap?: boolean;
 }): number {
   const at = opts.at ?? now;
   const id = store.insert({
@@ -103,6 +108,7 @@ function turn(opts: {
     source: opts.source ?? "chat",
     promptPreview: `prompt ${opts.uuid}`,
     createdAt: at,
+    checkpointed: !opts.gap,
   });
   store.setActivity(id, {
     filesChanged: opts.files ?? [],
@@ -132,6 +138,8 @@ beforeEach(() => {
   history = [];
   mtimes = {};
   taskStatus = null;
+  streamActive = false;
+  mappedSid = null;
 });
 
 afterEach(() => {
@@ -228,7 +236,7 @@ describe("UndoService.preview", () => {
     expect(tempQueries[0]!.options.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
-  it("closes a live session spawned without checkpointing, and leaves a live session on another SDK session alone", async () => {
+  it("closes any live session it cannot reuse before resuming the SDK session elsewhere", async () => {
     turn({ uuid: "u1", files: ["/work/a.ts"] });
     liveQuery = fakeQuery(async () => ok([]));
     binding = { checkpointing: false, sdkSessionId: null, configDir: null };
@@ -238,7 +246,52 @@ describe("UndoService.preview", () => {
     closeAndWait.mockClear();
     binding = { checkpointing: true, sdkSessionId: "sid-after-clear", configDir: null };
     await service().preview({ kind: "chat", sessionKey: KEY });
-    expect(closeAndWait).not.toHaveBeenCalled();
+    expect(closeAndWait).toHaveBeenCalledTimes(1);
+    expect(liveQuery.rewindFiles).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse the live query when the session mapping names another SDK session", async () => {
+    turn({ uuid: "u1", files: ["/work/a.ts"] });
+    liveQuery = fakeQuery(async () => ok(["/work/a.ts"]));
+    binding = { checkpointing: true, sdkSessionId: "sid-1", configDir: null };
+    mappedSid = "sid-other";
+    await service().preview({ kind: "chat", sessionKey: KEY });
+    expect(liveQuery.rewindFiles).not.toHaveBeenCalled();
+    expect(closeAndWait).toHaveBeenCalledTimes(1);
+    expect(tempQueries).toHaveLength(1);
+  });
+
+  it("closes the live session when a rewind on it times out", async () => {
+    turn({ uuid: "u1", files: ["/work/a.ts"] });
+    liveQuery = fakeQuery(() => new Promise<RewindFilesResult>(() => undefined));
+    binding = { checkpointing: true, sdkSessionId: "sid-1", configDir: null };
+    const res = await service().preview({ kind: "chat", sessionKey: KEY });
+    expect(res.status).toBe("refused");
+    expect(closeAndWait).toHaveBeenCalledWith(KEY, expect.any(Number));
+  });
+
+  it("does not rewind when a turn starts while the temporary query is spawning", async () => {
+    const id = turn({ uuid: "u1", files: ["/work/a.ts"] });
+    const svc = service({
+      query: () => {
+        busy = true; // a message arrived meanwhile
+        const fake = fakeQuery(tempImpl);
+        tempQueries.push({ fake, options: {}, prompt: { [Symbol.asyncIterator]: () => ({ next: async () => ({ value: undefined, done: true }) }) } as AsyncIterable<SDKUserMessage> });
+        return fake.q;
+      },
+    });
+    const res = await svc.preview({ kind: "chat", sessionKey: KEY });
+    expect(res.status).toBe("refused");
+    if (res.status === "refused") expect(res.message).toContain("a turn started");
+    expect(tempQueries[0]!.fake.rewindFiles).not.toHaveBeenCalled();
+    expect(tempQueries[0]!.fake.close).toHaveBeenCalledTimes(1);
+    expect(store.get(id)!.undoneAt).toBeNull();
+  });
+
+  it("refuses while an unsolicited turn streams", async () => {
+    turn({ uuid: "u1", files: ["/work/a.ts"] });
+    streamActive = true;
+    expect(await service().preview({ kind: "chat", sessionKey: KEY })).toEqual({ status: "refused", message: UNDO_BUSY_TEXT });
   });
 
   it("refuses while a turn is in flight, without opening a query", async () => {
@@ -269,6 +322,50 @@ describe("UndoService.preview", () => {
     const res2 = await service().preview({ kind: "chat", sessionKey: KEY }, 2);
     expect(res2.status).toBe("refused");
     if (res2.status === "refused") expect(res2.message).toContain("/undo 1");
+  });
+
+  it("refuses a multi-turn undo across a turn that ran with undo off", async () => {
+    turn({ uuid: "t1", files: ["/work/a"] });
+    turn({ uuid: "gap", gap: true });
+    turn({ uuid: "t2", files: ["/work/b"] });
+    const res = await service().preview({ kind: "chat", sessionKey: KEY }, 2);
+    expect(res.status).toBe("refused");
+    if (res.status === "refused") {
+      expect(res.message).toContain("while undo was off");
+      expect(res.message).toContain("/undo 1");
+    }
+    expect((await service().preview({ kind: "chat", sessionKey: KEY }, 1)).status).toBe("ready");
+  });
+
+  it("explains that a task spanning an account switch cannot be undone in one step", async () => {
+    turn({ uuid: "k1", files: ["/work/a"], source: "task:task-1234567", configDir: null });
+    turn({ uuid: "k2", files: ["/work/b"], source: "task:task-1234567", configDir: "/h/.claude2" });
+    taskStatus = "completed";
+    const res = await service().preview({ kind: "task", taskId: "task-1234567" });
+    expect(res.status).toBe("refused");
+    if (res.status === "refused") expect(res.message).toBe(
+      "Task task-123's edits cannot be undone in one step: they span an account switch or a /clear, and one undo can only use one account's backups.",
+    );
+  });
+
+  it("matches created files through symlinked paths (/tmp vs /private/tmp)", async () => {
+    turn({ uuid: "u1", files: ["/tmp/w/new.md", "/tmp/w/a.ts"], created: ["/tmp/w/new.md"] });
+    tempImpl = async () => ok(["/private/tmp/w/new.md", "/private/tmp/w/a.ts"]);
+    const res = await service({ canonicalPath: (p) => p.replace(/^\/tmp\//, "/private/tmp/") }).preview({ kind: "chat", sessionKey: KEY });
+    if (res.status !== "ready") throw new Error(res.status);
+    expect(res.plan.remove).toEqual(["/private/tmp/w/new.md"]);
+    expect(res.plan.restore).toEqual(["/private/tmp/w/a.ts"]);
+  });
+
+  it("warns per file against the last selected turn that touched it", async () => {
+    turn({ uuid: "t1", files: ["/work/a"], at: now - 100_000 }); // ends now-99_500
+    turn({ uuid: "t2", files: ["/work/b"], at: now - 50_000 }); // ends now-49_500
+    tempImpl = async () => ok(["/work/a", "/work/b"]);
+    // a changed between the turns (by something unrecorded); b only by t2
+    mtimes = { "/work/a": now - 70_000, "/work/b": now - 49_600 };
+    const res = await service().preview({ kind: "chat", sessionKey: KEY }, 2);
+    if (res.status !== "ready") throw new Error(res.status);
+    expect(res.plan.modifiedAfter).toEqual(["/work/a"]);
   });
 
   it("targets the oldest selected turn and skips turns without file edits", async () => {
@@ -363,6 +460,22 @@ describe("UndoService.apply", () => {
     expect(notes[0]![1]).toContain("Shell (Bash) commands");
     expect(history).toHaveLength(1);
     expect(history[0]![1]).toMatch(/^\[owner ran \/undo: 2 files restored/);
+  });
+
+  it("flags an undo during which a turn started", async () => {
+    turn({ uuid: "t1", files: ["/work/a"] });
+    const svc = service();
+    const plan = await ready(svc);
+    tempImpl = async () => {
+      epoch += 1;
+      return ok(["/work/a"]);
+    };
+    const res = await svc.apply(plan);
+    expect(res.status).toBe("applied");
+    if (res.status === "applied") {
+      expect(res.raced).toBe(true);
+      expect(res.restored).toEqual(["/work/a"]);
+    }
   });
 
   it("leaves rows not undone when the SDK says it cannot rewind", async () => {

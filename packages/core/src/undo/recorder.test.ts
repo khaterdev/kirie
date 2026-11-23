@@ -188,13 +188,69 @@ describe("ledger recording", () => {
     expect(store.getByUuid("t-1")).toMatchObject({ source: "task:task-77", promptPreview: "task task-77", filesChanged: ["/work/t.ts"] });
   });
 
-  it("counts every turn start per scope (the confirm check), recorded or not", () => {
+  it("counts every turn start of the chat and of its tasks (the confirm check), recorded or not", () => {
     const ctx = chatCtx();
-    expect(recorder.turnEpoch({ sessionKey: KEY })).toBe(0);
+    expect(recorder.turnEpoch(KEY)).toBe(0);
     start(ctx, "x1");
     start(ctx, "x2");
-    expect(recorder.turnEpoch({ sessionKey: KEY })).toBe(2);
-    expect(recorder.turnEpoch({ taskId: "task-1" })).toBe(0);
+    start(taskCtx("task-9"), "x3");
+    expect(recorder.turnEpoch(KEY)).toBe(3);
+    expect(recorder.turnEpoch("telegram:dm:2")).toBe(0);
+  });
+
+  it("treats stream activity after turn end as an unsolicited turn: active and counted until its result", () => {
+    const ctx = chatCtx();
+    spawn(ctx);
+    start(ctx, "u1", "sid-1");
+    end(ctx, "u1");
+    expect(recorder.isStreamActive(KEY)).toBe(false);
+    const before = recorder.turnEpoch(KEY);
+    msg(ctx, assistant([{ type: "tool_use", id: "late", name: "Edit", input: { file_path: "/work/late.ts" } }]));
+    expect(recorder.isStreamActive(KEY)).toBe(true);
+    expect(recorder.turnEpoch(KEY)).toBe(before + 1);
+    msg(ctx, assistant([{ type: "text", text: "more" }]));
+    expect(recorder.turnEpoch(KEY)).toBe(before + 1);
+    msg(ctx, { type: "result", subtype: "success", session_id: "sid-1" } as unknown as SDKMessage);
+    expect(recorder.isStreamActive(KEY)).toBe(false);
+    // the late edit is attributed to the previous turn, which a rewind to its uuid covers
+    expect(store.getByUuid("u1")!.filesChanged).toEqual(["/work/late.ts"]);
+  });
+
+  it("writes a gap marker for an unrecorded turn only in a session with undo history", () => {
+    const off = chatCtx();
+    start(off, "g0", "sid-1"); // no history yet: nothing written
+    expect(store.count()).toBe(0);
+    const on = chatCtx();
+    spawn(on);
+    start(on, "u1", "sid-1");
+    end(on, "u1");
+    enabled = false;
+    const off2 = chatCtx();
+    spawn(off2);
+    start(off2, "g1", "sid-1");
+    const gap = store.getByUuid("g1")!;
+    expect(gap.checkpointed).toBe(false);
+    expect(store.recent(KEY, 10).map((r) => r.userMessageUuid)).toEqual(["u1"]);
+  });
+
+  it("takes the engine's session id at turn end over one read from the stream", () => {
+    const ctx = chatCtx();
+    spawn(ctx);
+    start(ctx, "u1");
+    msg(ctx, { type: "system", subtype: "init", session_id: "sid-stale" } as unknown as SDKMessage);
+    end(ctx, "u1", "sid-real");
+    expect(store.getByUuid("u1")!.sdkSessionId).toBe("sid-real");
+  });
+
+  it("a contributor error never breaks a spawn", () => {
+    const broken = new UndoRecorder({
+      store,
+      isEnabled: () => { throw new Error("settings closed"); },
+      backgroundTasks: () => true,
+    });
+    const options: Options = { cwd: "/w" };
+    expect(() => broken.contributor(options, chatCtx())).not.toThrow();
+    expect(options.enableFileCheckpointing).toBeUndefined();
   });
 
   it("scrubs shell samples and keeps three", () => {
