@@ -471,6 +471,45 @@ export class SecretScrubber {
       }
     }
 
+    // SCRUB-N6: a zero-width character or Markdown emphasis inside a token hides it from the
+    // rules, yet the platform shows one readable string. Scan a shadow copy without those
+    // characters and map its findings back onto the original text.
+    if (SHADOW_TRIGGER_RE.test(text)) {
+      try {
+        const shadow = buildShadow(text);
+        if (shadow) {
+          const mapped = (a: number, b: number, rule: string): void => {
+            if (b <= a) return;
+            claim(shadow.map[a]!, shadow.map[b - 1]! + 1, rule);
+          };
+          for (const { form, raw } of this.knownForms) {
+            if (allow?.has(raw)) continue;
+            let idx = shadow.text.indexOf(form);
+            while (idx !== -1) {
+              mapped(idx, idx + form.length, KNOWN_SECRET_RULE);
+              idx = shadow.text.indexOf(form, idx + form.length);
+            }
+          }
+          const sLower: { v?: string } = {};
+          const sInput: SecretScanInput = {
+            text: shadow.text,
+            lower: () => (sLower.v ??= shadow.text.toLowerCase()),
+            ...(sink !== undefined ? { sink } : {}),
+          };
+          for (const rule of this.rules) {
+            if (rule.gate && rule.gate.length > 0) {
+              const hay = rule.gateLower ? sInput.lower() : shadow.text;
+              if (!rule.gate.some((g) => hay.includes(g))) continue;
+            }
+            rule.scan(sInput, (a, b) => mapped(a, b, rule.name));
+          }
+        }
+      } catch (err) {
+        patternFailed = true;
+        if (!quiet) diag().error({ err: errorSummary(err) }, "scrubber shadow pass failed");
+      }
+    }
+
     if (knownFailed && patternFailed) return null;
     const roots = spans.filter((sp, i) => sp.parent === i);
     roots.sort((a, b) => a.start - b.start);
@@ -589,6 +628,34 @@ export class SecretScrubber {
 function errorSummary(err: unknown): { name: string; message: string } {
   if (err instanceof Error) return { name: err.name, message: err.message };
   return { name: "Error", message: String(err) };
+}
+
+// ---------------------------------------------------------------------------
+// Shadow copy for the formatting pass (SCRUB-N6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Characters a renderer hides or turns into formatting, so a token split by them still
+ * reads as one string: zero-width and invisible formatting characters, the soft hyphen,
+ * and Markdown emphasis or code marks (`*`, `~`, a backtick, a double underscore).
+ */
+const SHADOW_TRIGGER_RE = /[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF*~`]|__/;
+const SHADOW_DROP_CHAR_RE = /[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF*~`]/;
+
+/** The text without those characters, and for each shadow index the original index. Null when nothing was dropped. */
+function buildShadow(text: string): { text: string; map: Int32Array } | null {
+  const map = new Int32Array(text.length);
+  let out = "";
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (SHADOW_DROP_CHAR_RE.test(ch)) continue;
+    if (ch === "_" && text[i + 1] === "_") { i++; continue; }
+    out += ch;
+    map[n++] = i;
+  }
+  if (n === text.length) return null;
+  return { text: out, map: map.subarray(0, n) };
 }
 
 // ---------------------------------------------------------------------------

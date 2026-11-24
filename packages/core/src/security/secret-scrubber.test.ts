@@ -558,6 +558,40 @@ describe("idempotency and markers", () => {
     expect(s.scrub(`token: ${uuidish}`)).toBe(`token: ${marker("secret-assignment")}`);
   });
 
+  describe("tokens split by invisible characters or Markdown emphasis (SCRUB-N6)", () => {
+    const tok = (): string => ["gh", "p_", synth(36)].join("");
+    it("a zero-width character inside a token", () => {
+      const t = tok();
+      for (const zw of ["\u200B", "\u200C", "\u200D", "\u2060", "\uFEFF", "\u00AD"]) {
+        const out = s.scrub(`key ${t.slice(0, 10)}${zw}${t.slice(10)} end`);
+        expect(out).not.toContain(t.slice(10));
+        expect(out).toBe(`key ${marker("github-token")} end`);
+      }
+    });
+    it("bold, italic, strike or code marks splitting a token", () => {
+      const t = tok();
+      for (const [open, close] of [["**", "**"], ["*", "*"], ["~~", "~~"], ["`", "`"], ["__", "__"]] as const) {
+        const out = s.scrub(`${t.slice(0, 20)}${open}${t.slice(20)}${close} ok`);
+        expect(out, open).not.toContain(t.slice(20));
+        expect(out, open).toContain(marker("github-token"));
+        expect(out, open).toMatch(/ ok$/);
+      }
+    });
+    it("a known value split by a zero-width character", () => {
+      const k = fresh();
+      const v = mixed(24);
+      k.addKnownSecret(v, "db");
+      expect(k.scrub(`pw ${v.slice(0, 8)}\u200B${v.slice(8)}`)).toBe(`pw ${marker("known-secret")}`);
+    });
+    it("ordinary Markdown is untouched and scrubbing stays idempotent", () => {
+      const md = "**Bold** and *italic*, `code`, ~~strike~~, __init__ and a zero\u200Bwidth word.";
+      expect(s.scrub(md)).toBe(md);
+      const t = tok();
+      const once = s.scrub(`**${t.slice(0, 15)}**${t.slice(15)}`);
+      expect(s.scrub(once)).toBe(once);
+    });
+  });
+
   it("a Telegram bot token with an 11 or 12 digit bot id (SCRUB-N10)", () => {
     const secret = ["AA", synth(33, TOKEN)].join("");
     expect(s.scrub(`12345678901:${secret}`)).toBe(`12345678901:${marker("telegram-bot-token")}`);
@@ -780,6 +814,10 @@ describe("timing on 1 MB adversarial input", () => {
     "body of alternating blanks": `-----BEGIN PRIVATE KEY-----\n${fill(" \t\n")}`,
     "body of blank lines": `-----BEGIN PRIVATE KEY-----\n${fill(`${" ".repeat(15)}\n`)}`,
     "provider names": fill("plivo twilio "),
+    "emphasis marks": fill("**"),
+    "emphasis between prefixes": fill("gh*p_*sk-*"),
+    "zero-width runs": fill("\u200B"),
+    "zero-width in token chars": fill("ghp_\u200Babc"),
     "provider names and near-tokens": fill(`twilio ${"a1".repeat(15)}b plivo ${"Ab1".repeat(13)} `),
   };
 
