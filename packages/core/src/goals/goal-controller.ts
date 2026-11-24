@@ -451,7 +451,7 @@ export class GoalController {
         const approved = res.outcome === "answered" && res.optionId === "start";
         if (approved) {
           if (this.store.transition(goal.id, ["pending_approval"], "pending", { startMode: "start" }, { by: res.answeredBy ?? "owner" })) {
-            this.audit("goal.agent_approved", res.answeredBy ?? "owner", goal, { code: res.code });
+            this.audit("goal.agent_approved", res.answeredBy ?? "owner", goal, { ref: res.ref });
             this.tick();
           }
           return;

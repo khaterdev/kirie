@@ -41,12 +41,30 @@ function uptime(): { hours: number; mins: number; secs: number } {
 }
 
 function answerText(result: AnswerByCodeResult, code: string, verb: string): string {
-  switch (result) {
-    case "ok": return `${verb} ${code}.`;
-    case "not-found": return `No pending request with code ${code}. Send /pending for the list.`;
-    case "bad-option": return `${code} has no such option. Send /pending to see its options, then /answer ${code} <option>.`;
-    case "not-owner": return "Only the owner can answer.";
+  switch (result.status) {
+    case "ok":
+      return `${verb} ${code} (${result.optionLabel}): ${result.summary}`;
+    case "resent":
+      return `${code} is: ${result.summary}\nIts card has buttons, so a typed code does not answer it. I sent the real card again just above; check it and use its buttons.`;
+    case "resend-failed":
+      return `${code} is: ${result.summary}\nIts card has buttons, so a typed code does not answer it, and sending the card again failed. Nothing was answered.`;
+    case "not-ready":
+      return `${code} is: ${result.summary}\nIts card is still being sent. Nothing was answered; try again in a moment.`;
+    case "closed":
+      return `${code} is already over (answered, timed out or cancelled): ${result.summary}. Nothing was changed.`;
+    case "bad-option":
+      return `${code} has no such option. It is: ${result.summary}\nOptions: ${result.options.map((o) => `${o.id} (${o.label})`).join(", ")}. Reply /answer ${code} <option>.`;
+    case "wrong-chat":
+      return `${code} was sent to your ${result.channel} DM. Answer it there.`;
+    case "not-found":
+      return `No pending request with code ${code}. Send /pending for the list.`;
+    case "not-owner":
+      return "Only the owner can answer.";
   }
+}
+
+function answerer(ctx: CommandContext): { channel: CommandContext["message"]["channel"]; senderId: string; chatId: string } {
+  return { channel: ctx.message.channel, senderId: ctx.message.senderId, chatId: ctx.message.chatId };
 }
 
 function codeArg(ctx: CommandContext): string | null {
@@ -240,10 +258,10 @@ export function createCoreCommands(deps: CoreCommandDeps): CommandDefinition[] {
         const lines = [`Waiting for your answer (${pending.length}):`];
         for (const p of pending) {
           const mins = Math.max(0, Math.ceil((p.expiresAt - now) / 60_000));
-          lines.push(`  ${p.code}  ${p.title}  (${p.kind}, ${mins} min left)`);
+          lines.push(`  ${p.code}  ${p.summary}  (${p.kind}, ${mins} min left)`);
           lines.push(`    options: ${p.options.map((o) => `${o.id} (${o.label})`).join(", ")}`);
         }
-        lines.push("", "Reply /approve <code>, /deny <code> or /answer <code> <option>.");
+        lines.push("", "Use the buttons on each card. Without buttons, reply /approve <code>, /deny <code> or /answer <code> <option>.");
         return lines.join("\n");
       },
     },
@@ -253,11 +271,12 @@ export function createCoreCommands(deps: CoreCommandDeps): CommandDefinition[] {
       category: "core",
       ownerOnly: true,
       args: "<code>",
-      handler(ctx) {
+      auditArgs: false,
+      async handler(ctx) {
         const code = codeArg(ctx);
         if (!code) return "Usage: /approve <code>. Send /pending for the list.";
         if (!deps.prompts) return "Prompts are not available.";
-        return answerText(deps.prompts.answerByCode(code, "approve", { channel: ctx.message.channel, senderId: ctx.message.senderId }), code, "Approved");
+        return answerText(await deps.prompts.answerByCode(code, "approve", answerer(ctx)), code, "Approved");
       },
     },
     {
@@ -266,11 +285,12 @@ export function createCoreCommands(deps: CoreCommandDeps): CommandDefinition[] {
       category: "core",
       ownerOnly: true,
       args: "<code>",
-      handler(ctx) {
+      auditArgs: false,
+      async handler(ctx) {
         const code = codeArg(ctx);
         if (!code) return "Usage: /deny <code>. Send /pending for the list.";
         if (!deps.prompts) return "Prompts are not available.";
-        return answerText(deps.prompts.answerByCode(code, "deny", { channel: ctx.message.channel, senderId: ctx.message.senderId }), code, "Denied");
+        return answerText(await deps.prompts.answerByCode(code, "deny", answerer(ctx)), code, "Denied");
       },
     },
     {
@@ -279,12 +299,13 @@ export function createCoreCommands(deps: CoreCommandDeps): CommandDefinition[] {
       category: "core",
       ownerOnly: true,
       args: "<code> <option>",
-      handler(ctx) {
+      auditArgs: false,
+      async handler(ctx) {
         const code = codeArg(ctx);
         const option = ctx.argv[1]?.trim().toLowerCase();
         if (!code || !option) return "Usage: /answer <code> <option>. Send /pending for the list.";
         if (!deps.prompts) return "Prompts are not available.";
-        return answerText(deps.prompts.answerByCode(code, option, { channel: ctx.message.channel, senderId: ctx.message.senderId }), code, "Answered");
+        return answerText(await deps.prompts.answerByCode(code, option, answerer(ctx)), code, "Answered");
       },
     },
   ];

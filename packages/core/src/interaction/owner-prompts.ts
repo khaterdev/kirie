@@ -22,7 +22,7 @@
  * and the option belongs to the prompt. First valid press wins.
  */
 
-import { randomBytes, randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { createModuleLogger } from "../logging/logger.js";
 import type { ChannelAdapter, InlineButton } from "../channels/adapter.js";
 import type { ChannelName } from "../channels/normalizer.js";
@@ -54,6 +54,13 @@ export interface OwnerAskRequest {
   /** Plain text. Scrubbed, hidden characters made visible, cut at 3000 chars with a TRUNCATED marker */
   body?: string;
   /**
+   * One line naming what is asked (e.g. "Bash: rm -rf ~/work/repo"). Shown by
+   * /pending and in the reply to a typed /approve, /deny or /answer, so a typed
+   * code always says what it answered. Default: the title plus the first line
+   * of the body. Scrubbed and cut at 300 characters.
+   */
+  summary?: string;
+  /**
    * The exact text the owner is asked to approve (an agent's goal or loop
    * prompt). Never cut silently: see `OwnerPrompts.askWithContent`.
    */
@@ -82,6 +89,13 @@ export interface OwnerAskResult {
   answeredBy?: string;
   /** 4 chars, shown on the card, usable with /approve, /deny, /answer. Empty when the prompt was never shown */
   code: string;
+  /**
+   * Opaque reference for audit lines and logs (a hash of the prompt id). Never
+   * write `code` to a log or audit line: the agent can read those, and a
+   * typed code is how the owner answers on a channel without buttons.
+   * Empty when the prompt was never shown.
+   */
+  ref?: string;
 }
 
 export type ApprovalOutcome = "approved" | "denied" | "timeout" | "cancelled" | "unavailable";
@@ -90,6 +104,8 @@ export interface OwnerApprovalRequest {
   kind: string;
   title: string;
   body?: string;
+  /** See OwnerAskRequest.summary */
+  summary?: string;
   timeoutMs: number;
   signal?: AbortSignal;
   /** A third option; choosing it counts as denied (e.g. { id: "stop", label: "Deny + stop" }) */
@@ -110,7 +126,27 @@ export interface OwnerCard {
   plain?: boolean;
 }
 
-export type AnswerByCodeResult = "ok" | "not-found" | "not-owner" | "bad-option";
+/** What a typed /approve, /deny or /answer did. Every variant that found the request names it. */
+export type AnswerByCodeResult =
+  /** Answered. `summary` names the request, `optionLabel` the choice */
+  | { status: "ok"; kind: string; summary: string; optionLabel: string }
+  /**
+   * The request's card has buttons, so a typed code may only pick the safe
+   * (default) option. For any other option the real card was sent again,
+   * with buttons; the owner answers there.
+   */
+  | { status: "resent"; kind: string; summary: string }
+  /** As "resent", but sending the card again failed. Nothing was answered */
+  | { status: "resend-failed"; kind: string; summary: string }
+  /** The card is still being sent; try again in a moment */
+  | { status: "not-ready"; kind: string; summary: string }
+  /** The code belonged to a request that is already over (answered, timed out or cancelled) */
+  | { status: "closed"; kind: string; summary: string }
+  | { status: "bad-option"; kind: string; summary: string; options: readonly OwnerAskOption[] }
+  /** The request was sent to another channel or chat; answer it there */
+  | { status: "wrong-chat"; channel: ChannelName }
+  | { status: "not-found" }
+  | { status: "not-owner" };
 
 export interface OwnerPromptsDeps {
   router: InteractionRouter;
@@ -132,6 +168,10 @@ export const OWNER_PROMPT_CONTENT_PREVIEW_CHARS = 600;
 /** Option id of the "Show full text" button on a card whose content is cut. */
 export const OWNER_PROMPT_SHOW_FULL_ID = "show_full";
 const TITLE_MAX_CHARS = 200;
+const SUMMARY_MAX_CHARS = 300;
+/** A finished prompt's code is not handed out again for this long (CORE-N6), and a late /approve says it is over. */
+const RECENT_CODE_TTL_MS = 24 * 60 * 60 * 1000;
+const RECENT_CODE_MAX = 2000;
 const OPTION_ID_RE = /^[a-z0-9_]{1,16}$/;
 const PROMPT_ID_RE = /^[0-9a-f]{16}$/;
 /** No 0/O, 1/I/L, so codes survive being typed back. */
@@ -139,9 +179,13 @@ const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 interface PendingPrompt {
   readonly id: string;
+  /** Audit and log reference (hash of id). The code never goes to the audit trail */
+  readonly ref: string;
   readonly code: string;
   readonly kind: string;
   readonly title: string;
+  /** One line naming the request (scrubbed). Used by /pending and typed answers */
+  readonly summary: string;
   readonly text: string;
   readonly options: readonly OwnerAskOption[];
   readonly defaultOptionId: string;
@@ -162,6 +206,8 @@ interface PendingPrompt {
 
 export class OwnerPrompts {
   private readonly pendingById = new Map<string, PendingPrompt>();
+  /** Codes of finished prompts: code -> what it was and until when it stays reserved. */
+  private readonly recentCodes = new Map<string, { kind: string; summary: string; until: number }>();
   private readonly scrub: (text: string) => string;
   private closed = false;
 
@@ -213,7 +259,7 @@ export class OwnerPrompts {
     if (first.outcome !== "answered" || first.optionId !== OWNER_PROMPT_SHOW_FULL_ID) return first;
 
     const sent = await this.sendPages(label, pages);
-    if (!sent) return { optionId: base.defaultOptionId, outcome: "unavailable", code: first.code };
+    if (!sent) return { optionId: base.defaultOptionId, outcome: "unavailable", code: first.code, ref: first.ref };
     return this.open(
       base,
       () => `${head}${label}: ${total} characters, sent in full in the ${pages.length} message${pages.length === 1 ? "" : "s"} above (part 1 to ${pages.length}). Read ${pages.length === 1 ? "it" : "them"} before you answer.${hiddenLine}`,
@@ -250,7 +296,7 @@ export class OwnerPrompts {
     return new Promise<OwnerAskResult>((resolve) => {
       const unavailable = (reason: string): void => {
         log.info({ kind: req?.kind, reason }, "owner prompt unavailable");
-        resolve({ optionId: req?.defaultOptionId, outcome: "unavailable", code: "" });
+        resolve({ optionId: req?.defaultOptionId, outcome: "unavailable", code: "", ref: "" });
       };
 
       const invalid = validateRequest(req);
@@ -260,7 +306,7 @@ export class OwnerPrompts {
         return;
       }
       if (req.signal?.aborted) {
-        resolve({ optionId: req.defaultOptionId, outcome: "cancelled", code: "" });
+        resolve({ optionId: req.defaultOptionId, outcome: "cancelled", code: "", ref: "" });
         return;
       }
       if (this.closed) return unavailable("closed");
@@ -275,15 +321,19 @@ export class OwnerPrompts {
       const id = randomBytes(8).toString("hex");
       const code = this.newCode();
       const title = truncate(this.prepareText(req.title), TITLE_MAX_CHARS);
-      const body = renderBody(req.body ? this.prepareText(req.body) : "") || undefined;
+      const preparedBody = req.body ? this.prepareText(req.body) : "";
+      const body = renderBody(preparedBody) || undefined;
+      const summary = this.summarize(req, title, preparedBody);
       const interactive = canSendButtons(adapter);
       const text = renderPrompt(title, body, code, req.options, interactive);
 
       const entry: PendingPrompt = {
         id,
+        ref: promptRef(id),
         code,
         kind: req.kind,
         title,
+        summary,
         text,
         options: req.options.map((o) => ({ id: o.id, label: o.label })),
         defaultOptionId: req.defaultOptionId,
@@ -313,7 +363,7 @@ export class OwnerPrompts {
   }
 
   /** ask() with Approve / Deny (+ optional extra), default deny. */
-  async requestApproval(req: OwnerApprovalRequest): Promise<{ outcome: ApprovalOutcome; optionId: string; code: string }> {
+  async requestApproval(req: OwnerApprovalRequest): Promise<{ outcome: ApprovalOutcome; optionId: string; code: string; ref?: string }> {
     const options: OwnerAskOption[] = [
       { id: "approve", label: req.labels?.approve ?? "Approve" },
       { id: "deny", label: req.labels?.deny ?? "Deny" },
@@ -323,6 +373,7 @@ export class OwnerPrompts {
       kind: req.kind,
       title: req.title,
       body: req.body,
+      ...(req.summary !== undefined ? { summary: req.summary } : {}),
       options,
       defaultOptionId: "deny",
       timeoutMs: req.timeoutMs,
@@ -331,7 +382,7 @@ export class OwnerPrompts {
     let outcome: ApprovalOutcome;
     if (res.outcome === "answered") outcome = res.optionId === "approve" ? "approved" : "denied";
     else outcome = res.outcome;
-    return { outcome, optionId: res.optionId, code: res.code };
+    return { outcome, optionId: res.optionId, code: res.code, ref: res.ref };
   }
 
   /** Durable card with no timer. Null when no owner channel is up or the send fails. */
@@ -376,23 +427,109 @@ export class OwnerPrompts {
     this.deps.router.registerNamespace(ns, handler);
   }
 
-  /** Text fallback for buttons: /approve, /deny, /answer. */
-  answerByCode(code: string, optionId: string, by: { channel: ChannelName; senderId: string }): AnswerByCodeResult {
-    if (!this.deps.owners.isOwner(by.channel, by.senderId)) return "not-owner";
+  /**
+   * Text fallback for buttons: /approve, /deny, /answer (CORE-B1).
+   *
+   * - Only an owner, and only from the channel and chat the card was sent to.
+   * - Every reply names the request, so the owner sees what a code answered.
+   * - When the card has buttons, a typed code may only pick the safe (default)
+   *   option, e.g. /deny. Any other option sends the real card again, with
+   *   buttons, instead of answering: a look-alike text card posted by the
+   *   agent therefore never gets a dangerous request approved by a typed code.
+   * - A code of a finished prompt stays reserved for a day and answers "closed".
+   */
+  async answerByCode(
+    code: string,
+    optionId: string,
+    by: { channel: ChannelName; senderId: string; chatId?: string },
+  ): Promise<AnswerByCodeResult> {
+    if (!this.deps.owners.isOwner(by.channel, by.senderId)) return { status: "not-owner" };
     const wanted = String(code ?? "").trim().toUpperCase();
     const entry = [...this.pendingById.values()].find((p) => p.code === wanted && !p.done);
-    if (!entry) return "not-found";
+    if (!entry) {
+      this.pruneRecentCodes();
+      const recent = this.recentCodes.get(wanted);
+      return recent ? { status: "closed", kind: recent.kind, summary: recent.summary } : { status: "not-found" };
+    }
+    if (by.channel !== entry.channel || (by.chatId !== undefined && by.chatId !== entry.chatId)) {
+      return { status: "wrong-chat", channel: entry.channel };
+    }
+    const named = { kind: entry.kind, summary: entry.summary };
     const opt = String(optionId ?? "").trim().toLowerCase();
-    if (!entry.options.some((o) => o.id === opt)) return "bad-option";
-    this.finish(entry, "answered", opt, `owner:${by.channel}:${by.senderId}`);
-    return "ok";
+    const option = entry.options.find((o) => o.id === opt);
+    if (!option) return { status: "bad-option", ...named, options: entry.options };
+    if (entry.interactive && opt !== entry.defaultOptionId) {
+      if (entry.messageId === null) return { status: "not-ready", ...named };
+      const resent = await this.resendCard(entry);
+      return { status: resent ? "resent" : "resend-failed", ...named };
+    }
+    this.finish(entry, "answered", opt, `owner:${by.channel}:${by.senderId}`, undefined, "typed");
+    return { status: "ok", ...named, optionLabel: option.label };
+  }
+
+  /**
+   * Send a pending prompt's card again, with its buttons, and retire the old
+   * card (its keyboard is removed; a press on it answers "Expired."). False
+   * when the channel is down or the send fails; the old card then stays valid.
+   */
+  private async resendCard(entry: PendingPrompt): Promise<boolean> {
+    const adapter = this.runningAdapter(entry.channel);
+    if (!adapter || !canSendButtons(adapter) || entry.done) return false;
+    const oldId = entry.messageId;
+    try {
+      const sent = await adapter.sendInteractive!({
+        ctx: { chatId: entry.chatId },
+        text: entry.text,
+        buttons: this.buttonRows(entry),
+        plain: true,
+      });
+      if (!sent?.id) throw new Error("no message id returned");
+      entry.messageId = sent.id;
+      if (entry.done) {
+        // Answered (old card, timeout) while the new card was being sent: close the new one too.
+        await this.markResolved(entry, adapter, entry.finalLine ?? this.resolvedLine(entry, "cancelled"));
+        return true;
+      }
+    } catch (err) {
+      log.warn({ kind: entry.kind, ref: entry.ref, err: err instanceof Error ? err.message : String(err) }, "owner prompt re-send failed");
+      return false;
+    }
+    this.deps.audit.record({
+      feature: "prompts",
+      action: "prompt.resent",
+      actor: "system",
+      detail: { kind: entry.kind, ref: entry.ref, channel: entry.channel },
+    });
+    if (oldId !== null) {
+      const ctx = { chatId: entry.chatId };
+      const text = `${entry.text}\n\nSent again below. Use the buttons on the new card.`;
+      try {
+        if (adapter.updateInteractive) await adapter.updateInteractive({ ctx, messageId: oldId, text, buttons: null, plain: true });
+        else if (adapter.editMessage) await adapter.editMessage({ ctx, messageId: oldId, text });
+      } catch (err) {
+        log.debug({ err: err instanceof Error ? err.message : String(err) }, "old owner prompt card update failed");
+      }
+    }
+    return true;
   }
 
   /** Prompts waiting for an answer, oldest first. */
-  pending(): ReadonlyArray<{ code: string; kind: string; title: string; expiresAt: number; options: readonly OwnerAskOption[] }> {
+  pending(): ReadonlyArray<{ code: string; kind: string; title: string; summary: string; expiresAt: number; options: readonly OwnerAskOption[] }> {
     return [...this.pendingById.values()]
       .filter((p) => !p.done)
-      .map((p) => ({ code: p.code, kind: p.kind, title: p.title, expiresAt: p.expiresAt, options: p.options }));
+      .map((p) => ({ code: p.code, kind: p.kind, title: p.title, summary: p.summary, expiresAt: p.expiresAt, options: p.options }));
+  }
+
+  /**
+   * Whether `messageId` is the card of a prompt that is still open. The
+   * channel-action route refuses to edit or delete such a message, so the
+   * agent cannot rewrite a real card into a look-alike.
+   */
+  isOpenPromptCard(channel: string, chatId: string, messageId: string): boolean {
+    for (const p of this.pendingById.values()) {
+      if (!p.done && p.channel === channel && p.chatId === chatId && p.messageId === messageId) return true;
+    }
+    return false;
   }
 
   /** Resolve every pending prompt with its default (daemon stop). Later asks resolve as unavailable. */
@@ -410,12 +547,7 @@ export class OwnerPrompts {
     try {
       let messageId: string | undefined;
       if (entry.interactive) {
-        const row = entry.options.map((o) => ({
-          label: o.label,
-          data: InteractionRouter.encode(OWNER_PROMPT_NAMESPACE, `${entry.id}:${o.id}`),
-        }));
-        const buttons = row.length > 3 ? [row.slice(0, 3), row.slice(3)] : [row];
-        const sent = await adapter.sendInteractive!({ ctx, text: entry.text, buttons, plain: true });
+        const sent = await adapter.sendInteractive!({ ctx, text: entry.text, buttons: this.buttonRows(entry), plain: true });
         messageId = sent.id;
       } else {
         const sent = await adapter.sendText({ ctx, text: entry.text, plain: true });
@@ -427,7 +559,7 @@ export class OwnerPrompts {
         feature: "prompts",
         action: "prompt.sent",
         actor: "system",
-        detail: { kind: entry.kind, code: entry.code, channel: entry.channel, timeoutMs: entry.expiresAt - Date.now() },
+        detail: { kind: entry.kind, ref: entry.ref, channel: entry.channel, timeoutMs: entry.expiresAt - Date.now() },
       });
       if (entry.done) {
         // Resolved (abort, timeout or shutdown) while the card was still being sent.
@@ -452,7 +584,7 @@ export class OwnerPrompts {
         feature: "prompts",
         action: "prompt.mismatch",
         actor: `owner:${ev.channel}:${ev.senderId}`,
-        detail: { kind: entry.kind, code: entry.code },
+        detail: { kind: entry.kind, ref: entry.ref },
       });
       return Promise.resolve({ toast: INTERACTION_EXPIRED_TEXT });
     }
@@ -462,23 +594,25 @@ export class OwnerPrompts {
     return Promise.resolve({ toast: option.label });
   }
 
-  private finish(entry: PendingPrompt, outcome: OwnerAskOutcome, optionId: string, by?: string, reason?: string): void {
+  private finish(entry: PendingPrompt, outcome: OwnerAskOutcome, optionId: string, by?: string, reason?: string, via?: "typed"): void {
     if (entry.done) return;
     entry.done = true;
     this.pendingById.delete(entry.id);
+    this.rememberCode(entry);
     if (entry.timer) clearTimeout(entry.timer);
     entry.removeAbort?.();
     entry.resolve({
       optionId,
       outcome,
       code: entry.code,
+      ref: entry.ref,
       ...(by ? { answeredBy: by } : {}),
     });
     this.deps.audit.record({
       feature: "prompts",
       action: `prompt.${outcome}`,
       actor: by ?? "system",
-      detail: { kind: entry.kind, code: entry.code, optionId, ...(reason ? { reason } : {}) },
+      detail: { kind: entry.kind, ref: entry.ref, optionId, ...(via ? { via } : {}), ...(reason ? { reason } : {}) },
     });
     entry.finalLine = this.resolvedLine(entry, outcome, optionId, reason);
     if (entry.messageId !== null) {
@@ -522,8 +656,47 @@ export class OwnerPrompts {
     return reg.getById(channel) ?? null;
   }
 
+  private buttonRows(entry: PendingPrompt): InlineButton[][] {
+    const row = entry.options.map((o) => ({
+      label: o.label,
+      data: InteractionRouter.encode(OWNER_PROMPT_NAMESPACE, `${entry.id}:${o.id}`),
+    }));
+    return row.length > 3 ? [row.slice(0, 3), row.slice(3)] : [row];
+  }
+
+  /** One line naming the request: the caller's summary, else the title plus the body's first line. */
+  private summarize(req: OwnerAskRequest, title: string, preparedBody: string): string {
+    let text: string;
+    if (typeof req.summary === "string" && req.summary.trim()) {
+      text = this.prepareText(req.summary);
+    } else {
+      const first = preparedBody.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
+      text = first ? `${title}: ${first}` : title;
+    }
+    return truncate(text.replace(/\s+/g, " ").trim(), SUMMARY_MAX_CHARS);
+  }
+
+  private rememberCode(entry: PendingPrompt): void {
+    this.pruneRecentCodes();
+    if (this.recentCodes.size >= RECENT_CODE_MAX) {
+      const oldest = this.recentCodes.keys().next().value;
+      if (oldest !== undefined) this.recentCodes.delete(oldest);
+    }
+    this.recentCodes.delete(entry.code);
+    this.recentCodes.set(entry.code, { kind: entry.kind, summary: entry.summary, until: Date.now() + RECENT_CODE_TTL_MS });
+  }
+
+  private pruneRecentCodes(): void {
+    const now = Date.now();
+    for (const [code, r] of this.recentCodes) {
+      if (r.until <= now) this.recentCodes.delete(code);
+    }
+  }
+
   private newCode(): string {
+    this.pruneRecentCodes();
     const used = new Set([...this.pendingById.values()].map((p) => p.code));
+    for (const code of this.recentCodes.keys()) used.add(code);
     for (;;) {
       let code = "";
       for (let i = 0; i < 4; i++) code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
@@ -572,6 +745,11 @@ function renderPrompt(
     }
   }
   return parts.join("\n\n");
+}
+
+/** Audit and log reference for a prompt: not the code, and not usable to answer it. */
+function promptRef(id: string): string {
+  return createHash("sha256").update(`owner-prompt:${id}`).digest("hex").slice(0, 12);
 }
 
 function clamp(n: number, min: number, max: number): number {

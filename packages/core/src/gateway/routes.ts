@@ -35,6 +35,12 @@ export interface GatewayDeps {
   usageDashboard?: UsageDashboard;
   /** Optional ProactiveEngine for proactive status/trigger API */
   proactiveEngine?: ProactiveEngine | null;
+  /**
+   * True for a message that must not be edited through /api/channel-action:
+   * the card of an open owner prompt (CORE-B1). Editing it would let the agent
+   * turn a real approval card into a look-alike.
+   */
+  isProtectedMessage?: (channel: string, chatId: string, messageId: string) => boolean;
 }
 
 /**
@@ -387,6 +393,9 @@ export function createRoutes(deps: GatewayDeps): Hono {
         case "edit_message": {
           if (!params.messageId || !params.text) {
             return c.json({ status: "error", message: "messageId and text are required" }, 400);
+          }
+          if (deps.isProtectedMessage?.(params.channel, String(params.chatId), String(params.messageId))) {
+            return c.json({ status: "error", message: "That message is an open approval card and cannot be edited" }, 403);
           }
           if (!adapter.editMessage) {
             return c.json({ status: "error", message: `Channel "${params.channel}" does not support editing` }, 400);

@@ -1270,6 +1270,7 @@ export async function startDaemon(): Promise<void> {
         void restartDaemon();
       },
       proactiveEngine: proactive,
+      isProtectedMessage: (channel, chatId, messageId) => ownerPrompts.isOpenPromptCard(channel, chatId, messageId),
     },
     internalApi,
   });

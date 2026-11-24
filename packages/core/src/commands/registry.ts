@@ -250,7 +250,7 @@ export class CommandRegistry {
     );
     if (!isOwnerOnlyCommand(def) || !this.deps.audit) return;
     const detail: Record<string, unknown> = { outcome, channel: message.channel, chatType: message.chatType };
-    if (!SENSITIVE_CATEGORIES.has(def.category) && parsed.args) {
+    if (!SENSITIVE_CATEGORIES.has(def.category) && def.auditArgs !== false && parsed.args) {
       detail.args = truncate(parsed.args, AUDIT_ARGS_MAX_CHARS);
     }
     this.deps.audit.record({

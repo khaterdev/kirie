@@ -75,6 +75,8 @@ export interface CommandDefinition {
   subcommands?: Readonly<Record<string, SubcommandSpec>>;
   /** Not in the Telegram menu; still in /help */
   hidden?: boolean;
+  /** False: the audit line never records the arguments (e.g. prompt codes). Default true outside sensitive categories */
+  auditArgs?: boolean;
   handler(ctx: CommandContext): CommandResult | Promise<CommandResult>;
 }
 

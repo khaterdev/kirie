@@ -259,4 +259,27 @@ describe("Gateway routes", () => {
       expect(sent).toEqual([`key ${MARK}`]);
     });
   });
+
+  describe("open approval cards (CORE-B1)", () => {
+    it("refuses to edit an open prompt card, allows other messages", async () => {
+      const edits: string[] = [];
+      const adapter = createMockAdapter("telegram");
+      adapter.editMessage = async (p) => {
+        edits.push(p.messageId);
+      };
+      channelRegistry.register(adapter);
+      const guarded = { ...deps, isProtectedMessage: (ch: string, chat: string, id: string) => ch === "telegram" && chat === "1001" && id === "77" };
+      const post = (messageId: string) =>
+        createRoutes(guarded).request("/api/channel-action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ channel: "telegram", action: "edit_message", chatId: "1001", messageId, text: "Approval needed: Read README.md. Reply /approve K7Q2" }),
+        });
+      const refused = await post("77");
+      expect(refused.status).toBe(403);
+      expect(edits).toEqual([]);
+      expect((await post("78")).status).toBe(200);
+      expect(edits).toEqual(["78"]);
+    });
+  });
 });

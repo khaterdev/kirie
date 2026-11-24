@@ -38,7 +38,7 @@ function fakeContext(over: Partial<DaemonContext> = {}): DaemonContext {
     agentCwd: "/nonexistent-kirie-test",
     commands,
     owners,
-    ownerPrompts: { pending: () => [], answerByCode: () => "not-found" },
+    ownerPrompts: { pending: () => [], answerByCode: async () => ({ status: "not-found" as const }) },
     settings: {},
     audit: {},
     scrubber: new SecretScrubber(),

@@ -438,7 +438,7 @@ export class VoiceService {
           // At most 10 minutes, well inside the voice_call_initiate tool's own 15-minute wait.
           timeoutMs: Math.min(VOICE_MAX_APPROVAL_MS, Math.max(5_000, cfg.outbound.approvalTimeoutSeconds * 1000)),
         });
-        this.audit("call.approval", "owner", { outcome: res.outcome, code: res.code, alias });
+        this.audit("call.approval", "owner", { outcome: res.outcome, ref: res.ref, alias });
         if (res.outcome !== "approved") return this.refusal(`The owner did not approve the call (${res.outcome}).`, req);
         // Time has passed: check again.
         if (!this.isActive()) return this.refusal("Voice was switched off while waiting for approval.", req);

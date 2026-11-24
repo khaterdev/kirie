@@ -141,6 +141,12 @@ export function approvalCallDisplay(call: ApprovalToolCall, scrub: (t: string) =
   return { label, text: truncateApprovalDisplay(rendered.text), hidden: rendered.hidden };
 }
 
+/** One line for /pending and typed answers: "Bash: rm -rf ~/x". `displayText` is already scrubbed and escaped. */
+export function approvalSummary(call: ApprovalToolCall, displayText: string): string {
+  const oneLine = displayText.replace(/\s+/g, " ").trim();
+  return clip(`${call.tool}: ${oneLine}`, 280);
+}
+
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
@@ -346,12 +352,13 @@ export class ApprovalPrompter {
       kind: "approval",
       title: "Approval needed",
       body,
+      summary: approvalSummary(call, display.text),
       timeoutMs: policy.timeoutSeconds * 1000,
       signal,
       extra: { ...APPROVAL_STOP_OPTION },
     });
     const waitedMs = this.now() - started;
-    const detail = { code: res.code, waitedMs };
+    const detail = { ref: res.ref, waitedMs };
 
     if (res.outcome === "approved") {
       this.audit("approved", ev, call, detail);

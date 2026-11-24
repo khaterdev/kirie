@@ -322,7 +322,7 @@ describe("OwnerPrompts", () => {
     expect(first.buttons.flat().map((b) => b.label)).toEqual(["Show full text", "Decline"]);
     // Start cannot be chosen on this card, by button or by code.
     const code = /Code ([A-Z2-9]{4})/.exec(first.text)![1]!;
-    expect(prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toBe("bad-option");
+    expect(await prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toMatchObject({ status: "bad-option" });
 
     await adapter.press({ data: dataFor("Show full text"), messageId: await sentMessageId() });
     await vi.waitFor(() => expect(adapter.sentInteractive).toHaveLength(2));
@@ -372,32 +372,114 @@ describe("OwnerPrompts", () => {
     const text = adapter.sentText[0]!.text;
     const code = /Reply \/answer ([A-Z2-9]{4}) <option>/.exec(text)![1]!;
     expect(text).toContain("start (Start)");
-    expect(prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toBe("ok");
+    expect(await prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER, chatId: OWNER })).toEqual({
+      status: "ok",
+      kind: "goal",
+      summary: "Start goal g-1?: Build the thing",
+      optionLabel: "Start",
+    });
     expect(await p).toMatchObject({ optionId: "start", outcome: "answered" });
     await flush();
     expect(adapter.edits.at(-1)!.text).toMatch(/Start \d{2}:\d{2}$/);
   });
 
   describe("answerByCode", () => {
-    it("answers by code, case-insensitively", async () => {
+    it("answers by code on a text-only card, case-insensitively, and names the request", async () => {
+      build({ adapter: makeFakeAdapter("telegram", { buttons: false }) });
       const p = prompts.ask(req());
       await flush();
       const { code } = prompts.pending()[0]!;
-      expect(prompts.answerByCode(code.toLowerCase(), "START", { channel: "telegram", senderId: OWNER })).toBe("ok");
+      expect(await prompts.answerByCode(code.toLowerCase(), "START", { channel: "telegram", senderId: OWNER })).toMatchObject({
+        status: "ok",
+        summary: "Start goal g-1?: Build the thing",
+      });
       expect(await p).toMatchObject({ optionId: "start", outcome: "answered", code });
     });
 
-    it("refuses non-owners, unknown codes and bad options", async () => {
+    it("refuses non-owners, unknown codes, bad options and other chats; a finished code answers closed", async () => {
+      build({ adapter: makeFakeAdapter("telegram", { buttons: false }) });
       const p = prompts.ask(req());
       await flush();
       const { code } = prompts.pending()[0]!;
-      expect(prompts.answerByCode(code, "start", { channel: "telegram", senderId: "2002" })).toBe("not-owner");
-      expect(prompts.answerByCode("ZZZZ", "start", { channel: "telegram", senderId: OWNER })).toBe("not-found");
-      expect(prompts.answerByCode(code, "approve", { channel: "telegram", senderId: OWNER })).toBe("bad-option");
+      expect(await prompts.answerByCode(code, "start", { channel: "telegram", senderId: "2002" })).toEqual({ status: "not-owner" });
+      expect(await prompts.answerByCode("ZZZZ", "start", { channel: "telegram", senderId: OWNER })).toEqual({ status: "not-found" });
+      expect(await prompts.answerByCode(code, "approve", { channel: "telegram", senderId: OWNER })).toMatchObject({ status: "bad-option" });
+      expect(await prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER, chatId: "-100555" })).toEqual({ status: "wrong-chat", channel: "telegram" });
       expect(prompts.pending()).toHaveLength(1);
-      expect(prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toBe("ok");
-      expect(prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toBe("not-found");
+      expect(await prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toMatchObject({ status: "ok" });
+      expect(await prompts.answerByCode(code, "start", { channel: "telegram", senderId: OWNER })).toMatchObject({
+        status: "closed",
+        summary: "Start goal g-1?: Build the thing",
+      });
       await p;
+    });
+
+    it("a finished prompt's code stays reserved and is not handed out again", async () => {
+      build({ adapter: makeFakeAdapter("telegram", { buttons: false }) });
+      const a = prompts.ask(req());
+      await flush();
+      const c1 = prompts.pending()[0]!.code;
+      await prompts.answerByCode(c1, "decline", { channel: "telegram", senderId: OWNER });
+      await a;
+      const internal = prompts as unknown as { newCode(): string; recentCodes: Map<string, unknown> };
+      expect(internal.recentCodes.has(c1)).toBe(true);
+      for (let i = 0; i < 2000; i++) expect(internal.newCode()).not.toBe(c1);
+      // After a day it is free again.
+      vi.advanceTimersByTime(24 * 60 * 60 * 1000 + 1);
+      expect(await prompts.answerByCode(c1, "decline", { channel: "telegram", senderId: OWNER })).toEqual({ status: "not-found" });
+    });
+
+    it("a card with buttons: a typed approving code re-sends the real card instead of answering (CORE-B1)", async () => {
+      const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", body: "Command:\nrm -rf ~/work/client-repo", summary: "Bash: rm -rf ~/work/client-repo", timeoutMs: 600_000 });
+      await flush();
+      const oldId = await sentMessageId();
+      const { code } = prompts.pending()[0]!;
+      const res = await prompts.answerByCode(code, "approve", { channel: "telegram", senderId: OWNER, chatId: OWNER });
+      expect(res).toEqual({ status: "resent", kind: "approval", summary: "Bash: rm -rf ~/work/client-repo" });
+      // Not answered: still pending, and the card went out again with its buttons.
+      expect(prompts.pending()).toHaveLength(1);
+      expect(adapter.sentInteractive).toHaveLength(2);
+      const again = adapter.sentInteractive.at(-1)!;
+      expect(again.text).toContain("rm -rf ~/work/client-repo");
+      expect(again.buttons.flat().map((b) => b.label)).toEqual(["Approve", "Deny"]);
+      // The old card lost its keyboard and its buttons no longer work.
+      expect(adapter.updates.at(-1)).toMatchObject({ messageId: oldId, buttons: null });
+      await adapter.press({ data: dataFor("Approve"), messageId: oldId });
+      expect(prompts.pending()).toHaveLength(1);
+      // The new card's buttons do.
+      const newId = await sentMessageId();
+      await adapter.press({ data: dataFor("Approve"), messageId: newId });
+      expect(await p).toMatchObject({ outcome: "approved" });
+    });
+
+    it("a card with buttons: a typed safe (default) answer is taken directly", async () => {
+      const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", timeoutMs: 600_000 });
+      await flush();
+      const { code } = prompts.pending()[0]!;
+      expect(await prompts.answerByCode(code, "deny", { channel: "telegram", senderId: OWNER })).toMatchObject({ status: "ok", optionLabel: "Deny" });
+      expect(await p).toMatchObject({ outcome: "denied" });
+    });
+
+    it("a card with buttons: a failed re-send answers nothing", async () => {
+      const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", timeoutMs: 600_000 });
+      await flush();
+      const { code } = prompts.pending()[0]!;
+      (adapter.sendInteractive as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("network"));
+      expect(await prompts.answerByCode(code, "approve", { channel: "telegram", senderId: OWNER })).toMatchObject({ status: "resend-failed" });
+      expect(prompts.pending()).toHaveLength(1);
+      prompts.cancelAll("t");
+      expect(await p).toMatchObject({ outcome: "cancelled" });
+    });
+
+    it("isOpenPromptCard is true only for the live card of a pending prompt", async () => {
+      const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", timeoutMs: 600_000 });
+      await flush();
+      const id = await sentMessageId();
+      expect(prompts.isOpenPromptCard("telegram", OWNER, id)).toBe(true);
+      expect(prompts.isOpenPromptCard("telegram", OWNER, "999999")).toBe(false);
+      prompts.cancelAll("t");
+      await p;
+      expect(prompts.isOpenPromptCard("telegram", OWNER, id)).toBe(false);
     });
   });
 
@@ -442,7 +524,7 @@ describe("OwnerPrompts", () => {
       await flush();
       const text = adapter.sentText[0]!.text;
       const code = /Reply \/approve ([A-Z2-9]{4}) or \/deny \1/.exec(text)![1]!;
-      expect(prompts.answerByCode(code, "deny", { channel: "telegram", senderId: OWNER })).toBe("ok");
+      expect(await prompts.answerByCode(code, "deny", { channel: "telegram", senderId: OWNER })).toMatchObject({ status: "ok", optionLabel: "Cancel" });
       expect(await p).toMatchObject({ outcome: "denied" });
     });
   });
@@ -540,6 +622,14 @@ describe("OwnerPrompts", () => {
     const recs = audit.recent({ feature: "prompts" });
     expect(recs.map((r) => r.action)).toEqual(["prompt.timeout", "prompt.sent"]);
     expect(JSON.stringify(recs)).not.toContain("private body text");
+    // CORE-B1: the code is never in the audit trail (the agent can read it); a ref is.
+    const code = (await p).code;
+    expect(code).toMatch(/^[A-Z2-9]{4}$/);
+    for (const r of recs) {
+      expect(r.detail).not.toHaveProperty("code");
+      expect(r.detail).toHaveProperty("ref");
+    }
+    expect(JSON.stringify(recs)).not.toContain(`"${code}"`);
   });
 
   it("never rejects", async () => {
