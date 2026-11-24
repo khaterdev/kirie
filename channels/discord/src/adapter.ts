@@ -52,6 +52,12 @@ function resolvedChatId(channel: { id?: string }, chatId: string, threadId?: str
 export interface DiscordAdapterConfig {
   /** Bot token */
   token: string;
+  /**
+   * User ids whose DM may be opened when a chat id is a user id rather than a
+   * channel (the owner's primary DM, CORE-N4). Any other user id is refused,
+   * so the agent cannot DM arbitrary guild members through channel-action.
+   */
+  dmUserIds?: readonly string[];
 }
 
 export class DiscordAdapter implements ChannelAdapter {
@@ -276,6 +282,7 @@ export class DiscordAdapter implements ChannelAdapter {
   /** The DM channel with a user, by user id. Null when the id is not a reachable user. */
   private async openDm(userId: string): Promise<SendableChannel | null> {
     if (!/^\d{15,22}$/.test(userId)) return null;
+    if (!(this.config.dmUserIds ?? []).map(String).includes(userId)) return null;
     const cached = this.dmChannels.get(userId);
     if (cached) return cached;
     try {

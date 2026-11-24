@@ -108,6 +108,18 @@ describe("V2SessionManager with the SDK options seam", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("a schedule turn after the owner's message resumes the session as not ownerDm, and back (CORE-N2)", async () => {
+    await manager.execute(msg("hello"), { ...owner, origin: "owner_message" });
+    await manager.execute(msg("scheduled check"), { ...owner, origin: "schedule" });
+    await manager.execute(msg("again"), { ...owner, origin: "owner_message" });
+    await manager.execute(msg("and again"), { ...owner, origin: "owner_message" });
+    const starts = events.filter((e) => e.type === "turn_start").map((e) => e.ctx.ownerDm);
+    expect(starts).toEqual([true, false, true, true]);
+    // Three processes: the context changed twice; each resumes the same conversation.
+    expect(recorded.options).toHaveLength(3);
+    expect(recorded.options.slice(1).map((o) => o.resume)).toEqual([store.get(key), store.get(key)]);
+  });
+
   it("keeps the session and its mapping after a returned limit error, with no fresh retry", async () => {
     await manager.execute(msg("hello"), owner);
     const mapped = store.get(key);

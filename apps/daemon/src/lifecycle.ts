@@ -1588,7 +1588,10 @@ function registerChannelAdapters(registry: ChannelRegistry, config: KirieConfig)
 
   if (ch.discord?.enabled && ch.discord.token) {
     log.info("registering Discord adapter");
-    registry.register(new DiscordAdapter({ token: ch.discord.token }));
+    registry.register(new DiscordAdapter({
+      token: ch.discord.token,
+      dmUserIds: (config.security.owner.identities.discord ?? []).map((id) => String(id)),
+    }));
   }
 
   if (ch.slack?.enabled && ch.slack.botToken && ch.slack.appToken) {

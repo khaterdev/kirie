@@ -299,6 +299,12 @@ export class V2SessionManager implements AgentExecutor {
       this.config.prompt?.timezone,
     );
 
+    // Only awaits when the session must be recycled, so the common path stays synchronous.
+    if (this.contextChanged(sessionKey, bootstrap)) {
+      log.info({ sessionKey, ownerDm: bootstrap.ctx.ownerDm }, "turn origin changed the session context; resuming the session under the new one");
+      await this.closeAndWait(sessionKey, 5_000);
+    }
+
     const resilience = this.resilience;
     if (!resilience) return this.attempt(sessionKey, userPrompt, bootstrap, sessionId, onQuery);
 
@@ -342,6 +348,19 @@ export class V2SessionManager implements AgentExecutor {
       }
       return result;
     }
+  }
+
+  /**
+   * CORE-N2: a session's context (ownerDm and what it unlocks: the user-model
+   * tool and card, the accounts block, the undo addendum) is fixed when its
+   * process starts. When the next turn's ownerDm differs (a schedule or loop
+   * turn after the owner's message, or the reverse), the idle session is closed
+   * so the turn resumes the same conversation under its own context.
+   */
+  private contextChanged(sessionKey: string, bootstrap: SessionBootstrap): boolean {
+    const managed = this.sessions.get(sessionKey);
+    if (!managed || managed.pendingResult || managed.aborted) return false;
+    return managed.ctx.ownerDm !== bootstrap.ctx.ownerDm;
   }
 
   private logAdvance(sessionKey: string, advance: TurnAdvance): void {
@@ -431,6 +450,7 @@ export class V2SessionManager implements AgentExecutor {
       channel: message.channel,
       chatType: message.chatType,
       senderRole: sender.role,
+      ...(sender.origin !== undefined ? { origin: sender.origin } : {}),
       cwd: this.config.workspacePath,
     });
 

@@ -199,6 +199,8 @@ interface PendingPrompt {
   messageId: string | null;
   /** Whether the card carries buttons (and can be updated with updateInteractive) */
   interactive: boolean;
+  /** A typed code is sending the card again right now */
+  resending?: boolean;
   done: boolean;
   /** Line appended to the card once resolved */
   finalLine: string | null;
@@ -463,8 +465,14 @@ export class OwnerPrompts {
     const option = entry.options.find((o) => o.id === opt);
     if (!option) return { status: "bad-option", ...named, options: entry.options };
     if (entry.interactive && opt !== entry.defaultOptionId) {
-      if (entry.messageId === null) return { status: "not-ready", ...named };
-      const resent = await this.resendCard(entry);
+      if (entry.messageId === null || entry.resending) return { status: "not-ready", ...named };
+      entry.resending = true;
+      let resent: boolean;
+      try {
+        resent = await this.resendCard(entry);
+      } finally {
+        entry.resending = false;
+      }
       return { status: resent ? "resent" : "resend-failed", ...named };
     }
     this.finish(entry, "answered", opt, `owner:${by.channel}:${by.senderId}`, undefined, "typed");

@@ -347,7 +347,12 @@ export function createMemoryToolHandlers(store: MemoryStore, memoryManager?: Mem
         required: ["key", "content"] as const,
       },
       async handler(params: { key: string; content: string; chunkTokens?: number; chunkOverlap?: number; tags?: string[] }): Promise<{ chunks: number; skipped: number; notice?: string }> {
+        if ((await scrubBeforeStore(String(params.key ?? ""), "memory")).count > 0) {
+          throw new Error("Memory key looks like it contains a secret. Use a descriptive key; store secrets with: kirie credentials set <key> <value>");
+        }
         const known = await scrubBeforeStore(params.content, "memory");
+        const docTags = params.tags ? await Promise.all(params.tags.map(async (t) => (await scrubBeforeStore(t, "memory")).text)) : undefined;
+        params = { ...params, ...(docTags ? { tags: docTags } : {}) };
         const { text, count: patternCount } = scrubForMemory(known.text);
         const count = known.count + patternCount;
         const withNotice = (r: { chunks: number; skipped: number }) =>

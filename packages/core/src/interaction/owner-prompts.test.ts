@@ -452,6 +452,20 @@ describe("OwnerPrompts", () => {
       expect(await p).toMatchObject({ outcome: "approved" });
     });
 
+    it("two quick typed codes send the card again only once", async () => {
+      const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", timeoutMs: 600_000 });
+      await flush();
+      const { code } = prompts.pending()[0]!;
+      const [a, b] = await Promise.all([
+        prompts.answerByCode(code, "approve", { channel: "telegram", senderId: OWNER }),
+        prompts.answerByCode(code, "approve", { channel: "telegram", senderId: OWNER }),
+      ]);
+      expect([a.status, b.status].sort()).toEqual(["not-ready", "resent"]);
+      expect(adapter.sentInteractive).toHaveLength(2);
+      prompts.cancelAll("t");
+      await p;
+    });
+
     it("a card with buttons: a typed safe (default) answer is taken directly", async () => {
       const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", timeoutMs: 600_000 });
       await flush();

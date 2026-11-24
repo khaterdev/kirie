@@ -24,7 +24,7 @@ import { DiscordAdapter } from "./adapter.js";
 
 describe("DiscordAdapter: a user id is sent to that user's DM channel (CORE-N4)", () => {
   it("falls back to users.fetch().createDM() and reports the DM channel id", async () => {
-    const adapter = new DiscordAdapter({ token: "test-token" });
+    const adapter = new DiscordAdapter({ token: "test-token", dmUserIds: ["123456789012345678"] });
     const dmSend = vi.fn().mockResolvedValue({ id: "m-1", createdTimestamp: 1 });
     const createDM = vi.fn().mockResolvedValue({ id: "dm-999", send: dmSend });
     const usersFetch = vi.fn().mockResolvedValue({ createDM });
@@ -43,8 +43,21 @@ describe("DiscordAdapter: a user id is sent to that user's DM channel (CORE-N4)"
     expect(createDM).toHaveBeenCalledTimes(1);
   });
 
+  it("never opens a DM with a user who is not configured (no DMs to arbitrary members)", async () => {
+    const adapter = new DiscordAdapter({ token: "test-token", dmUserIds: ["123456789012345678"] });
+    const usersFetch = vi.fn();
+    (adapter as any).state = "connected";
+    (adapter as any).client = {
+      channels: { fetch: vi.fn().mockRejectedValue(new Error("Unknown Channel")) },
+      users: { fetch: usersFetch },
+      destroy: vi.fn(),
+    };
+    await expect(adapter.sendText({ ctx: { chatId: "999999999999999999" }, text: "hi" })).rejects.toThrow("Unknown Channel");
+    expect(usersFetch).not.toHaveBeenCalled();
+  });
+
   it("keeps the original error for an id that is neither a channel nor a user", async () => {
-    const adapter = new DiscordAdapter({ token: "test-token" });
+    const adapter = new DiscordAdapter({ token: "test-token", dmUserIds: ["123456789012345678"] });
     (adapter as any).state = "connected";
     (adapter as any).client = {
       channels: { fetch: vi.fn().mockRejectedValue(new Error("Unknown Channel")) },
