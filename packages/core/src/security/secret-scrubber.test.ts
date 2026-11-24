@@ -257,7 +257,7 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
       expect(out).not.toContain(end);
     };
 
-    for (const [label, indent] of [["2 spaces", "  "], ["4 spaces", "    "], ["8 spaces", "        "], ["16 spaces", " ".repeat(16)], ["a tab", "\t"], ["two tabs", "\t\t"]] as const) {
+    for (const [label, indent] of [["2 spaces", "  "], ["4 spaces", "    "], ["8 spaces", "        "], ["16 spaces", " ".repeat(16)], ["17 spaces", " ".repeat(17)], ["24 spaces", " ".repeat(24)], ["40 spaces", " ".repeat(40)], ["a tab", "\t"], ["two tabs", "\t\t"], ["five tabs", "\t".repeat(5)]] as const) {
       it(`redacts the whole key indented by ${label}`, () => {
         const { text, lines } = block(indent);
         const out = s.scrub(`config:\n${text}\nnext: 1`);
@@ -279,6 +279,18 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
       const out = s.scrub(`1. Paste this:\n\n${text}\n\n2. Save.`);
       noBody(out, lines);
       expect(out).toContain("2. Save.");
+    });
+
+    it("a Markdown blockquote (> )", () => {
+      const { text, lines } = block("> ");
+      const out = s.scrub(`Here:\n${text}\nThanks`);
+      noBody(out, lines);
+      expect(out).toBe(`Here:\n> ${marker("private-key")}\nThanks`);
+    });
+
+    it("the JSON-escaped form at 20 spaces", () => {
+      const { text, lines } = block(" ".repeat(20));
+      noBody(s.scrub(JSON.stringify({ msg: text }), { sink: "log" }), lines);
     });
 
     it("CRLF line endings with indentation", () => {
@@ -326,7 +338,7 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
       }
     });
 
-    it("indentation beyond the bound ends the body instead of scanning on", () => {
+    it("a deeply indented prose line after the body ends the body", () => {
       const lines = bodyLines();
       const deep = " ".repeat(40);
       const text = [begin, lines[0], `${deep}prose after a very deep indent`].join("\n");

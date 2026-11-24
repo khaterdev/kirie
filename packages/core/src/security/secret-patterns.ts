@@ -169,22 +169,22 @@ const PEM_END_STICKY_RE = /-----END[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/y;
 /** Body characters: base64, line breaks, and what encrypted-PEM headers use (Proc-Type: 4,ENCRYPTED). */
 const PEM_BODY_CHAR_RE = /[A-Za-z0-9+/=\r\n:,.-]/;
 const MAX_PEM_BODY = 16_384;
-/**
- * Indentation skipped at the start of a body line, and trailing blanks before a
- * line break: YAML block scalars (`tls.key: |`), Markdown lists, tabs (SCRUB-B1).
- * Bounded, so the scan stays linear.
+/*
+ * SCRUB-B1: indentation at the start of a body line (YAML block scalars such as
+ * `tls.key: |` at any depth, Markdown lists, tabs, `> ` quotes) and trailing
+ * blanks before a line break are skipped. No depth cap: the scan position only
+ * moves forward, so it stays linear.
  */
-const MAX_PEM_INDENT = 16;
 
 function isBlank(ch: string | undefined): boolean {
   return ch === " " || ch === "\t";
 }
 
-/** Index after at most MAX_PEM_INDENT spaces or tabs (raw, or JSON-escaped `\t`) starting at p. */
-function skipPemBlanks(text: string, p: number, limit: number): number {
+/** Index after the spaces or tabs (raw, or JSON-escaped `\t`) starting at p; with `quotes`, also `>` marks. */
+function skipPemBlanks(text: string, p: number, limit: number, quotes = false): number {
   let q = p;
-  for (let n = 0; n < MAX_PEM_INDENT && q < limit; n++) {
-    if (isBlank(text[q])) q++;
+  while (q < limit) {
+    if (isBlank(text[q]) || (quotes && text[q] === ">")) q++;
     else if (text[q] === "\\" && text[q + 1] === "t") q += 2;
     else break;
   }
@@ -212,15 +212,15 @@ const privateKeyRule: SecretPatternRule = {
       // The body stops at the first character a key block cannot contain (a quote, prose
       // punctuation, a space not after ':'), at the next "-----", or after 16 KB. It never
       // runs to the end of the text, so an unterminated block cannot swallow a JSON line.
-      // Up to MAX_PEM_INDENT blanks are skipped at the start of a line (indented keys) and
-      // before a line break (trailing blanks).
+      // Blanks (and `>` quote marks) at the start of a line and blanks before a line break
+      // are skipped.
       let lineStart = p;
       /** Start of a line that follows a line break (the header's own line is not one). */
       let brokeAt = -1;
       while (p < limit) {
-        if (p === brokeAt && (isBlank(text[p]) || (text[p] === "\\" && text[p + 1] === "t"))) {
-          const q = skipPemBlanks(text, p, limit);
-          if (q < limit && !isBlank(text[q])) { p = q; continue; }
+        if (p === brokeAt && (isBlank(text[p]) || text[p] === ">" || (text[p] === "\\" && text[p + 1] === "t"))) {
+          const q = skipPemBlanks(text, p, limit, true);
+          if (q < limit) { p = q; brokeAt = -1; continue; }
         }
         if (text.startsWith("-----", p)) break;
         const ch = text[p] as string;
@@ -303,8 +303,18 @@ const MAX_VALUE = 512;
 /** Lower-case words then numeric version parts: claude-opus-5-5, llama-3.1-70, gpt-oss-120. */
 const VERSIONED_NAME_RE = /^[a-z]+(?:-[a-z]+)*(?:-\d+(?:\.\d+)*)+$/;
 const PASSWORD_KEYWORD_RE = /passw|pwd|passphrase/i;
-/** Whitespace, shell syntax or a URL scheme in a value: real secrets have none of them. */
-const COMMAND_SHAPED_VALUE_RE = /\s|[;|&<>`]|\$\(|:\/\//;
+/**
+ * A value that reads as shell code rather than a secret: a command substitution, or words
+ * with an option (`-rf`, `--upload-file`), a path, or a shell operator; or a bare URL.
+ * Used only for approval cards (SCRUB-N3), and never for password-named values.
+ */
+function isCommandShapedValue(value: string): boolean {
+  if (/^(?:bearer|basic|token|bot|digest)\s/i.test(value)) return false;
+  if (/\$\(|`/.test(value)) return true;
+  if (/^[a-z][a-z0-9+.-]{1,20}:\/\/\S+$/i.test(value)) return true;
+  if (!/\s/.test(value)) return false;
+  return /(?:^|\s)(?:--?[A-Za-z]|[~/.]{1,2}\/|\/[A-Za-z])|\s(?:;|&&|\|\|?|>>?|<)(?:\s|$)/.test(value);
+}
 const MAX_GAP = 8;
 
 function splitNameSegments(rest: string): string[] {
@@ -441,7 +451,7 @@ const secretAssignmentRule: SecretPatternRule = {
       if (!isPlausibleSecretValue(value, { strictWords: !quoted })) continue;
       // SCRUB-N3: on an approval card a value shaped like shell code ("rm -rf ~/x", "-T ~/.ssh/id")
       // is part of what the owner approves, not a secret: hiding it would make the card lie.
-      if (input.sink === "prompt-card" && COMMAND_SHAPED_VALUE_RE.test(value)) continue;
+      if (input.sink === "prompt-card" && !PASSWORD_KEYWORD_RE.test(m[0]) && isCommandShapedValue(value)) continue;
       // SCRUB-N7: a lower-case name with a version ("claude-opus-5-5", "gpt-oss-120") next to
       // "token" or "key" is a model or package id. Never applied to passwords (diceware).
       if (!PASSWORD_KEYWORD_RE.test(m[0]) && VERSIONED_NAME_RE.test(value)) continue;
