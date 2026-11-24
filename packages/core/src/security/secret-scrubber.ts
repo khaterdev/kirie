@@ -309,7 +309,7 @@ export class SecretScrubber {
       return { text, count: 0, rules: {} };
     }
     try {
-      const spans = this.findSpans(text, opts?.allow, opts?.sink === "log");
+      const spans = this.findSpans(text, opts?.allow, opts?.sink === "log", opts?.sink);
       if (spans === null) return this.withheld();
       if (spans.length === 0) return { text, count: 0, rules: {} };
       const out = this.render(text, spans);
@@ -377,7 +377,7 @@ export class SecretScrubber {
    * Returns the claimed spans sorted by start, or null when both passes failed.
    * `quiet` suppresses diagnostics: the log sink must never log from inside a log write.
    */
-  private findSpans(text: string, allow: ReadonlySet<string> | undefined, quiet: boolean): Span[] | null {
+  private findSpans(text: string, allow: ReadonlySet<string> | undefined, quiet: boolean, sink?: ScrubSink): Span[] | null {
     const spans: Span[] = [];
     // owner[i]: 0 = free, OWNER_MARKER = inside an existing marker, k + 1 = claimed by span k.
     let owner: Int32Array | null = null;
@@ -456,6 +456,7 @@ export class SecretScrubber {
     const input: SecretScanInput = {
       text,
       lower: () => (lowerCache.v ??= text.toLowerCase()),
+      ...(sink !== undefined ? { sink } : {}),
     };
     for (const rule of this.rules) {
       try {

@@ -30,6 +30,8 @@ export interface SecretScanInput {
   readonly text: string;
   /** Lower-cased copy of `text`, computed once per call and shared by all rules. */
   lower(): string;
+  /** The sink being scrubbed for, when known ("prompt-card", "channel", ...). */
+  readonly sink?: string;
 }
 
 export interface SecretPatternRule {
@@ -301,6 +303,8 @@ const MAX_VALUE = 512;
 /** Lower-case words then numeric version parts: claude-opus-5-5, llama-3.1-70, gpt-oss-120. */
 const VERSIONED_NAME_RE = /^[a-z]+(?:-[a-z]+)*(?:-\d+(?:\.\d+)*)+$/;
 const PASSWORD_KEYWORD_RE = /passw|pwd|passphrase/i;
+/** Whitespace, shell syntax or a URL scheme in a value: real secrets have none of them. */
+const COMMAND_SHAPED_VALUE_RE = /\s|[;|&<>`]|\$\(|:\/\//;
 const MAX_GAP = 8;
 
 function splitNameSegments(rest: string): string[] {
@@ -435,6 +439,9 @@ const secretAssignmentRule: SecretPatternRule = {
       }
       const value = text.slice(p, Math.min(valueEnd, p + MAX_VALUE));
       if (!isPlausibleSecretValue(value, { strictWords: !quoted })) continue;
+      // SCRUB-N3: on an approval card a value shaped like shell code ("rm -rf ~/x", "-T ~/.ssh/id")
+      // is part of what the owner approves, not a secret: hiding it would make the card lie.
+      if (input.sink === "prompt-card" && COMMAND_SHAPED_VALUE_RE.test(value)) continue;
       // SCRUB-N7: a lower-case name with a version ("claude-opus-5-5", "gpt-oss-120") next to
       // "token" or "key" is a model or package id. Never applied to passwords (diceware).
       if (!PASSWORD_KEYWORD_RE.test(m[0]) && VERSIONED_NAME_RE.test(value)) continue;
