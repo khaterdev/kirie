@@ -73,6 +73,7 @@ import {
   daemonScrubbingConfig,
   freezeScrubbingConfig,
   registerKnownSecrets,
+  restrictLogPermissions,
   sanitizeErrorForLog,
 } from "./features/scrubbing.js";
 import { featureFailureNotice, type FeatureFailure } from "./features/runner.js";
@@ -199,6 +200,8 @@ export async function startDaemon(): Promise<void> {
     secretsDir: join(homedir(), ".kirie", "secrets"),
   });
   log.info({ knownSecrets, scrubbing: scrubber.isEnabled() }, "configuration loaded");
+  const tightenedLogs = restrictLogPermissions(join(homedir(), ".kirie", "logs"));
+  if (tightenedLogs.length > 0) log.info({ files: tightenedLogs }, "log files made owner-only (0600)");
   if (!scrubber.isEnabled()) {
     log.warn("secret scrubbing is OFF: replies, logs and stores are not scrubbed");
   }

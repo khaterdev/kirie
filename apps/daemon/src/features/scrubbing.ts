@@ -10,7 +10,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   createScrubApp,
@@ -172,6 +172,41 @@ export function sanitizeErrorForLog(reason: unknown): { name: string; message: s
     return { name, message: message.slice(0, 500) };
   }
   return { name: typeof reason, message: String(reason).slice(0, 500) };
+}
+
+/**
+ * SCRUB-N8: the log files (launchd's daemon.out.log and daemon.err.log, the
+ * audit trail, other *.log / *.jsonl) are made readable by the owner only.
+ * launchd creates its log files 0644; this runs at every start. Best effort:
+ * returns the files it changed.
+ */
+export function restrictLogPermissions(logsDir: string): string[] {
+  const changed: string[] = [];
+  let names: string[];
+  try {
+    names = readdirSync(logsDir);
+  } catch {
+    return changed;
+  }
+  for (const name of names) {
+    if (!/\.(log|jsonl|err|out)$/.test(name)) continue;
+    const file = join(logsDir, name);
+    try {
+      const st = statSync(file);
+      if (!st.isFile() || (st.mode & 0o077) === 0) continue;
+      chmodSync(file, 0o600);
+      changed.push(name);
+    } catch {
+      // a file that vanished or is not ours: skip
+    }
+  }
+  return changed;
+}
+
+/** The startup failure line for daemon.err.log (SCRUB-N5): name and message only, scrubbed. */
+export function startupFailureLine(err: unknown, scrub: (text: string) => string): string {
+  const { name, message } = sanitizeErrorForLog(err);
+  return `Failed to start Kirie daemon: ${scrub(`${name}: ${message}`)}`;
 }
 
 export const SCRUBBING_OFF_NOTICE =
