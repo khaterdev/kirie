@@ -221,6 +221,18 @@ describe("the owner's card", () => {
     const real = approvalCallDisplay(call("export GH_TOKEN=Zx9Cv8Bn7Mq6Lk5Jh4; gh api /user"), scrub);
     expect(real.text).toContain("GH_TOKEN=«redacted:secret-assignment»");
     expect(real.redacted).toBe(1);
+    // Passwords, plain multi-word secrets and Bearer values stay hidden on the card.
+    for (const cmd of [
+      "export PASSWORD='tr0ub4dor&3'; psql",
+      "DB_PASSWORD=\"correct horse battery staple\" ./run",
+      "DB_PASSWORD=\"rm -rf /tmp/x9\" ./run",
+      "API_TOKEN=\"Bearer x9Kq7Lm2Np4Rs6Tv8Wx0Yz\" curl https://x.example",
+      "API_TOKEN=\"correct horse battery staple9\" ./run",
+    ]) {
+      const d = approvalCallDisplay(call(cmd), scrub);
+      expect(d.text, cmd).toContain("«redacted:");
+      expect(d.redacted, cmd).toBeGreaterThan(0);
+    }
     // Other sinks still redact the assignment value.
     expect(scrubSecrets("SECRET='rm -rf /Users/tester/work x9'", { sink: "channel" })).toContain("«redacted:secret-assignment»");
   });

@@ -238,7 +238,8 @@ export class UndoRecorder {
     const rawPreview = source === "chat"
       ? this.deps.chatPreview?.(ctx.sessionKey)
       : ctx.taskId ? this.deps.taskPreview?.(ctx.taskId) : undefined;
-    const preview = rawPreview ? clip(scrubSecrets(rawPreview, { sink: "prompt-card" }), PREVIEW_CHARS) : null;
+    // Stored on disk: full scrubbing ("audit"), not the approval-card sink, which keeps command-shaped values visible.
+    const preview = rawPreview ? clip(scrubSecrets(rawPreview, { sink: "audit" }), PREVIEW_CHARS) : null;
     const sdkSessionId = ev.sdkSessionId ?? spawn.sdkSessionId;
     const rowId = this.deps.store.insert({
       sessionKey: ctx.sessionKey,
@@ -308,7 +309,7 @@ export class UndoRecorder {
         } else if (block.name === "Bash") {
           turn.bashCount += 1;
           if (turn.bashSamples.length < UNDO_MAX_BASH_SAMPLES && typeof input.command === "string") {
-            turn.bashSamples.push(clip(scrubSecrets(input.command, { sink: "prompt-card" }), BASH_SAMPLE_CHARS));
+            turn.bashSamples.push(clip(scrubSecrets(input.command, { sink: "audit" }), BASH_SAMPLE_CHARS));
           }
           changed = true;
         }
