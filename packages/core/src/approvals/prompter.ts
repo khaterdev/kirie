@@ -105,7 +105,7 @@ function str(v: unknown): string {
 }
 
 /** The exact text shown for a call: the command, a file path plus content preview, or the JSON input. */
-export function approvalCallDisplay(call: ApprovalToolCall, scrub: (t: string) => string): { label: string; text: string; hidden: number } {
+export function approvalCallDisplay(call: ApprovalToolCall, scrub: (t: string) => string): { label: string; text: string; hidden: number; redacted: number } {
   const input = call.input ?? {};
   let label: string;
   let raw: string;
@@ -138,7 +138,19 @@ export function approvalCallDisplay(call: ApprovalToolCall, scrub: (t: string) =
     scrubbed = "«message withheld: scrubber error»";
   }
   const rendered = renderApprovalDisplay(scrubbed);
-  return { label, text: truncateApprovalDisplay(rendered.text), hidden: rendered.hidden };
+  // Values the scrubber hid from this text (markers that were not already in the input).
+  const redacted = Math.max(0, countMarkers(scrubbed) - countMarkers(raw));
+  return { label, text: truncateApprovalDisplay(rendered.text), hidden: rendered.hidden, redacted };
+}
+
+function countMarkers(text: string): number {
+  return text.split("«redacted:").length - 1 + (text.split("«message withheld").length - 1);
+}
+
+/** One line for /pending and typed answers: "Bash: rm -rf ~/x". `displayText` is already scrubbed and escaped. */
+export function approvalSummary(call: ApprovalToolCall, displayText: string): string {
+  const oneLine = displayText.replace(/\s+/g, " ").trim();
+  return clip(`${call.tool}: ${oneLine}`, 280);
 }
 
 function clip(text: string, max: number): string {
@@ -329,6 +341,10 @@ export class ApprovalPrompter {
       `Tool: ${clip(call.tool, 120)}`,
       `Why: ${clip(why.slice(0, 6).join("; "), 600)}`,
       ...(display.hidden > 0 ? [`Warning: ${display.hidden} hidden or direction-changing character(s), shown as ⟨U+…⟩.`] : []),
+      // SCRUB-N3: never let a redaction make the card look harmless.
+      ...(display.redacted > 0
+        ? [`Warning: ${display.redacted} value(s) below were hidden by the secret scrubber («redacted:…»). They are part of what will run; deny if you cannot tell what they are.`]
+        : []),
       `${display.label}:`,
       display.text,
       `cwd: ${clip(call.cwd || call.ctx.cwd, 300)}`,
@@ -346,12 +362,13 @@ export class ApprovalPrompter {
       kind: "approval",
       title: "Approval needed",
       body,
+      summary: approvalSummary(call, display.text),
       timeoutMs: policy.timeoutSeconds * 1000,
       signal,
       extra: { ...APPROVAL_STOP_OPTION },
     });
     const waitedMs = this.now() - started;
-    const detail = { code: res.code, waitedMs };
+    const detail = { ref: res.ref, waitedMs };
 
     if (res.outcome === "approved") {
       this.audit("approved", ev, call, detail);

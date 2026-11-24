@@ -73,6 +73,7 @@ import {
   daemonScrubbingConfig,
   freezeScrubbingConfig,
   registerKnownSecrets,
+  restrictLogPermissions,
   sanitizeErrorForLog,
 } from "./features/scrubbing.js";
 import { featureFailureNotice, type FeatureFailure } from "./features/runner.js";
@@ -199,6 +200,8 @@ export async function startDaemon(): Promise<void> {
     secretsDir: join(homedir(), ".kirie", "secrets"),
   });
   log.info({ knownSecrets, scrubbing: scrubber.isEnabled() }, "configuration loaded");
+  const tightenedLogs = restrictLogPermissions(join(homedir(), ".kirie", "logs"));
+  if (tightenedLogs.length > 0) log.info({ files: tightenedLogs }, "log files made owner-only (0600)");
   if (!scrubber.isEnabled()) {
     log.warn("secret scrubbing is OFF: replies, logs and stores are not scrubbed");
   }
@@ -1270,6 +1273,7 @@ export async function startDaemon(): Promise<void> {
         void restartDaemon();
       },
       proactiveEngine: proactive,
+      isProtectedMessage: (channel, chatId, messageId) => ownerPrompts.isOpenPromptCard(channel, chatId, messageId),
     },
     internalApi,
   });
@@ -1584,7 +1588,10 @@ function registerChannelAdapters(registry: ChannelRegistry, config: KirieConfig)
 
   if (ch.discord?.enabled && ch.discord.token) {
     log.info("registering Discord adapter");
-    registry.register(new DiscordAdapter({ token: ch.discord.token }));
+    registry.register(new DiscordAdapter({
+      token: ch.discord.token,
+      dmUserIds: (config.security.owner.identities.discord ?? []).map((id) => String(id)),
+    }));
   }
 
   if (ch.slack?.enabled && ch.slack.botToken && ch.slack.appToken) {

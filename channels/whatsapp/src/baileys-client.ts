@@ -234,6 +234,7 @@ function normalizeMessage(
     threadId: undefined,
     replyToId,
     replyTo,
+    ...(contextInfo?.isForwarded ? { isForwarded: true } : {}),
     media: media ? [media] : undefined,
     timestamp: (msg.messageTimestamp as number) * 1000 || Date.now(),
     raw: msg,

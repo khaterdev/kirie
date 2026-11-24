@@ -48,7 +48,12 @@ describe("built-in core commands", () => {
     onRestart = vi.fn();
     cancelAll = vi.fn(async () => 2);
     abortAll = vi.fn(() => 1);
-    answerByCode = vi.fn(() => "ok");
+    answerByCode = vi.fn(async (_code: string, opt: string) => ({
+      status: "ok",
+      kind: "approval",
+      summary: "Bash: rm -rf build",
+      optionLabel: opt === "approve" ? "Approve" : "Deny",
+    }));
     deps = {
       help: registry,
       channelRegistry: {
@@ -65,7 +70,7 @@ describe("built-in core commands", () => {
       backgroundTaskManager: { cancelAll },
       onRestart,
       prompts: {
-        pending: () => [{ code: "K7Q2", kind: "approval", title: "Run rm -rf build", expiresAt: Date.now() + 120_000, options: [{ id: "approve", label: "Approve" }, { id: "deny", label: "Deny" }] }],
+        pending: () => [{ code: "K7Q2", kind: "approval", title: "Approval needed", summary: "Bash: rm -rf build", expiresAt: Date.now() + 120_000, options: [{ id: "approve", label: "Approve" }, { id: "deny", label: "Deny" }] }],
         answerByCode,
       },
     };
@@ -157,18 +162,34 @@ describe("built-in core commands", () => {
     expect(registry.menu({ forOwner: true })).toHaveLength(14);
   });
 
-  it("/pending lists codes and options; /approve, /deny, /answer call answerByCode", async () => {
+  it("in a group, only the owner can /clear, and /context hides the session key from others (CORE-N5)", async () => {
+    const group = { chatType: "group" as const, chatId: "-100555" };
+    expect((await run("/clear", { ...group, senderId: STRANGER })).texts[0]).toContain("Only the owner");
+    expect(deps.pipeline!.clearSession).not.toHaveBeenCalled();
+    expect((await run("/clear", group)).texts[0]).toContain("Chat context cleared");
+    expect(deps.pipeline!.clearSession).toHaveBeenCalledTimes(1);
+    expect((await run("/context", { ...group, senderId: STRANGER })).texts[0]).not.toContain("Session:");
+    expect((await run("/context", group)).texts[0]).toContain("Session: telegram:group:-100555");
+  });
+
+  it("/pending lists codes, what each is and options; /approve, /deny, /answer name what they answered", async () => {
     const pending = (await run("/pending")).texts[0]!;
-    expect(pending).toContain("K7Q2  Run rm -rf build");
+    expect(pending).toContain("K7Q2  Bash: rm -rf build");
     expect(pending).toContain("approve (Approve), deny (Deny)");
-    expect((await run("/approve k7q2")).texts).toEqual(["Approved K7Q2."]);
-    expect(answerByCode).toHaveBeenLastCalledWith("K7Q2", "approve", { channel: "telegram", senderId: OWNER });
-    expect((await run("/deny K7Q2")).texts).toEqual(["Denied K7Q2."]);
-    expect(answerByCode).toHaveBeenLastCalledWith("K7Q2", "deny", { channel: "telegram", senderId: OWNER });
-    answerByCode.mockReturnValueOnce("bad-option");
+    expect((await run("/approve k7q2")).texts).toEqual(["Approved K7Q2 (Approve): Bash: rm -rf build"]);
+    expect(answerByCode).toHaveBeenLastCalledWith("K7Q2", "approve", { channel: "telegram", senderId: OWNER, chatId: OWNER });
+    expect((await run("/deny K7Q2")).texts).toEqual(["Denied K7Q2 (Deny): Bash: rm -rf build"]);
+    expect(answerByCode).toHaveBeenLastCalledWith("K7Q2", "deny", { channel: "telegram", senderId: OWNER, chatId: OWNER });
+    answerByCode.mockResolvedValueOnce({ status: "bad-option", kind: "approval", summary: "Bash: rm -rf build", options: [{ id: "approve", label: "Approve" }] });
     expect((await run("/answer K7Q2 maybe")).texts[0]).toContain("no such option");
-    answerByCode.mockReturnValueOnce("not-found");
+    answerByCode.mockResolvedValueOnce({ status: "not-found" });
     expect((await run("/approve ZZZZ")).texts[0]).toContain("No pending request");
+    answerByCode.mockResolvedValueOnce({ status: "resent", kind: "approval", summary: "Bash: rm -rf build" });
+    const resent = (await run("/approve K7Q2")).texts[0]!;
+    expect(resent).toContain("K7Q2 is: Bash: rm -rf build");
+    expect(resent).toContain("does not answer it");
+    answerByCode.mockResolvedValueOnce({ status: "closed", kind: "approval", summary: "Bash: rm -rf build" });
+    expect((await run("/approve K7Q2")).texts[0]).toContain("already over");
     expect((await run("/approve")).texts[0]).toContain("Usage");
     expect((await run("/approve K7Q2", { senderId: STRANGER, chatId: STRANGER })).texts).toEqual([COMMAND_OWNER_ONLY_TEXT]);
   });

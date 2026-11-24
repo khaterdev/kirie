@@ -225,6 +225,12 @@ export interface SentMessage {
   readonly id: string;
   /** Timestamp of the sent message (ms epoch) */
   readonly timestamp: number;
+  /**
+   * The chat the message landed in, when the adapter resolved the given chat id
+   * to another one (Discord: a user id is sent to that user's DM channel).
+   * Omitted when it is the chat id that was passed in.
+   */
+  readonly chatId?: string;
 }
 
 // ---------------------------------------------------------------------------

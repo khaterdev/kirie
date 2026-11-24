@@ -515,6 +515,14 @@ describe("helpers", () => {
     expect(chatCallContext({ sessionKey: "telegram:dm:2", channel: "telegram", chatType: "dm", senderRole: "user", cwd: CWD }).ownerDm).toBe(false);
   });
 
+  it("an injected turn in the owner's DM is not ownerDm (CORE-N2)", () => {
+    const base = { sessionKey: "telegram:dm:1", channel: "telegram", chatType: "dm", senderRole: "owner", cwd: CWD } as const;
+    expect(chatCallContext({ ...base, origin: "owner_message" }).ownerDm).toBe(true);
+    for (const origin of ["schedule", "loop", "goal", "webhook", "background", "system", "other_user"] as const) {
+      expect(chatCallContext({ ...base, origin }).ownerDm).toBe(false);
+    }
+  });
+
   it("addHook appends instead of overwriting", () => {
     const options: Options = {};
     const a: HookCallbackMatcher = { hooks: [async () => ({})] };

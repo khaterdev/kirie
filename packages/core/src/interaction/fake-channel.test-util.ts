@@ -25,7 +25,7 @@ export interface FakeAdapter extends ChannelAdapter {
   press(i: Partial<UnifiedInteraction> & { data: string }): Promise<void>;
 }
 
-export function makeFakeAdapter(id: ChannelName = "telegram", opts: { buttons?: boolean } = {}): FakeAdapter {
+export function makeFakeAdapter(id: ChannelName = "telegram", opts: { buttons?: boolean; dmChatId?: string } = {}): FakeAdapter {
   const buttons = opts.buttons ?? true;
   let nextId = 100;
   const a: FakeAdapter = {
@@ -57,7 +57,7 @@ export function makeFakeAdapter(id: ChannelName = "telegram", opts: { buttons?: 
     sendTyping: async () => {},
     sendText: vi.fn(async (p: SendTextParams) => {
       a.sentText.push(p);
-      return [{ id: String(nextId++), timestamp: Date.now() }];
+      return [{ id: String(nextId++), timestamp: Date.now(), ...(opts.dmChatId ? { chatId: opts.dmChatId } : {}) }];
     }),
     editMessage: vi.fn(async (p) => {
       a.edits.push({ chatId: p.ctx.chatId, messageId: p.messageId, text: p.text });

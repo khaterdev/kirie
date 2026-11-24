@@ -259,4 +259,29 @@ describe("Gateway routes", () => {
       expect(sent).toEqual([`key ${MARK}`]);
     });
   });
+
+  describe("open approval cards (CORE-B1)", () => {
+    it("refuses to edit an open prompt card, allows other messages", async () => {
+      const edits: string[] = [];
+      const adapter = createMockAdapter("telegram");
+      adapter.editMessage = async (p) => {
+        edits.push(p.messageId);
+      };
+      channelRegistry.register(adapter);
+      adapter.sendText = async () => [{ id: "78", timestamp: 1 }];
+      const guarded = { ...deps, isProtectedMessage: (ch: string, chat: string, id: string) => ch === "telegram" && chat === "1001" && id === "77" };
+      const routes = createRoutes(guarded);
+      const call = (body: Record<string, unknown>) =>
+        routes.request("/api/channel-action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channel: "telegram", chatId: "1001", ...body }) });
+      const edit = (messageId: unknown, extra: Record<string, unknown> = {}) =>
+        call({ action: "edit_message", messageId, text: "Approval needed: Read README.md. Reply /approve K7Q2", ...extra });
+      // An open card, a page Kirie sent, and number tricks on the card's id: all refused.
+      for (const id of ["77", "76", "77.0", " 77", "0x4d", 77]) expect((await edit(id)).status, String(id)).toBe(403);
+      expect(edits).toEqual([]);
+      // A message the agent sent through send_text can be edited, from any chat id or thread.
+      expect((await call({ action: "send_text", text: "progress 1/3" })).status).toBe(200);
+      expect((await edit("78", { chatId: "2002", threadId: "x" })).status).toBe(200);
+      expect(edits).toEqual(["78"]);
+    });
+  });
 });

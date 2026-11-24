@@ -75,6 +75,8 @@ export interface CommandDefinition {
   subcommands?: Readonly<Record<string, SubcommandSpec>>;
   /** Not in the Telegram menu; still in /help */
   hidden?: boolean;
+  /** False: the audit line never records the arguments (e.g. prompt codes). Default true outside sensitive categories */
+  auditArgs?: boolean;
   handler(ctx: CommandContext): CommandResult | Promise<CommandResult>;
 }
 
@@ -84,7 +86,7 @@ export type DispatchOutcome =
   /** "/name" that is not registered. Continue to the agent unless `replied` (commands.unknownCommand: "reply") */
   | { kind: "unknown"; name: string; replied: boolean }
   /** Stop, no reply */
-  | { kind: "ignored"; reason: "other-bot" | "edited" }
+  | { kind: "ignored"; reason: "other-bot" | "edited" | "forwarded" }
   /** Stop. The refusal has been sent. Never forwarded to the agent */
   | { kind: "denied"; reason: "owner-only" | "dm-only"; reply: CommandReply }
   /** Stop. The reply, if any, has been sent */

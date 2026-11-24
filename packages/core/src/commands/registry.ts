@@ -58,6 +58,7 @@ export interface CommandRegistryDeps {
 
 export const COMMAND_OWNER_ONLY_TEXT = "This command is owner-only.";
 export const COMMAND_DM_ONLY_TEXT = "Use this command in a direct message with me.";
+export const COMMAND_FORWARDED_TEXT = "Forwarded commands are not run. Type the command yourself if you meant it.";
 export const COMMAND_CONFIRM_TIMEOUT_MS = 120_000;
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
@@ -135,6 +136,14 @@ export class CommandRegistry {
 
     // 5. Editing an old command message never runs it again.
     if (message.isEdited) return { kind: "ignored", reason: "edited" };
+
+    // 5b. A forwarded message is someone else's words, never the owner's command (CORE-N1).
+    if (message.isForwarded) {
+      const reply: CommandReply = { text: COMMAND_FORWARDED_TEXT, plain: true };
+      this.finish(def, message, parsed, this.deps.owners.isOwner(message.channel, message.senderId), "ignored:forwarded");
+      await this.safeSend(input, reply);
+      return { kind: "ignored", reason: "forwarded" };
+    }
 
     const ownerOnly = isOwnerOnlyCommand(def);
     const isOwner = this.deps.owners.isOwner(message.channel, message.senderId);
@@ -250,7 +259,7 @@ export class CommandRegistry {
     );
     if (!isOwnerOnlyCommand(def) || !this.deps.audit) return;
     const detail: Record<string, unknown> = { outcome, channel: message.channel, chatType: message.chatType };
-    if (!SENSITIVE_CATEGORIES.has(def.category) && parsed.args) {
+    if (!SENSITIVE_CATEGORIES.has(def.category) && def.auditArgs !== false && parsed.args) {
       detail.args = truncate(parsed.args, AUDIT_ARGS_MAX_CHARS);
     }
     this.deps.audit.record({

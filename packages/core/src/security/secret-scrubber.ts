@@ -96,6 +96,8 @@ export const SCRUB_WITHHELD = "«message withheld: scrubber error»";
 
 /** Rule name used for known-secret findings. */
 export const KNOWN_SECRET_RULE = "known-secret";
+/** `mask: "partial"` shows the first and last 4 characters only of values at least this long. */
+export const PARTIAL_MASK_MIN_CHARS = 32;
 
 export function redactionMarker(rule: string): string {
   return `«redacted:${rule}»`;
@@ -307,7 +309,7 @@ export class SecretScrubber {
       return { text, count: 0, rules: {} };
     }
     try {
-      const spans = this.findSpans(text, opts?.allow, opts?.sink === "log");
+      const spans = this.findSpans(text, opts?.allow, opts?.sink === "log", opts?.sink);
       if (spans === null) return this.withheld();
       if (spans.length === 0) return { text, count: 0, rules: {} };
       const out = this.render(text, spans);
@@ -375,7 +377,7 @@ export class SecretScrubber {
    * Returns the claimed spans sorted by start, or null when both passes failed.
    * `quiet` suppresses diagnostics: the log sink must never log from inside a log write.
    */
-  private findSpans(text: string, allow: ReadonlySet<string> | undefined, quiet: boolean): Span[] | null {
+  private findSpans(text: string, allow: ReadonlySet<string> | undefined, quiet: boolean, sink?: ScrubSink): Span[] | null {
     const spans: Span[] = [];
     // owner[i]: 0 = free, OWNER_MARKER = inside an existing marker, k + 1 = claimed by span k.
     let owner: Int32Array | null = null;
@@ -454,6 +456,7 @@ export class SecretScrubber {
     const input: SecretScanInput = {
       text,
       lower: () => (lowerCache.v ??= text.toLowerCase()),
+      ...(sink !== undefined ? { sink } : {}),
     };
     for (const rule of this.rules) {
       try {
@@ -465,6 +468,45 @@ export class SecretScrubber {
       } catch (err) {
         patternFailed = true;
         if (!quiet) diag().error({ rule: rule.name, err: errorSummary(err) }, "scrubber rule failed");
+      }
+    }
+
+    // SCRUB-N6: a zero-width character or Markdown emphasis inside a token hides it from the
+    // rules, yet the platform shows one readable string. Scan a shadow copy without those
+    // characters and map its findings back onto the original text.
+    if (SHADOW_TRIGGER_RE.test(text)) {
+      try {
+        const shadow = buildShadow(text);
+        if (shadow) {
+          const mapped = (a: number, b: number, rule: string): void => {
+            if (b <= a) return;
+            claim(shadow.map[a]!, shadow.map[b - 1]! + 1, rule);
+          };
+          for (const { form, raw } of this.knownForms) {
+            if (allow?.has(raw)) continue;
+            let idx = shadow.text.indexOf(form);
+            while (idx !== -1) {
+              mapped(idx, idx + form.length, KNOWN_SECRET_RULE);
+              idx = shadow.text.indexOf(form, idx + form.length);
+            }
+          }
+          const sLower: { v?: string } = {};
+          const sInput: SecretScanInput = {
+            text: shadow.text,
+            lower: () => (sLower.v ??= shadow.text.toLowerCase()),
+            ...(sink !== undefined ? { sink } : {}),
+          };
+          for (const rule of this.rules) {
+            if (rule.gate && rule.gate.length > 0) {
+              const hay = rule.gateLower ? sInput.lower() : shadow.text;
+              if (!rule.gate.some((g) => hay.includes(g))) continue;
+            }
+            rule.scan(sInput, (a, b) => mapped(a, b, rule.name));
+          }
+        }
+      } catch (err) {
+        patternFailed = true;
+        if (!quiet) diag().error({ err: errorSummary(err) }, "scrubber shadow pass failed");
       }
     }
 
@@ -486,7 +528,9 @@ export class SecretScrubber {
   }
 
   private markerFor(rule: string, value: string): string {
-    if (this.mask === "partial" && value.length >= 18 && !/[\s«»]/.test(value)) {
+    // SCRUB-N9: 8 revealed characters are only acceptable on long, random pattern matches;
+    // a known value (a password from the credential store) is never partly shown.
+    if (this.mask === "partial" && rule !== KNOWN_SECRET_RULE && value.length >= PARTIAL_MASK_MIN_CHARS && !/[\s«»]/.test(value)) {
       return `«redacted:${rule}:${value.slice(0, 4)}…${value.slice(-4)}»`;
     }
     return redactionMarker(rule);
@@ -584,6 +628,34 @@ export class SecretScrubber {
 function errorSummary(err: unknown): { name: string; message: string } {
   if (err instanceof Error) return { name: err.name, message: err.message };
   return { name: "Error", message: String(err) };
+}
+
+// ---------------------------------------------------------------------------
+// Shadow copy for the formatting pass (SCRUB-N6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Characters a renderer hides or turns into formatting, so a token split by them still
+ * reads as one string: zero-width and invisible formatting characters, the soft hyphen,
+ * and Markdown emphasis or code marks (`*`, `~`, a backtick, a double underscore).
+ */
+const SHADOW_TRIGGER_RE = /[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF*~`]|__/;
+const SHADOW_DROP_CHAR_RE = /[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF*~`]/;
+
+/** The text without those characters, and for each shadow index the original index. Null when nothing was dropped. */
+function buildShadow(text: string): { text: string; map: Int32Array } | null {
+  const map = new Int32Array(text.length);
+  let out = "";
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (SHADOW_DROP_CHAR_RE.test(ch)) continue;
+    if (ch === "_" && text[i + 1] === "_") { i++; continue; }
+    out += ch;
+    map[n++] = i;
+  }
+  if (n === text.length) return null;
+  return { text: out, map: map.subarray(0, n) };
 }
 
 // ---------------------------------------------------------------------------

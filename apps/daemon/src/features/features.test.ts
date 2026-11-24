@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -18,6 +18,7 @@ import { createOwnerNotifier, OWNER_NOTIFY_KEY_INTERVAL_MS } from "./notify.js";
 import { registerCommandMenus } from "./menus.js";
 import {
   registerKnownSecrets, readSecretsDir, sanitizeErrorForLog, SCRUBBING_OFF_NOTICE, setupScrubbing,
+  restrictLogPermissions, startupFailureLine,
   freezeScrubbingConfig, resetFrozenScrubbingConfigForTesting,
 } from "./scrubbing.js";
 import { TaskHooks } from "../task-hooks.js";
@@ -38,7 +39,7 @@ function fakeContext(over: Partial<DaemonContext> = {}): DaemonContext {
     agentCwd: "/nonexistent-kirie-test",
     commands,
     owners,
-    ownerPrompts: { pending: () => [], answerByCode: () => "not-found" },
+    ownerPrompts: { pending: () => [], answerByCode: async () => ({ status: "not-found" as const }) },
     settings: {},
     audit: {},
     scrubber: new SecretScrubber(),
@@ -88,11 +89,13 @@ describe("FEATURES", () => {
     expect(handles.map((h) => h.name)).toEqual(STUB_FEATURES.map((f) => f.name));
     const started = await startFeatures(handles);
     expect(started).toHaveLength(STUB_FEATURES.length);
-    // Only core-commands registers commands and an addendum; only scrubbing sets an env key.
+    // Only core-commands registers commands and an addendum; only scrubbing sets env keys and
+    // mounts a route (the known-value scrub for the tools subprocess, SCRUB-N1).
     expect(ctx.commands.list()).toHaveLength(14);
     expect(ctx.promptAddenda.names()).toEqual(["commands"]);
-    expect(Object.keys(ctx.kirieToolsEnv)).toEqual(["KIRIE_SCRUB_CONFIG"]);
-    expect(ctx.internalApi.apps()).toEqual([]);
+    expect(Object.keys(ctx.kirieToolsEnv)).toEqual(["KIRIE_SCRUB_CONFIG", "KIRIE_SCRUB_TOKEN"]);
+    expect(ctx.kirieToolsEnv.KIRIE_SCRUB_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+    expect(ctx.internalApi.apps().map((a) => a.name)).toEqual(["scrub"]);
     expect(ctx.notifyOwner).not.toHaveBeenCalled();
     await stopFeatures(started);
   });
@@ -308,6 +311,33 @@ describe("scrubbing wiring", () => {
     expect(JSON.stringify(clean)).not.toContain(token);
     expect(sanitizeErrorForLog({ name: "GrammyError", description: "Bad Request" })).toEqual({ name: "GrammyError", message: "Bad Request" });
     expect(sanitizeErrorForLog("plain")).toEqual({ name: "string", message: "plain" });
+  });
+
+  it("the startup failure line keeps only a scrubbed name and message (SCRUB-N5)", async () => {
+    const { scrubSecrets } = await import("@kirie/core");
+    const token = `${"8123456789"}:${"AAH" + "Zx9Cv8Bn7Mq6Wp5Ok4Ij3Uh2Yg1Tf0Rd9"}`;
+    const err = Object.assign(new Error(`Call to 'getMe' failed! (https://api.telegram.org/bot${token}/getMe)`), {
+      name: "HttpError",
+      error: { url: `https://api.telegram.org/bot${token}/getMe` },
+    });
+    const line = startupFailureLine(err, (t) => scrubSecrets(t, { sink: "log" }));
+    expect(line.startsWith("Failed to start Kirie daemon: HttpError: Call to 'getMe' failed!")).toBe(true);
+    expect(line).not.toContain(token.split(":")[1]!);
+    expect(line).toContain("«redacted:telegram-bot-token»");
+  });
+
+  it("restrictLogPermissions makes log files owner-only (SCRUB-N8)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kirie-logs-"));
+    try {
+      for (const f of ["daemon.out.log", "daemon.err.log", "audit.jsonl", "notes.txt"]) writeFileSync(join(dir, f), "x", { mode: 0o644 });
+      writeFileSync(join(dir, "already.log"), "x", { mode: 0o600 });
+      expect(restrictLogPermissions(dir).sort()).toEqual(["audit.jsonl", "daemon.err.log", "daemon.out.log"]);
+      for (const f of ["daemon.out.log", "daemon.err.log", "audit.jsonl", "already.log"]) expect(statSync(join(dir, f)).mode & 0o777).toBe(0o600);
+      expect(statSync(join(dir, "notes.txt")).mode & 0o777).toBe(0o644);
+      expect(restrictLogPermissions("/nonexistent-kirie-logs")).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("a restart with a looser config keeps the first scrubbing config for the subprocess", async () => {

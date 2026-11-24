@@ -65,12 +65,17 @@ export const INTERACTION_FAILED_TEXT = "Something went wrong.";
 const NS_RE = /^[a-z]{2,6}$/;
 const ACTION_RE = /^[A-Za-z0-9_:.=-]+$/;
 const RATE_WINDOW_MS = 60_000;
+/** Denied presses audited and logged per sender per minute; more are only acked (CORE-N3). */
+const DENIED_AUDIT_PER_MINUTE = 5;
+/** Senders tracked by the denial limiter before the oldest are dropped. */
+const DENIED_TRACKED_MAX = 1000;
 
 export class InteractionRouter {
   private readonly handlers = new Map<string, OwnerActionHandler>();
   private readonly attached = new Map<ChannelName, ChannelAdapter>();
   private readonly attachedSet = new WeakSet<ChannelAdapter>();
   private readonly presses = new Map<string, number[]>();
+  private readonly deniedPresses = new Map<string, number[]>();
   private readonly maxPerMinute: number;
 
   constructor(private readonly deps: InteractionRouterDeps) {
@@ -142,6 +147,10 @@ export class InteractionRouter {
       // 1. Owner, in the owner's own DM.
       const denial = this.denialReason(i);
       if (denial) {
+        if (!this.allowDeniedRecord(`${i.channel}:${i.senderId}`)) {
+          await ack(INTERACTION_NOT_OWNER_TEXT, true);
+          return;
+        }
         this.deps.audit.record({
           feature: "interaction",
           action: "press.denied",
@@ -216,6 +225,25 @@ export class InteractionRouter {
     if (i.chatType !== "dm") return "not-dm";
     if (i.channel === "telegram" && i.chatId !== i.senderId) return "not-own-dm";
     return null;
+  }
+
+  /** Whether a denied press may still be audited and logged (bounded per sender and in total). */
+  private allowDeniedRecord(key: string): boolean {
+    const now = Date.now();
+    const list = (this.deniedPresses.get(key) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
+    if (list.length >= DENIED_AUDIT_PER_MINUTE) {
+      this.deniedPresses.set(key, list);
+      return false;
+    }
+    list.push(now);
+    this.deniedPresses.delete(key);
+    this.deniedPresses.set(key, list);
+    while (this.deniedPresses.size > DENIED_TRACKED_MAX) {
+      const oldest = this.deniedPresses.keys().next().value;
+      if (oldest === undefined) break;
+      this.deniedPresses.delete(oldest);
+    }
+    return true;
   }
 
   private allowPress(key: string): boolean {

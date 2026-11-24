@@ -3,6 +3,19 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { scrubSecrets } from "../../security/secret-scrubber.js";
+import { scrubBeforeStore } from "../../security/remote-scrub.js";
+
+/**
+ * SCRUB-N4: TTS text goes to a cloud service (Edge, OpenAI, ElevenLabs) and
+ * comes back as a voice note. Known values (the daemon's scrubber, when this
+ * runs in the tools subprocess) and patterns are removed first; a marker is
+ * read out as "redacted".
+ */
+export async function prepareTtsText(text: unknown): Promise<string> {
+  const known = await scrubBeforeStore(String(text ?? ""), "channel");
+  return scrubSecrets(known.text, { sink: "channel" }).replace(/«redacted:[a-z0-9-]+(?::[^»]*)?»/g, "redacted");
+}
 
 /**
  * Resolve which TTS provider to use.
@@ -199,6 +212,7 @@ export function createTTSToolHandlers() {
         const outputPath = join(mediaDir, `${randomUUID()}.${format}`);
 
         const provider = resolveProvider(params.provider);
+        params = { ...params, text: await prepareTtsText(params.text) };
 
         switch (provider) {
           case "edge-tts":

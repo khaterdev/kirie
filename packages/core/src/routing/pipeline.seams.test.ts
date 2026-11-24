@@ -216,6 +216,8 @@ describe("MessagePipeline seams", () => {
       expect(seen[0]!.textPreview).toBe("hi from owner");
       expect(seen[2]!.textPreview).toBeUndefined();
       expect(events.map((e) => e.origin)).toEqual(["owner_message", "other_user", "schedule"]);
+      // The engine is told the origin, so an injected turn is not the owner's DM (CORE-N2).
+      expect(execute.mock.calls.map((c) => (c[1] as { origin?: string }).origin)).toEqual(["owner_message", "other_user", "schedule"]);
       // The registry is cleared after each turn.
       expect(turnContext.get(`telegram:dm:${OWNER}`)).toBeUndefined();
       expect(events[0]!.userMsgId).toBe(1);

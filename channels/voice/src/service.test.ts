@@ -182,8 +182,11 @@ describe("/voice and /call commands", () => {
   function msg(senderId: string, text: string): UnifiedMessage {
     return { id: "m1", channel: "telegram", senderId, senderName: "x", text, chatType: "dm", chatId: senderId, timestamp: 0, raw: null };
   }
-  async function dispatch(x: Harness, text: string, senderId = "1001"): Promise<string> {
-    const registry = new CommandRegistry({ owners: new OwnerDirectory({ telegram: ["1001"] }) });
+  async function dispatch(x: Harness, text: string, senderId = "1001", confirm: "approved" | "denied" = "approved"): Promise<string> {
+    const registry = new CommandRegistry({
+      owners: new OwnerDirectory({ telegram: ["1001"] }),
+      prompts: { requestApproval: async () => ({ outcome: confirm, optionId: confirm === "approved" ? "approve" : "deny", code: "K7Q2" }) },
+    });
     registry.registerAll(createVoiceCommands(x.service, { includeCall: true }));
     const replies: string[] = [];
     await registry.dispatch({
@@ -244,11 +247,33 @@ describe("/voice and /call commands", () => {
     expect(await dispatch(h, "/voice provider skype")).toContain("Unknown provider");
   });
 
-  it("/call lists aliases and dials", async () => {
+  it("/call lists aliases and dials after a confirmation", async () => {
     h = await makeHarness();
     expect(await dispatch(h, "/call")).toContain("me, mom");
     expect(await dispatch(h, '/call mom "Dinner at eight"')).toContain("Calling mom via twilio");
     expect(h.fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("/call never dials without the owner's confirmation (CORE-N1)", async () => {
+    h = await makeHarness();
+    expect(await dispatch(h, "/call mom I need the bank PIN", "1001", "denied")).toBe("Not calling mom.");
+    expect(h.fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("a forwarded /call is not run at all", async () => {
+    h = await makeHarness();
+    const registry = new CommandRegistry({ owners: new OwnerDirectory({ telegram: ["1001"] }) });
+    registry.registerAll(createVoiceCommands(h.service, { includeCall: true }));
+    const replies: string[] = [];
+    const out = await registry.dispatch({
+      message: { ...msg("1001", "/call mom I need the bank PIN"), isForwarded: true },
+      identity: { role: "owner", canonicalId: "telegram:1001", channel: "telegram", senderId: "1001" },
+      source: "channel",
+      send: async (r) => { replies.push(r.text); },
+    });
+    expect(out).toEqual({ kind: "ignored", reason: "forwarded" });
+    expect(replies.join("\n")).toContain("Forwarded commands are not run");
+    expect(h.fetchFn).not.toHaveBeenCalled();
   });
 
   it("parses /call arguments", () => {

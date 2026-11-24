@@ -35,6 +35,12 @@ export interface GatewayDeps {
   usageDashboard?: UsageDashboard;
   /** Optional ProactiveEngine for proactive status/trigger API */
   proactiveEngine?: ProactiveEngine | null;
+  /**
+   * True for a message that must not be edited through /api/channel-action:
+   * the card of an open owner prompt (CORE-B1). Editing it would let the agent
+   * turn a real approval card into a look-alike.
+   */
+  isProtectedMessage?: (channel: string, chatId: string, messageId: string) => boolean;
 }
 
 /**
@@ -48,7 +54,30 @@ export interface GatewayDeps {
  *   POST /shutdown            - Graceful shutdown
  *   GET  /sessions            - List active sessions
  */
+/** How many message ids sent through /api/channel-action are remembered as editable. */
+const CHANNEL_ACTION_EDITABLE_MAX = 5000;
+
 export function createRoutes(deps: GatewayDeps): Hono {
+  // CORE-B1 (review): /api/channel-action may edit only messages it sent itself
+  // (the agent's send_message / send_text). Anything else (an approval card, the
+  // full-text pages of a goal approval, Kirie's own replies) is refused, whatever
+  // chat id, thread id or number format the caller uses.
+  const editable = new Map<string, true>();
+  const editableKey = (channel: string, messageId: unknown): string => `${channel}|${String(messageId)}`;
+  const rememberEditable = (channel: string, sent: unknown): void => {
+    const list = Array.isArray(sent) ? sent : [sent];
+    for (const m of list) {
+      const id = (m as { id?: unknown } | null)?.id;
+      if (typeof id !== "string" || !id) continue;
+      editable.delete(editableKey(channel, id));
+      editable.set(editableKey(channel, id), true);
+      while (editable.size > CHANNEL_ACTION_EDITABLE_MAX) {
+        const oldest = editable.keys().next().value;
+        if (oldest === undefined) break;
+        editable.delete(oldest);
+      }
+    }
+  };
   const app = new Hono();
 
   // GET /status - overall system health
@@ -372,6 +401,7 @@ export function createRoutes(deps: GatewayDeps): Hono {
         case "send_text": {
           if (!params.text) return c.json({ status: "error", message: "text is required" }, 400);
           const sent = await adapter.sendText({ ctx, text: params.text });
+          rememberEditable(params.channel, sent);
           return c.json({ status: "ok", sent });
         }
         case "send_reaction": {
@@ -387,6 +417,13 @@ export function createRoutes(deps: GatewayDeps): Hono {
         case "edit_message": {
           if (!params.messageId || !params.text) {
             return c.json({ status: "error", message: "messageId and text are required" }, 400);
+          }
+          if (
+            typeof params.messageId !== "string" ||
+            !editable.has(editableKey(params.channel, params.messageId)) ||
+            deps.isProtectedMessage?.(params.channel, String(params.chatId), params.messageId)
+          ) {
+            return c.json({ status: "error", message: "Only messages sent with send_message or send_text can be edited" }, 403);
           }
           if (!adapter.editMessage) {
             return c.json({ status: "error", message: `Channel "${params.channel}" does not support editing` }, 400);

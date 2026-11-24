@@ -9,9 +9,11 @@
  * configure call: a config reload or restart cannot turn it off.
  */
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
+  createScrubApp,
   isPlausibleSecretValue,
   isSecretAssignmentName,
   resolveScrubbingConfig,
@@ -172,12 +174,54 @@ export function sanitizeErrorForLog(reason: unknown): { name: string; message: s
   return { name: typeof reason, message: String(reason).slice(0, 500) };
 }
 
+/**
+ * SCRUB-N8: the log files (launchd's daemon.out.log and daemon.err.log, the
+ * audit trail, other *.log / *.jsonl) are made readable by the owner only.
+ * launchd creates its log files 0644; this runs at every start. Best effort:
+ * returns the files it changed.
+ */
+export function restrictLogPermissions(logsDir: string): string[] {
+  const changed: string[] = [];
+  let names: string[];
+  try {
+    names = readdirSync(logsDir);
+  } catch {
+    return changed;
+  }
+  for (const name of names) {
+    if (!/\.(log|jsonl|err|out)$/.test(name)) continue;
+    const file = join(logsDir, name);
+    try {
+      const st = statSync(file);
+      if (!st.isFile() || (st.mode & 0o077) === 0) continue;
+      chmodSync(file, 0o600);
+      changed.push(name);
+    } catch {
+      // a file that vanished or is not ours: skip
+    }
+  }
+  return changed;
+}
+
+/** The startup failure line for daemon.err.log (SCRUB-N5): name and message only, scrubbed. */
+export function startupFailureLine(err: unknown, scrub: (text: string) => string): string {
+  const { name, message } = sanitizeErrorForLog(err);
+  return `Failed to start Kirie daemon: ${scrub(`${name}: ${message}`)}`;
+}
+
 export const SCRUBBING_OFF_NOTICE =
   "Secret scrubbing is OFF (security.scrubbing.enabled: false). Replies, logs and stores are not scrubbed for secrets until it is turned back on and Kirie restarts.";
 
-/** Scrubbing (PLAN B.10 "scrubbing"): the stdio subprocess config and the off warning. */
+/**
+ * Scrubbing (PLAN B.10 "scrubbing"): the stdio subprocess config, the known-value
+ * route for its writes (SCRUB-N1: `/api/scrub/text`, guarded by a per-boot token
+ * in the subprocess env) and the off warning.
+ */
 export const setupScrubbing: FeatureSetup = (ctx) => {
   ctx.kirieToolsEnv.KIRIE_SCRUB_CONFIG = JSON.stringify(freezeScrubbingConfig(daemonScrubbingConfig(ctx.config)));
+  const token = randomBytes(32).toString("hex");
+  ctx.kirieToolsEnv.KIRIE_SCRUB_TOKEN = token;
+  ctx.internalApi.mount("scrub", createScrubApp({ scrubber: ctx.scrubber, token }));
   const enabled = ctx.scrubber.isEnabled();
   return {
     name: "scrubbing",

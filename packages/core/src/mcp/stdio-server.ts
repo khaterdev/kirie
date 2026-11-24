@@ -45,6 +45,7 @@ import { MemoryManager, VectorStore, OpenAIEmbeddings, LocalEmbeddings, ensureMo
 import { HeartbeatLogStore, createHeartbeatLogToolHandlers } from "./tools/heartbeat-logs.js";
 import { createMcpServersToolHandlers } from "./tools/mcp-servers.js";
 import { registerFeatureTools } from "./feature-tools.js";
+import { createGatewayScrubber, setRemoteScrubber } from "../security/remote-scrub.js";
 
 // ── Database paths ──────────────────────────────────────────────────────────
 
@@ -271,6 +272,17 @@ registerHandlers(createTTSToolHandlers());
 registerHandlers(createMcpServersToolHandlers());
 
 // Gateway-proxied tools (send_message, channel_action, proactive) — only when spawned by daemon
+// Known-value scrubbing for writes the agent makes through these tools (SCRUB-N1): the daemon
+// holds the values; this process asks it before storing. Without a token, writes are refused.
+const scrubToken = process.env.KIRIE_SCRUB_TOKEN;
+if (gatewayUrl && scrubToken) {
+  setRemoteScrubber(createGatewayScrubber(gatewayUrl, scrubToken));
+} else if (gatewayUrl) {
+  setRemoteScrubber(async () => {
+    throw new Error("the known-secret check is not configured (no KIRIE_SCRUB_TOKEN); restart Kirie");
+  });
+}
+
 if (gatewayUrl) {
   registerHandlers(createGatewayProxyToolHandlers(gatewayUrl));
   registerHandlers(createGatewayProactiveToolHandlers(gatewayUrl));

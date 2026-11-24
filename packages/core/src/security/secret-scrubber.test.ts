@@ -155,6 +155,18 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
       make: () => ({ input: `sid ${["AC", synth(32, HEX)].join("")}`, expected: `sid ${marker("twilio-account-sid")}` }),
     },
     {
+      rule: "voice-provider-credential",
+      make: () => {
+        const id = ["MA", synth(17, UPPER + DIGITS), "7"].join("");
+        const token = ["Zx9", synth(36), "q7"].join("").slice(0, 40);
+        const tw = ["4f", synth(29, HEX), "a"].join("");
+        return {
+          input: `Plivo auth id ${id}, token ${token}\ntwilio auth token: ${tw}`,
+          expected: `Plivo auth id ${marker("voice-provider-credential")}, token ${marker("voice-provider-credential")}\ntwilio auth token: ${marker("voice-provider-credential")}`,
+        };
+      },
+    },
+    {
       rule: "jwt",
       make: () => {
         const t = ["ey", "J", synth(20, TOKEN), ".", "eyJ", synth(30, TOKEN), ".", synth(43, TOKEN)].join("");
@@ -229,6 +241,111 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
     const out = s.scrub(line, { sink: "log" });
     expect(out.endsWith("\n")).toBe(true);
     expect(JSON.parse(out)).toEqual({ level: 30, msg: marker("private-key"), n: 1 });
+  });
+
+  describe("indented private keys (SCRUB-B1)", () => {
+    const B64 = ALNUM + "+/";
+    const begin = ["-----BEGIN", " PRIVATE KEY-----"].join("");
+    const end = ["-----END", " PRIVATE KEY-----"].join("");
+    const bodyLines = (): string[] => [synth(64, B64), synth(64, B64), `${synth(40, B64)}==`];
+    const block = (indent: string, nl = "\n", lines = bodyLines()): { text: string; lines: string[] } => ({
+      text: [indent + begin, ...lines.map((l) => indent + l), indent + end].join(nl),
+      lines,
+    });
+    const noBody = (out: string, lines: string[]): void => {
+      for (const l of lines) expect(out).not.toContain(l.slice(0, 32));
+      expect(out).not.toContain(end);
+    };
+
+    for (const [label, indent] of [["2 spaces", "  "], ["4 spaces", "    "], ["8 spaces", "        "], ["16 spaces", " ".repeat(16)], ["17 spaces", " ".repeat(17)], ["24 spaces", " ".repeat(24)], ["40 spaces", " ".repeat(40)], ["a tab", "\t"], ["two tabs", "\t\t"], ["five tabs", "\t".repeat(5)]] as const) {
+      it(`redacts the whole key indented by ${label}`, () => {
+        const { text, lines } = block(indent);
+        const out = s.scrub(`config:\n${text}\nnext: 1`);
+        noBody(out, lines);
+        expect(out).toBe(`config:\n${indent}${marker("private-key")}\nnext: 1`);
+      });
+    }
+
+    it("a Kubernetes / Helm YAML block scalar (tls.key: |)", () => {
+      const { text, lines } = block("    ");
+      const yaml = `apiVersion: v1\nkind: Secret\nstringData:\n  tls.key: |\n${text}\n  tls.crt: x\n`;
+      const out = s.scrub(yaml);
+      noBody(out, lines);
+      expect(out).toBe(`apiVersion: v1\nkind: Secret\nstringData:\n  tls.key: |\n    ${marker("private-key")}\n  tls.crt: x\n`);
+    });
+
+    it("a Markdown list item (3 spaces)", () => {
+      const { text, lines } = block("   ");
+      const out = s.scrub(`1. Paste this:\n\n${text}\n\n2. Save.`);
+      noBody(out, lines);
+      expect(out).toContain("2. Save.");
+    });
+
+    it("a Markdown blockquote (> )", () => {
+      const { text, lines } = block("> ");
+      const out = s.scrub(`Here:\n${text}\nThanks`);
+      noBody(out, lines);
+      expect(out).toBe(`Here:\n> ${marker("private-key")}\nThanks`);
+    });
+
+    it("the JSON-escaped form at 20 spaces", () => {
+      const { text, lines } = block(" ".repeat(20));
+      noBody(s.scrub(JSON.stringify({ msg: text }), { sink: "log" }), lines);
+    });
+
+    it("CRLF line endings with indentation", () => {
+      const { text, lines } = block("  ", "\r\n");
+      const out = s.scrub(`k: |\r\n${text}\r\nz: 1`);
+      noBody(out, lines);
+      expect(out).toBe(`k: |\r\n  ${marker("private-key")}\r\nz: 1`);
+    });
+
+    it("the JSON-escaped indented form in a log line", () => {
+      const { text, lines } = block("    ");
+      const line = `${JSON.stringify({ level: 30, msg: `values:\n${text}\nok` })}\n`;
+      const out = s.scrub(line, { sink: "log" });
+      noBody(out, lines);
+      expect(JSON.parse(out)).toEqual({ level: 30, msg: `values:\n    ${marker("private-key")}\nok` });
+    });
+
+    it("the JSON-escaped tab-indented form", () => {
+      const { text, lines } = block("\t");
+      const out = s.scrub(JSON.stringify({ msg: text }), { sink: "log" });
+      noBody(out, lines);
+    });
+
+    it("trailing blanks after body lines", () => {
+      const lines = bodyLines();
+      const text = [begin, ...lines.map((l) => `  ${l}   `), `  ${end}`].join("\n");
+      const out = s.scrub(text);
+      noBody(out, lines);
+      expect(out).toBe(marker("private-key"));
+    });
+
+    it("an unterminated indented block stops at the first prose line", () => {
+      const lines = bodyLines();
+      const text = [`  ${begin}`, ...lines.map((l) => `  ${l}`)].join("\n");
+      const out = s.scrub(`${text}\n\nThat was the key, don't share it!`);
+      noBody(out, lines);
+      expect(out).toBe(`  ${marker("private-key")}\n\nThat was the key, don't share it!`);
+    });
+
+    it("every sink (replies, logs, memory, chat history, task results, cards) redacts the indented body", () => {
+      const sinks = ["channel", "log", "memory", "chat-history", "task-result", "heartbeat-log", "audit", "prompt-card", "proposal"] as const;
+      for (const sink of sinks) {
+        const { text, lines } = block("    ");
+        noBody(s.scrub(`tls.key: |\n${text}`, { sink }), lines);
+      }
+    });
+
+    it("a deeply indented prose line after the body ends the body", () => {
+      const lines = bodyLines();
+      const deep = " ".repeat(40);
+      const text = [begin, lines[0], `${deep}prose after a very deep indent`].join("\n");
+      const out = s.scrub(text);
+      expect(out).not.toContain(lines[0]!.slice(0, 32));
+      expect(out).toContain("prose after a very deep indent");
+    });
   });
 
   it("a BEGIN header mentioned in prose redacts only the header", () => {
@@ -413,6 +530,84 @@ describe("idempotency and markers", () => {
     const out = p.scrub(t);
     expect(out).toBe(`«redacted:github-token:${t.slice(0, 4)}…${t.slice(-4)}»`);
     expect(p.scrub(out)).toBe(out);
+  });
+
+  it("the partial mask needs 32+ characters and never applies to known values (SCRUB-N9)", () => {
+    const p = fresh({ mask: "partial" });
+    const short = mixed(24);
+    expect(p.scrub(`DB_PASSWORD=${short}`)).toBe(`DB_PASSWORD=${marker("secret-assignment")}`);
+    const known = mixed(40);
+    p.addKnownSecret(known, "db");
+    expect(p.scrub(`x ${known} y`)).toBe(`x ${marker("known-secret")} y`);
+  });
+
+  describe("voice provider credentials without a prefix (SCRUB-N2)", () => {
+    it("only near the provider name", () => {
+      const tw = ["4f", synth(29, HEX), "a"].join("");
+      expect(s.scrub(`TWILIO auth token is ${tw}`)).toBe(`TWILIO auth token is ${marker("voice-provider-credential")}`);
+      expect(s.scrub(`${tw} is the twilio token`)).toBe(`${marker("voice-provider-credential")} is the twilio token`);
+      // Far from the name, or with no name at all: an MD5 or a hash is left alone.
+      expect(s.scrub(`md5 ${tw}`)).toBe(`md5 ${tw}`);
+      expect(s.scrub(`twilio${" filler".repeat(30)} ${tw}`)).toContain(tw);
+      // A lower-case git SHA next to "plivo" is not a Plivo token.
+      const sha = synth(40, HEX);
+      expect(s.scrub(`plivo fix in ${sha}`)).toBe(`plivo fix in ${sha}`);
+    });
+
+    it("is linear on many keywords", () => {
+      const text = `twilio ${synth(31, HEX)}g `.repeat(40_000);
+      const t0 = performance.now();
+      s.scrub(text);
+      expect(performance.now() - t0).toBeLessThan(1500);
+    });
+  });
+
+  it("a versioned model id next to token is not a secret; a password still is (SCRUB-N7)", () => {
+    expect(s.scrub("token: claude-opus-5-5")).toBe("token: claude-opus-5-5");
+    expect(s.scrub("model_key: llama-3.1-70")).toBe("model_key: llama-3.1-70");
+    expect(s.scrub("password: correct-horse-battery-9")).toBe(`password: ${marker("secret-assignment")}`);
+    const uuidish = "123e4567-e89b-12d3-a456-426614174000";
+    expect(s.scrub(`token: ${uuidish}`)).toBe(`token: ${marker("secret-assignment")}`);
+  });
+
+  describe("tokens split by invisible characters or Markdown emphasis (SCRUB-N6)", () => {
+    const tok = (): string => ["gh", "p_", synth(36)].join("");
+    it("a zero-width character inside a token", () => {
+      const t = tok();
+      for (const zw of ["\u200B", "\u200C", "\u200D", "\u2060", "\uFEFF", "\u00AD"]) {
+        const out = s.scrub(`key ${t.slice(0, 10)}${zw}${t.slice(10)} end`);
+        expect(out).not.toContain(t.slice(10));
+        expect(out).toBe(`key ${marker("github-token")} end`);
+      }
+    });
+    it("bold, italic, strike or code marks splitting a token", () => {
+      const t = tok();
+      for (const [open, close] of [["**", "**"], ["*", "*"], ["~~", "~~"], ["`", "`"], ["__", "__"]] as const) {
+        const out = s.scrub(`${t.slice(0, 20)}${open}${t.slice(20)}${close} ok`);
+        expect(out, open).not.toContain(t.slice(20));
+        expect(out, open).toContain(marker("github-token"));
+        expect(out, open).toMatch(/ ok$/);
+      }
+    });
+    it("a known value split by a zero-width character", () => {
+      const k = fresh();
+      const v = mixed(24);
+      k.addKnownSecret(v, "db");
+      expect(k.scrub(`pw ${v.slice(0, 8)}\u200B${v.slice(8)}`)).toBe(`pw ${marker("known-secret")}`);
+    });
+    it("ordinary Markdown is untouched and scrubbing stays idempotent", () => {
+      const md = "**Bold** and *italic*, `code`, ~~strike~~, __init__ and a zero\u200Bwidth word.";
+      expect(s.scrub(md)).toBe(md);
+      const t = tok();
+      const once = s.scrub(`**${t.slice(0, 15)}**${t.slice(15)}`);
+      expect(s.scrub(once)).toBe(once);
+    });
+  });
+
+  it("a Telegram bot token with an 11 or 12 digit bot id (SCRUB-N10)", () => {
+    const secret = ["AA", synth(33, TOKEN)].join("");
+    expect(s.scrub(`12345678901:${secret}`)).toBe(`12345678901:${marker("telegram-bot-token")}`);
+    expect(s.scrub(`123456789012:${secret}`)).toBe(`123456789012:${marker("telegram-bot-token")}`);
   });
 });
 
@@ -624,6 +819,18 @@ describe("timing on 1 MB adversarial input", () => {
     "AKIA runs": fill("AKIA"),
     "quoted keyword values": fill('"secret": "'),
     "flags": fill("--token "),
+    "BEGIN + indented short lines": fill(`-----BEGIN PRIVATE KEY-----\n${" ".repeat(16)}A\n`),
+    "BEGIN + long blank runs": fill(`-----BEGIN PRIVATE KEY-----\n${" ".repeat(300)}`),
+    "BEGIN + blank runs mid-line": fill(`-----BEGIN PRIVATE KEY-----\nAAAA${" ".repeat(15)}x`),
+    "BEGIN + escaped tabs": fill(`-----BEGIN PRIVATE KEY-----\\n${"\\t".repeat(40)}`),
+    "body of alternating blanks": `-----BEGIN PRIVATE KEY-----\n${fill(" \t\n")}`,
+    "body of blank lines": `-----BEGIN PRIVATE KEY-----\n${fill(`${" ".repeat(15)}\n`)}`,
+    "provider names": fill("plivo twilio "),
+    "emphasis marks": fill("**"),
+    "emphasis between prefixes": fill("gh*p_*sk-*"),
+    "zero-width runs": fill("\u200B"),
+    "zero-width in token chars": fill("ghp_\u200Babc"),
+    "provider names and near-tokens": fill(`twilio ${"a1".repeat(15)}b plivo ${"Ab1".repeat(13)} `),
   };
 
   const known = fresh();

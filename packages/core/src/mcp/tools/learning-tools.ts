@@ -6,6 +6,7 @@ import type { McpToolDefinition } from "../server.js";
 import { LearningConfigSchema, type LearningConfig } from "../../config/sections/learning.js";
 import { AuditTrail } from "../../security/audit-trail.js";
 import { scrubSecrets } from "../../security/secret-scrubber.js";
+import { scrubBeforeStore } from "../../security/remote-scrub.js";
 import { createModuleLogger } from "../../logging/logger.js";
 import { LearningIntake, type ProposalSubmission } from "../../learning/intake.js";
 import { learningDbPath, openLearningDb, type LearningDb } from "../../learning/learning-db.js";
@@ -126,7 +127,13 @@ export const createLearningTools: FeatureToolFactory = (ctx) => {
         },
         required: ["kind", "title", "payload", "sessionKey"],
       },
-      handler: (params) => {
+      handler: async (rawParams) => {
+        // Known values (the daemon's scrubber, SCRUB-N1) before anything is stored.
+        const params: Record<string, unknown> = { ...rawParams };
+        for (const field of ["title", "rationale", "payload"] as const) {
+          const v = str(rawParams, field);
+          if (v !== undefined) params[field] = (await scrubBeforeStore(v, "proposal")).text;
+        }
         const kind = str(params, "kind") as ProposeKind | undefined;
         if (!kind || !(PROPOSE_KINDS as readonly string[]).includes(kind)) {
           return { error: `kind must be one of: ${PROPOSE_KINDS.join(", ")}` };
