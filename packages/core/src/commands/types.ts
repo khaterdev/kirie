@@ -86,7 +86,7 @@ export type DispatchOutcome =
   /** "/name" that is not registered. Continue to the agent unless `replied` (commands.unknownCommand: "reply") */
   | { kind: "unknown"; name: string; replied: boolean }
   /** Stop, no reply */
-  | { kind: "ignored"; reason: "other-bot" | "edited" }
+  | { kind: "ignored"; reason: "other-bot" | "edited" | "forwarded" }
   /** Stop. The refusal has been sent. Never forwarded to the agent */
   | { kind: "denied"; reason: "owner-only" | "dm-only"; reply: CommandReply }
   /** Stop. The reply, if any, has been sent */

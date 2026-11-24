@@ -208,6 +208,8 @@ async function normalizeMessage(
     threadId: resolveThreadId(message),
     replyToId: message.reference?.messageId ?? undefined,
     replyTo,
+    // MessageReferenceType.Forward (1): the text is someone else's words.
+    ...((message.reference as { type?: number } | null)?.type === 1 ? { isForwarded: true } : {}),
     media: media.length > 0 ? media : undefined,
     timestamp: message.createdTimestamp,
     raw: message,

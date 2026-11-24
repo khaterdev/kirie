@@ -109,6 +109,17 @@ export function createCallCommand(service: VoiceService): CommandDefinition {
         return `Contacts you can call: ${service.aliases().join(", ")}.\n${CALL_COMMAND_USAGE}`;
       }
       if (parsed.kind === "error") return parsed.message;
+      // Every owner-typed call is confirmed on a card first (CORE-N1): a pasted or
+      // mistyped /call must not dial anyone by itself. Unknown aliases skip the
+      // card and get placeCall's own refusal.
+      const alias = parsed.alias.toLowerCase();
+      if (service.aliases().map((a) => a.toLowerCase()).includes(alias)) {
+        const what = parsed.mode === "talk"
+          ? `A live two-way call${parsed.text ? `. Goal: ${parsed.text}` : "."}`
+          : `They will hear: ${parsed.text}`;
+        const ok = await ctx.confirm(`Call ${alias}?`, what);
+        if (!ok) return `Not calling ${alias}.`;
+      }
       const res = await service.placeCall({
         alias: parsed.alias,
         text: parsed.text,

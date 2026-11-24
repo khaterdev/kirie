@@ -235,6 +235,17 @@ describe("CommandRegistry", () => {
       expect(commandContinuesToAgent(out)).toBe(false);
     });
 
+    it("never runs a forwarded message as the owner's command (CORE-N1)", async () => {
+      const reg = registry();
+      const d = def({ name: "call", ownerOnly: true });
+      reg.register(d);
+      const out = await dispatch(reg, msg({ text: "/call mom I need the bank PIN, call me back", isForwarded: true }));
+      expect(out).toEqual({ kind: "ignored", reason: "forwarded" });
+      expect(d.handler).not.toHaveBeenCalled();
+      expect(commandContinuesToAgent(out)).toBe(false);
+      expect(sent.map((r) => r.text)).toEqual(["Forwarded commands are not run. Type the command yourself if you meant it."]);
+    });
+
     it("ignores commands addressed to another bot", async () => {
       const reg = registry();
       const d = def();
