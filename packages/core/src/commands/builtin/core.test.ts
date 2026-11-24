@@ -162,6 +162,16 @@ describe("built-in core commands", () => {
     expect(registry.menu({ forOwner: true })).toHaveLength(14);
   });
 
+  it("in a group, only the owner can /clear, and /context hides the session key from others (CORE-N5)", async () => {
+    const group = { chatType: "group" as const, chatId: "-100555" };
+    expect((await run("/clear", { ...group, senderId: STRANGER })).texts[0]).toContain("Only the owner");
+    expect(deps.pipeline!.clearSession).not.toHaveBeenCalled();
+    expect((await run("/clear", group)).texts[0]).toContain("Chat context cleared");
+    expect(deps.pipeline!.clearSession).toHaveBeenCalledTimes(1);
+    expect((await run("/context", { ...group, senderId: STRANGER })).texts[0]).not.toContain("Session:");
+    expect((await run("/context", group)).texts[0]).toContain("Session: telegram:group:-100555");
+  });
+
   it("/pending lists codes, what each is and options; /approve, /deny, /answer name what they answered", async () => {
     const pending = (await run("/pending")).texts[0]!;
     expect(pending).toContain("K7Q2  Bash: rm -rf build");

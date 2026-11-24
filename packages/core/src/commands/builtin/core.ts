@@ -172,6 +172,8 @@ export function createCoreCommands(deps: CoreCommandDeps): CommandDefinition[] {
       scope: "any",
       handler(ctx) {
         if (!deps.pipeline) return "Pipeline not available.";
+        // In a group the session is shared: only the owner may wipe it (CORE-N5).
+        if (ctx.message.chatType !== "dm" && !ctx.isOwner) return "Only the owner can clear a group's conversation.";
         deps.pipeline.clearSession(ctx.sessionKey);
         return "Chat context cleared. Next message starts a fresh conversation.";
       },
@@ -199,7 +201,9 @@ export function createCoreCommands(deps: CoreCommandDeps): CommandDefinition[] {
       handler(ctx) {
         const sessionKey = ctx.sessionKey;
         const row = deps.sessionStore.getRow(sessionKey);
-        const lines = ["Chat Context", `  Session: ${sessionKey}`];
+        // The session key names the chat; in a group only the owner sees it (CORE-N5).
+        const showKey = ctx.message.chatType === "dm" || ctx.isOwner;
+        const lines = ["Chat Context", ...(showKey ? [`  Session: ${sessionKey}`] : [])];
         if (row) {
           lines.push(`  Started: ${row.created_at}`);
           lines.push(`  Last active: ${row.updated_at}`);
