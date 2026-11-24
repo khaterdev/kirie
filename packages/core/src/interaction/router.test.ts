@@ -100,6 +100,16 @@ describe("InteractionRouter", () => {
       expect(rec[0]).toMatchObject({ action: "press.denied", actor: "user:telegram:2002", detail: { reason: "not-owner" } });
     });
 
+    it("audits at most 5 denied presses per sender per minute, but still acks every one (CORE-N3)", async () => {
+      for (let n = 0; n < 30; n++) await adapter.press({ data: "k1|prop|a:1:abcd", senderId: "2002", chatId: "2002" });
+      expect(handler).not.toHaveBeenCalled();
+      expect(adapter.acks).toHaveLength(30);
+      expect(audit.recent({ feature: "interaction" }).filter((r) => r.action === "press.denied")).toHaveLength(5);
+      // Another stranger has their own budget.
+      await adapter.press({ data: "k1|prop|a:1:abcd", senderId: "2003", chatId: "2003" });
+      expect(audit.recent({ feature: "interaction" }).filter((r) => r.action === "press.denied")).toHaveLength(6);
+    });
+
     it("does not route an owner press from a group chat", async () => {
       await adapter.press({ data: "k1|prop|a:1:abcd", chatType: "group", chatId: "-100555" });
       expect(handler).not.toHaveBeenCalled();
