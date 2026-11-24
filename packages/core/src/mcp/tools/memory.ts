@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { getScrubber, scrubSecretsWithCount } from "../../security/secret-scrubber.js";
+import { scrubBeforeStore } from "../../security/remote-scrub.js";
 
 /**
  * Compute a SHA-256 hex digest of the given content string.
@@ -309,14 +310,22 @@ export function createMemoryToolHandlers(store: MemoryStore, memoryManager?: Mem
         },
         required: ["key", "content"] as const,
       },
-      handler(params: { key: string; content: string; tags?: string[] }): (MemoryEntry & { notice?: string }) | Promise<MemoryEntry & { notice?: string }> {
-        const { text, count } = scrubForMemory(params.content);
+      async handler(params: { key: string; content: string; tags?: string[] }): Promise<MemoryEntry & { notice?: string }> {
+        // Known values first (the daemon's scrubber, SCRUB-N1), then patterns. Before embedding.
+        if ((await scrubBeforeStore(String(params.key ?? ""), "memory")).count > 0) {
+          throw new Error("Memory key looks like it contains a secret. Use a descriptive key; store secrets with: kirie credentials set <key> <value>");
+        }
+        const known = await scrubBeforeStore(params.content, "memory");
+        const tags = params.tags ? await Promise.all(params.tags.map(async (t) => (await scrubBeforeStore(t, "memory")).text)) : undefined;
+        const { text, count: patternCount } = scrubForMemory(known.text);
+        const count = known.count + patternCount;
         const withNotice = (entry: MemoryEntry): MemoryEntry & { notice?: string } =>
           count > 0 ? { ...entry, notice: secretRedactionNotice(count) } : entry;
         if (memoryManager) {
-          return memoryManager.store(params.key, text, params.tags).then(() => withNotice(store.recall(params.key)!));
+          await memoryManager.store(params.key, text, tags);
+          return withNotice(store.recall(params.key)!);
         }
-        return withNotice(store.store(params.key, text, params.tags));
+        return withNotice(store.store(params.key, text, tags));
       },
     },
 
@@ -337,8 +346,10 @@ export function createMemoryToolHandlers(store: MemoryStore, memoryManager?: Mem
         },
         required: ["key", "content"] as const,
       },
-      handler(params: { key: string; content: string; chunkTokens?: number; chunkOverlap?: number; tags?: string[] }): Promise<{ chunks: number; skipped: number; notice?: string }> | { chunks: number; skipped: number; notice?: string } {
-        const { text, count } = scrubForMemory(params.content);
+      async handler(params: { key: string; content: string; chunkTokens?: number; chunkOverlap?: number; tags?: string[] }): Promise<{ chunks: number; skipped: number; notice?: string }> {
+        const known = await scrubBeforeStore(params.content, "memory");
+        const { text, count: patternCount } = scrubForMemory(known.text);
+        const count = known.count + patternCount;
         const withNotice = (r: { chunks: number; skipped: number }) =>
           count > 0 ? { ...r, notice: secretRedactionNotice(count) } : r;
         if (memoryManager) {

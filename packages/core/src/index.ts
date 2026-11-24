@@ -86,6 +86,7 @@ export * from "./config/runtime-settings.js";
 export * from "./security/audit-trail.js";
 // Secret scrubber (PLAN B.8)
 export * from "./security/secret-scrubber.js";
+export * from "./security/remote-scrub.js";
 export * from "./security/secret-patterns.js";
 export * from "./engine/agent-registry.js";
 export * from "./engine/media-output-parser.js";

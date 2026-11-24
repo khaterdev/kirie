@@ -9,9 +9,11 @@
  * configure call: a config reload or restart cannot turn it off.
  */
 
+import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
+  createScrubApp,
   isPlausibleSecretValue,
   isSecretAssignmentName,
   resolveScrubbingConfig,
@@ -175,9 +177,16 @@ export function sanitizeErrorForLog(reason: unknown): { name: string; message: s
 export const SCRUBBING_OFF_NOTICE =
   "Secret scrubbing is OFF (security.scrubbing.enabled: false). Replies, logs and stores are not scrubbed for secrets until it is turned back on and Kirie restarts.";
 
-/** Scrubbing (PLAN B.10 "scrubbing"): the stdio subprocess config and the off warning. */
+/**
+ * Scrubbing (PLAN B.10 "scrubbing"): the stdio subprocess config, the known-value
+ * route for its writes (SCRUB-N1: `/api/scrub/text`, guarded by a per-boot token
+ * in the subprocess env) and the off warning.
+ */
 export const setupScrubbing: FeatureSetup = (ctx) => {
   ctx.kirieToolsEnv.KIRIE_SCRUB_CONFIG = JSON.stringify(freezeScrubbingConfig(daemonScrubbingConfig(ctx.config)));
+  const token = randomBytes(32).toString("hex");
+  ctx.kirieToolsEnv.KIRIE_SCRUB_TOKEN = token;
+  ctx.internalApi.mount("scrub", createScrubApp({ scrubber: ctx.scrubber, token }));
   const enabled = ctx.scrubber.isEnabled();
   return {
     name: "scrubbing",

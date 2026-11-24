@@ -88,11 +88,13 @@ describe("FEATURES", () => {
     expect(handles.map((h) => h.name)).toEqual(STUB_FEATURES.map((f) => f.name));
     const started = await startFeatures(handles);
     expect(started).toHaveLength(STUB_FEATURES.length);
-    // Only core-commands registers commands and an addendum; only scrubbing sets an env key.
+    // Only core-commands registers commands and an addendum; only scrubbing sets env keys and
+    // mounts a route (the known-value scrub for the tools subprocess, SCRUB-N1).
     expect(ctx.commands.list()).toHaveLength(14);
     expect(ctx.promptAddenda.names()).toEqual(["commands"]);
-    expect(Object.keys(ctx.kirieToolsEnv)).toEqual(["KIRIE_SCRUB_CONFIG"]);
-    expect(ctx.internalApi.apps()).toEqual([]);
+    expect(Object.keys(ctx.kirieToolsEnv)).toEqual(["KIRIE_SCRUB_CONFIG", "KIRIE_SCRUB_TOKEN"]);
+    expect(ctx.kirieToolsEnv.KIRIE_SCRUB_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+    expect(ctx.internalApi.apps().map((a) => a.name)).toEqual(["scrub"]);
     expect(ctx.notifyOwner).not.toHaveBeenCalled();
     await stopFeatures(started);
   });

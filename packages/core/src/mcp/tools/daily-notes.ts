@@ -4,6 +4,7 @@
  */
 
 import { scrubForMemory, secretRedactionNotice } from "./memory.js";
+import { scrubBeforeStore } from "../../security/remote-scrub.js";
 
 interface MemoryStoreLike {
   recall(key: string): { content: string; tags: string[] } | null;
@@ -49,7 +50,9 @@ export function createDailyNoteToolHandlers(
         const date = params.date as string | undefined;
         const key = date ? `daily:${date}` : todayKey();
         const dateStr = key.replace("daily:", "");
-        const { text: content, count: redacted } = scrubForMemory(params.content as string);
+        const known = await scrubBeforeStore(String(params.content ?? ""), "memory");
+        const { text: content, count: patternCount } = scrubForMemory(known.text);
+        const redacted = known.count + patternCount;
 
         const existing = memoryStore.recall(key);
         const timestamp = new Date().toLocaleTimeString("en-US", {

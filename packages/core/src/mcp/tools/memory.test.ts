@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { MemoryStore, createMemoryToolHandlers, type MemoryManagerLike } from "./memory.js";
+import { createGatewayScrubber, createScrubApp, setRemoteScrubber } from "../../security/remote-scrub.js";
+import { SecretScrubber } from "../../security/secret-scrubber.js";
 
 const TEST_DIR = `/tmp/kirie-memory-test-${process.pid}`;
 const TEST_DB = join(TEST_DIR, "memory.db");
@@ -203,12 +205,12 @@ describe("secret scrubbing (memory sink)", () => {
     expect(store.store("plain", text).content).toBe(text);
   });
 
-  it("memory_store adds a notice when something was redacted", () => {
+  it("memory_store adds a notice when something was redacted", async () => {
     const handlers = createMemoryToolHandlers(store);
-    const result = handlers.memory_store.handler({ key: "k", content: `PASSWORD=Zx9Cv8Bn7Mq6 and ${token()}` }) as { content: string; notice?: string };
+    const result = await handlers.memory_store.handler({ key: "k", content: `PASSWORD=Zx9Cv8Bn7Mq6 and ${token()}` });
     expect(result.content).not.toContain(body());
     expect(result.notice).toBe("2 secret(s) were redacted before storing. Store secrets with: kirie credentials set <key> <value>");
-    const clean = handlers.memory_store.handler({ key: "k2", content: "nothing secret" }) as { notice?: string };
+    const clean = await handlers.memory_store.handler({ key: "k2", content: "nothing secret" });
     expect(clean.notice).toBeUndefined();
   });
 
@@ -229,11 +231,70 @@ describe("secret scrubbing (memory sink)", () => {
     expect(doc.notice).toMatch(/^1 secret/);
   });
 
-  it("memory_store_document fallback stores scrubbed text with a notice", () => {
+  it("memory_store_document fallback stores scrubbed text with a notice", async () => {
     const handlers = createMemoryToolHandlers(store);
-    const result = handlers.memory_store_document.handler({ key: "doc", content: `doc ${token()}` }) as { chunks: number; notice?: string };
+    const result = await handlers.memory_store_document.handler({ key: "doc", content: `doc ${token()}` });
     expect(result.chunks).toBe(1);
     expect(result.notice).toMatch(/^1 secret/);
     expect(store.recall("doc")!.content).toBe(`doc ${MARK}`);
+  });
+
+  describe("known values held by the daemon (SCRUB-N1)", () => {
+    // A bare Twilio-style auth token: no prefix, no label, so no pattern catches it.
+    const KNOWN = ["9c1f", "0b7e", "44d2", "a8c3", "51e6", "f0d9", "2b74", "c6a1"].join("");
+    afterEach(() => setRemoteScrubber(null));
+
+    it("without the daemon's values a bare credential is not caught by patterns", async () => {
+      const handlers = createMemoryToolHandlers(store);
+      const r = await handlers.memory_store.handler({ key: "v1", content: `voice creds ${KNOWN}` });
+      expect(r.content).toContain(KNOWN);
+    });
+
+    it("memory_store, memory_store_document and daily notes ask the daemon first and store its scrubbed text", async () => {
+      const daemon = new SecretScrubber();
+      daemon.addKnownSecret(KNOWN, "credential:voice.twilio.authToken");
+      const app = createScrubApp({ scrubber: daemon, token: "t0k" });
+      const fetchFn = (async (url: string, init: RequestInit) => app.request(new URL(url).pathname.replace(/^\/api\/scrub/, ""), init)) as unknown as typeof fetch;
+      setRemoteScrubber(createGatewayScrubber("http://127.0.0.1:18789", "t0k", { fetchFn }));
+      const manager = {
+        store: vi.fn(async (key: string, content: string, tags?: string[]) => {
+          store.store(key, content, tags);
+        }),
+        storeDocument: vi.fn(async () => ({ chunks: 1, skipped: 0 })),
+      } as unknown as MemoryManagerLike;
+      const handlers = createMemoryToolHandlers(store, manager);
+      const r = await handlers.memory_store.handler({ key: "v2", content: `voice creds ${KNOWN}`, tags: [KNOWN] });
+      // Scrubbed before the manager (and its embedder) ever saw it.
+      expect((manager.store as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe("voice creds «redacted:known-secret»");
+      expect(r.notice).toMatch(/^1 secret/);
+      expect(store.recall("v2")!.tags).toEqual(["«redacted:known-secret»"]);
+      await handlers.memory_store_document.handler({ key: "d2", content: `doc ${KNOWN}` });
+      expect((manager.storeDocument as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe("doc «redacted:known-secret»");
+      await expect(handlers.memory_store.handler({ key: `k-${KNOWN}`, content: "x" })).rejects.toThrow(/looks like it contains a secret/);
+    });
+
+    it("refuses the write when the daemon cannot be asked (fail closed)", async () => {
+      setRemoteScrubber(createGatewayScrubber("http://127.0.0.1:9", "t0k", { fetchFn: (async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch }));
+      const handlers = createMemoryToolHandlers(store);
+      await expect(handlers.memory_store.handler({ key: "v3", content: `x ${KNOWN}` })).rejects.toThrow(/known-secret check is unavailable/);
+      expect(store.recall("v3")).toBeNull();
+    });
+
+    it("the route needs the token, a store sink and is rate limited", async () => {
+      const daemon = new SecretScrubber();
+      daemon.addKnownSecret(KNOWN, "k");
+      let t = 0;
+      const app = createScrubApp({ scrubber: daemon, token: "t0k", now: () => t });
+      const post = (body: unknown, token = "t0k") =>
+        app.request("/text", { method: "POST", headers: { "content-type": "application/json", "x-kirie-scrub-token": token }, body: JSON.stringify(body) });
+      expect((await post({ text: KNOWN, sink: "memory" }, "nope")).status).toBe(403);
+      expect((await post({ text: KNOWN, sink: "channel" })).status).toBe(400);
+      const ok = await post({ text: `a ${KNOWN}`, sink: "memory" });
+      expect(await ok.json()).toEqual({ text: "a «redacted:known-secret»", count: 1 });
+      for (let i = 0; i < 599; i++) await post({ text: "x", sink: "memory" });
+      expect((await post({ text: "x", sink: "memory" })).status).toBe(429);
+      t += 60_000;
+      expect((await post({ text: "x", sink: "memory" })).status).toBe(200);
+    });
   });
 });
