@@ -191,7 +191,10 @@ interface PendingPrompt {
   readonly defaultOptionId: string;
   readonly expiresAt: number;
   readonly channel: ChannelName;
-  readonly chatId: string;
+  /** The chat the card is in. Starts as the owner's configured id; the adapter may resolve it (Discord user id to DM channel) */
+  chatId: string;
+  /** The owner's configured chat id the prompt was addressed to */
+  readonly targetChatId: string;
   /** Set once the card was sent. Presses before that are refused */
   messageId: string | null;
   /** Whether the card carries buttons (and can be updated with updateInteractive) */
@@ -340,6 +343,7 @@ export class OwnerPrompts {
         expiresAt: Date.now() + timeoutMs,
         channel: target.channel,
         chatId: target.chatId,
+        targetChatId: target.chatId,
         messageId: null,
         interactive,
         done: false,
@@ -410,12 +414,12 @@ export class OwnerPrompts {
     try {
       if (rows.length > 0 && canSendButtons(adapter)) {
         const sent = await adapter.sendInteractive!({ ctx, text, buttons: rows, plain });
-        return { channel: target.channel, chatId: target.chatId, messageId: sent.id };
+        return { channel: target.channel, chatId: sent.chatId ?? target.chatId, messageId: sent.id };
       }
       const sent = await adapter.sendText({ ctx, text, plain });
       const last = sent[sent.length - 1];
       if (!last) return null;
-      return { channel: target.channel, chatId: target.chatId, messageId: last.id };
+      return { channel: target.channel, chatId: last.chatId ?? target.chatId, messageId: last.id };
     } catch (err) {
       log.warn({ err: err instanceof Error ? err.message : String(err) }, "owner card send failed");
       return null;
@@ -451,7 +455,7 @@ export class OwnerPrompts {
       const recent = this.recentCodes.get(wanted);
       return recent ? { status: "closed", kind: recent.kind, summary: recent.summary } : { status: "not-found" };
     }
-    if (by.channel !== entry.channel || (by.chatId !== undefined && by.chatId !== entry.chatId)) {
+    if (by.channel !== entry.channel || (by.chatId !== undefined && by.chatId !== entry.chatId && by.chatId !== entry.targetChatId)) {
       return { status: "wrong-chat", channel: entry.channel };
     }
     const named = { kind: entry.kind, summary: entry.summary };
@@ -546,14 +550,18 @@ export class OwnerPrompts {
     const ctx = { chatId: entry.chatId };
     try {
       let messageId: string | undefined;
+      let landedIn: string | undefined;
       if (entry.interactive) {
         const sent = await adapter.sendInteractive!({ ctx, text: entry.text, buttons: this.buttonRows(entry), plain: true });
         messageId = sent.id;
+        landedIn = sent.chatId;
       } else {
         const sent = await adapter.sendText({ ctx, text: entry.text, plain: true });
         messageId = sent[sent.length - 1]?.id;
+        landedIn = sent[sent.length - 1]?.chatId;
       }
       if (!messageId) throw new Error("no message id returned");
+      if (landedIn) entry.chatId = landedIn;
       entry.messageId = messageId;
       this.deps.audit.record({
         feature: "prompts",

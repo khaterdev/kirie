@@ -42,6 +42,12 @@ type SendableChannel = TextChannel | DMChannel | NewsChannel | ThreadChannel;
 
 const MAX_TEXT_LENGTH = 2000;
 
+/** `{ chatId }` when the message landed in another chat than the id passed in (a user id resolved to a DM). */
+function resolvedChatId(channel: { id?: string }, chatId: string, threadId?: string): { chatId?: string } {
+  if (threadId || typeof channel.id !== "string" || channel.id === chatId) return {};
+  return { chatId: channel.id };
+}
+
 /** Configuration for the Discord adapter */
 export interface DiscordAdapterConfig {
   /** Bot token */
@@ -71,6 +77,8 @@ export class DiscordAdapter implements ChannelAdapter {
   private lastError: string | undefined;
   private lastErrorAt: number | undefined;
   private readonly listeners: MessageListener[] = [];
+  /** DM channels opened by user id (owner prompts and notices address the owner's user id). */
+  private readonly dmChannels = new Map<string, SendableChannel>();
   private readonly config: DiscordAdapterConfig;
   private botId: string | undefined;
 
@@ -176,6 +184,7 @@ export class DiscordAdapter implements ChannelAdapter {
       results.push({
         id: sent.id,
         timestamp: sent.createdTimestamp,
+        ...(resolvedChatId(channel, params.ctx.chatId, params.ctx.threadId)),
       });
     }
 
@@ -242,13 +251,43 @@ export class DiscordAdapter implements ChannelAdapter {
     this.ensureConnected();
 
     const targetId = threadId ?? chatId;
-    const channel = await this.client!.channels.fetch(targetId);
+    let channel: Awaited<ReturnType<Client["channels"]["fetch"]>> | SendableChannel | null = null;
+    let fetchError: unknown = null;
+    try {
+      channel = await this.client!.channels.fetch(targetId);
+    } catch (err) {
+      fetchError = err;
+    }
 
+    if ((!channel || !("send" in channel)) && !threadId) {
+      // The owner's primary DM is configured as the owner's user id (CORE-N4):
+      // open that user's DM channel.
+      const dm = await this.openDm(targetId);
+      if (dm) return dm;
+    }
+    if (fetchError) throw fetchError;
     if (!channel || !("send" in channel)) {
       throw new Error(`Channel ${targetId} not found or is not text-based`);
     }
 
     return channel as SendableChannel;
+  }
+
+  /** The DM channel with a user, by user id. Null when the id is not a reachable user. */
+  private async openDm(userId: string): Promise<SendableChannel | null> {
+    if (!/^\d{15,22}$/.test(userId)) return null;
+    const cached = this.dmChannels.get(userId);
+    if (cached) return cached;
+    try {
+      const users = (this.client as unknown as { users?: { fetch(id: string): Promise<{ createDM(): Promise<DMChannel> }> } }).users;
+      if (!users) return null;
+      const user = await users.fetch(userId);
+      const dm = await user.createDM();
+      this.dmChannels.set(userId, dm);
+      return dm;
+    } catch {
+      return null;
+    }
   }
 
   async sendMediaBatch(params: { ctx: import("@kirie/core").ChannelContext; media: import("@kirie/core").UnifiedMedia[] }): Promise<SentMessage[]> {

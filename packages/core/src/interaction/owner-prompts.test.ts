@@ -471,6 +471,19 @@ describe("OwnerPrompts", () => {
       expect(await p).toMatchObject({ outcome: "cancelled" });
     });
 
+    it("Discord: the card goes to the owner's user id, lands in the DM channel, and /approve typed there works (CORE-N4)", async () => {
+      const USER = "123456789012345678";
+      build({ adapter: makeFakeAdapter("discord", { buttons: false, dmChatId: "DM-555" }), owners: new OwnerDirectory({ ...none, discord: [USER] }) });
+      const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", summary: "Bash: ls", timeoutMs: 60_000 });
+      await flush();
+      expect(adapter.sentText[0]!.ctx.chatId).toBe(USER);
+      const { code } = prompts.pending()[0]!;
+      expect(await prompts.answerByCode(code, "approve", { channel: "discord", senderId: USER, chatId: "DM-555" })).toMatchObject({ status: "ok" });
+      expect(await p).toMatchObject({ outcome: "approved" });
+      await flush();
+      expect(adapter.edits.at(-1)).toMatchObject({ chatId: "DM-555" });
+    });
+
     it("isOpenPromptCard is true only for the live card of a pending prompt", async () => {
       const p = prompts.requestApproval({ kind: "approval", title: "Approval needed", timeoutMs: 600_000 });
       await flush();
