@@ -288,7 +288,7 @@ describe("secret scrubbing (memory sink)", () => {
       const post = (body: unknown, token = "t0k") =>
         app.request("/text", { method: "POST", headers: { "content-type": "application/json", "x-kirie-scrub-token": token }, body: JSON.stringify(body) });
       expect((await post({ text: KNOWN, sink: "memory" }, "nope")).status).toBe(403);
-      expect((await post({ text: KNOWN, sink: "channel" })).status).toBe(400);
+      expect((await post({ text: KNOWN, sink: "log" })).status).toBe(400);
       const ok = await post({ text: `a ${KNOWN}`, sink: "memory" });
       expect(await ok.json()).toEqual({ text: "a «redacted:known-secret»", count: 1 });
       for (let i = 0; i < 599; i++) await post({ text: "x", sink: "memory" });
