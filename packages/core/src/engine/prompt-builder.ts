@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 import { appendPromptAddenda, type PromptAddendaRenderer } from "./prompt-addenda.js";
+import type { TurnOrigin } from "./turn-context.js";
 
 /**
  * Channel context passed into the prompt builder to give the agent
@@ -28,6 +29,17 @@ export interface SenderIdentity {
   platformId: string;
   /** Resolved role in the Kirie permission model */
   role: "owner" | "admin" | "user" | "readonly";
+  /**
+   * Who or what started the turn. The pipeline always sets it. An injected
+   * turn (schedule, loop, ...) carries the owner's id but is not the owner
+   * talking, so it does not count as the owner's DM (CORE-N2).
+   */
+  origin?: TurnOrigin;
+}
+
+/** The owner talking in their own DM: owner role, a DM, and (when known) a turn the owner's own message started. */
+export function isOwnerDmTurn(role: string | undefined, chatType: string | undefined, origin: TurnOrigin | undefined): boolean {
+  return role === "owner" && chatType === "dm" && (origin === undefined || origin === "owner_message");
 }
 
 /**
@@ -556,7 +568,7 @@ function buildAppendedPrompt(
     channel: channel.channel,
     chatType: channel.chatType,
     senderRole: sender.role,
-    ownerDm: sender.role === "owner" && channel.chatType === "dm",
+    ownerDm: isOwnerDmTurn(sender.role, channel.chatType, sender.origin),
   });
 }
 

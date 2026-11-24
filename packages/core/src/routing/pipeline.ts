@@ -679,12 +679,12 @@ export class MessagePipeline {
       this.abortSession(route.sessionKey);
     }
 
-    const sender = identityToSender(gateResult.identity, message.senderName);
     const origin: TurnOrigin = inject
       ? inject.origin
       : source === "channel" && this.config.owners?.isOwner(message.channel, message.senderId)
         ? "owner_message"
         : "other_user";
+    const sender: SenderIdentity = { ...identityToSender(gateResult.identity, message.senderName), origin };
     let userMsgId: number | undefined;
     let assistantMsgId: number | undefined;
     const inputs: TurnInputs = {

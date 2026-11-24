@@ -17,6 +17,7 @@
 
 import { randomUUID } from "node:crypto";
 import { createModuleLogger } from "../logging/logger.js";
+import type { TurnOrigin } from "./turn-context.js";
 import type {
   CanUseTool,
   HookCallback,
@@ -52,7 +53,11 @@ export interface SdkCallContext {
   readonly chatType?: "dm" | "group" | "channel" | string;
   /** Role of the sender whose message opened the session (chat only). */
   readonly senderRole?: string;
-  /** Chat session in a configured owner's DM. */
+  /**
+   * The owner talking in their own DM: owner role, a DM, and a turn started by
+   * the owner's own message. Injected turns (schedule, loop) in the owner's DM
+   * are not. Gates that grant power must still check the origin themselves.
+   */
   readonly ownerDm: boolean;
   /** True only for kind "chat". */
   readonly interactive: boolean;
@@ -189,6 +194,8 @@ export function chatCallContext(input: {
   channel: string;
   chatType: string;
   senderRole?: string;
+  /** The turn's origin. Anything but "owner_message" makes ownerDm false (CORE-N2) */
+  origin?: TurnOrigin;
   cwd: string;
 }): SdkCallContext {
   return {
@@ -197,7 +204,7 @@ export function chatCallContext(input: {
     channel: input.channel,
     chatType: input.chatType,
     ...(input.senderRole !== undefined ? { senderRole: input.senderRole } : {}),
-    ownerDm: input.senderRole === "owner" && input.chatType === "dm",
+    ownerDm: input.senderRole === "owner" && input.chatType === "dm" && (input.origin === undefined || input.origin === "owner_message"),
     interactive: true,
     label: `chat ${input.channel}:${input.chatType}`,
     cwd: input.cwd,

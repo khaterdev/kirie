@@ -262,6 +262,7 @@ export class AgentEngine implements AgentExecutor {
       channel: message.channel,
       chatType: message.chatType,
       senderRole: sender.role,
+      ...(sender.origin !== undefined ? { origin: sender.origin } : {}),
       cwd: this.config.cwd ?? process.cwd(),
     });
 
