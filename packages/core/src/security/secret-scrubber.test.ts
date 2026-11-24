@@ -231,6 +231,99 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
     expect(JSON.parse(out)).toEqual({ level: 30, msg: marker("private-key"), n: 1 });
   });
 
+  describe("indented private keys (SCRUB-B1)", () => {
+    const B64 = ALNUM + "+/";
+    const begin = ["-----BEGIN", " PRIVATE KEY-----"].join("");
+    const end = ["-----END", " PRIVATE KEY-----"].join("");
+    const bodyLines = (): string[] => [synth(64, B64), synth(64, B64), `${synth(40, B64)}==`];
+    const block = (indent: string, nl = "\n", lines = bodyLines()): { text: string; lines: string[] } => ({
+      text: [indent + begin, ...lines.map((l) => indent + l), indent + end].join(nl),
+      lines,
+    });
+    const noBody = (out: string, lines: string[]): void => {
+      for (const l of lines) expect(out).not.toContain(l.slice(0, 32));
+      expect(out).not.toContain(end);
+    };
+
+    for (const [label, indent] of [["2 spaces", "  "], ["4 spaces", "    "], ["8 spaces", "        "], ["16 spaces", " ".repeat(16)], ["a tab", "\t"], ["two tabs", "\t\t"]] as const) {
+      it(`redacts the whole key indented by ${label}`, () => {
+        const { text, lines } = block(indent);
+        const out = s.scrub(`config:\n${text}\nnext: 1`);
+        noBody(out, lines);
+        expect(out).toBe(`config:\n${indent}${marker("private-key")}\nnext: 1`);
+      });
+    }
+
+    it("a Kubernetes / Helm YAML block scalar (tls.key: |)", () => {
+      const { text, lines } = block("    ");
+      const yaml = `apiVersion: v1\nkind: Secret\nstringData:\n  tls.key: |\n${text}\n  tls.crt: x\n`;
+      const out = s.scrub(yaml);
+      noBody(out, lines);
+      expect(out).toBe(`apiVersion: v1\nkind: Secret\nstringData:\n  tls.key: |\n    ${marker("private-key")}\n  tls.crt: x\n`);
+    });
+
+    it("a Markdown list item (3 spaces)", () => {
+      const { text, lines } = block("   ");
+      const out = s.scrub(`1. Paste this:\n\n${text}\n\n2. Save.`);
+      noBody(out, lines);
+      expect(out).toContain("2. Save.");
+    });
+
+    it("CRLF line endings with indentation", () => {
+      const { text, lines } = block("  ", "\r\n");
+      const out = s.scrub(`k: |\r\n${text}\r\nz: 1`);
+      noBody(out, lines);
+      expect(out).toBe(`k: |\r\n  ${marker("private-key")}\r\nz: 1`);
+    });
+
+    it("the JSON-escaped indented form in a log line", () => {
+      const { text, lines } = block("    ");
+      const line = `${JSON.stringify({ level: 30, msg: `values:\n${text}\nok` })}\n`;
+      const out = s.scrub(line, { sink: "log" });
+      noBody(out, lines);
+      expect(JSON.parse(out)).toEqual({ level: 30, msg: `values:\n    ${marker("private-key")}\nok` });
+    });
+
+    it("the JSON-escaped tab-indented form", () => {
+      const { text, lines } = block("\t");
+      const out = s.scrub(JSON.stringify({ msg: text }), { sink: "log" });
+      noBody(out, lines);
+    });
+
+    it("trailing blanks after body lines", () => {
+      const lines = bodyLines();
+      const text = [begin, ...lines.map((l) => `  ${l}   `), `  ${end}`].join("\n");
+      const out = s.scrub(text);
+      noBody(out, lines);
+      expect(out).toBe(marker("private-key"));
+    });
+
+    it("an unterminated indented block stops at the first prose line", () => {
+      const lines = bodyLines();
+      const text = [`  ${begin}`, ...lines.map((l) => `  ${l}`)].join("\n");
+      const out = s.scrub(`${text}\n\nThat was the key, don't share it!`);
+      noBody(out, lines);
+      expect(out).toBe(`  ${marker("private-key")}\n\nThat was the key, don't share it!`);
+    });
+
+    it("every sink (replies, logs, memory, chat history, task results, cards) redacts the indented body", () => {
+      const sinks = ["channel", "log", "memory", "chat-history", "task-result", "heartbeat-log", "audit", "prompt-card", "proposal"] as const;
+      for (const sink of sinks) {
+        const { text, lines } = block("    ");
+        noBody(s.scrub(`tls.key: |\n${text}`, { sink }), lines);
+      }
+    });
+
+    it("indentation beyond the bound ends the body instead of scanning on", () => {
+      const lines = bodyLines();
+      const deep = " ".repeat(40);
+      const text = [begin, lines[0], `${deep}prose after a very deep indent`].join("\n");
+      const out = s.scrub(text);
+      expect(out).not.toContain(lines[0]!.slice(0, 32));
+      expect(out).toContain("prose after a very deep indent");
+    });
+  });
+
   it("a BEGIN header mentioned in prose redacts only the header", () => {
     const header = ["-----BEGIN", " RSA PRIVATE KEY-----"].join("");
     expect(s.scrub(`The file starts with ${header} and then base64.`)).toBe(`The file starts with ${marker("private-key")} and then base64.`);
@@ -624,6 +717,12 @@ describe("timing on 1 MB adversarial input", () => {
     "AKIA runs": fill("AKIA"),
     "quoted keyword values": fill('"secret": "'),
     "flags": fill("--token "),
+    "BEGIN + indented short lines": fill(`-----BEGIN PRIVATE KEY-----\n${" ".repeat(16)}A\n`),
+    "BEGIN + long blank runs": fill(`-----BEGIN PRIVATE KEY-----\n${" ".repeat(300)}`),
+    "BEGIN + blank runs mid-line": fill(`-----BEGIN PRIVATE KEY-----\nAAAA${" ".repeat(15)}x`),
+    "BEGIN + escaped tabs": fill(`-----BEGIN PRIVATE KEY-----\\n${"\\t".repeat(40)}`),
+    "body of alternating blanks": `-----BEGIN PRIVATE KEY-----\n${fill(" \t\n")}`,
+    "body of blank lines": `-----BEGIN PRIVATE KEY-----\n${fill(`${" ".repeat(15)}\n`)}`,
   };
 
   const known = fresh();

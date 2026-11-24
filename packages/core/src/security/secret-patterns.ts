@@ -167,6 +167,34 @@ const PEM_END_STICKY_RE = /-----END[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/y;
 /** Body characters: base64, line breaks, and what encrypted-PEM headers use (Proc-Type: 4,ENCRYPTED). */
 const PEM_BODY_CHAR_RE = /[A-Za-z0-9+/=\r\n:,.-]/;
 const MAX_PEM_BODY = 16_384;
+/**
+ * Indentation skipped at the start of a body line, and trailing blanks before a
+ * line break: YAML block scalars (`tls.key: |`), Markdown lists, tabs (SCRUB-B1).
+ * Bounded, so the scan stays linear.
+ */
+const MAX_PEM_INDENT = 16;
+
+function isBlank(ch: string | undefined): boolean {
+  return ch === " " || ch === "\t";
+}
+
+/** Index after at most MAX_PEM_INDENT spaces or tabs (raw, or JSON-escaped `\t`) starting at p. */
+function skipPemBlanks(text: string, p: number, limit: number): number {
+  let q = p;
+  for (let n = 0; n < MAX_PEM_INDENT && q < limit; n++) {
+    if (isBlank(text[q])) q++;
+    else if (text[q] === "\\" && text[q + 1] === "t") q += 2;
+    else break;
+  }
+  return q;
+}
+
+/** A real or JSON-escaped line break at q (or the end of the scanned range). */
+function isPemLineBreak(text: string, q: number, limit: number): boolean {
+  if (q >= limit) return true;
+  const ch = text[q];
+  return ch === "\n" || ch === "\r" || (ch === "\\" && (text[q + 1] === "n" || text[q + 1] === "r"));
+}
 
 const privateKeyRule: SecretPatternRule = {
   name: "private-key",
@@ -182,13 +210,25 @@ const privateKeyRule: SecretPatternRule = {
       // The body stops at the first character a key block cannot contain (a quote, prose
       // punctuation, a space not after ':'), at the next "-----", or after 16 KB. It never
       // runs to the end of the text, so an unterminated block cannot swallow a JSON line.
+      // Up to MAX_PEM_INDENT blanks are skipped at the start of a line (indented keys) and
+      // before a line break (trailing blanks).
       let lineStart = p;
+      /** Start of a line that follows a line break (the header's own line is not one). */
+      let brokeAt = -1;
       while (p < limit) {
+        if (p === brokeAt && (isBlank(text[p]) || (text[p] === "\\" && text[p + 1] === "t"))) {
+          const q = skipPemBlanks(text, p, limit);
+          if (q < limit && !isBlank(text[q])) { p = q; continue; }
+        }
         if (text.startsWith("-----", p)) break;
         const ch = text[p] as string;
-        if (ch === "\\" && (text[p + 1] === "n" || text[p + 1] === "r")) { p += 2; lineStart = p; continue; }
+        if (isBlank(ch)) {
+          const q = skipPemBlanks(text, p, limit);
+          if (isPemLineBreak(text, q, limit) && q < limit) { p = q; continue; }
+        }
+        if (ch === "\\" && (text[p + 1] === "n" || text[p + 1] === "r")) { p += 2; lineStart = p; brokeAt = p; continue; }
         if (ch === "\\" && text[p + 1] === "t") { p += 2; continue; }
-        if (ch === "\n" || ch === "\r") { p++; lineStart = p; continue; }
+        if (ch === "\n" || ch === "\r") { p++; lineStart = p; brokeAt = p; continue; }
         if (ch === " " && text[p - 1] === ":") { p++; continue; }
         if (PEM_BODY_CHAR_RE.test(ch)) { p++; continue; }
         // A space or tab mid-line means this line is prose, not key material: end before it.
