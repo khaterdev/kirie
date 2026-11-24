@@ -96,6 +96,8 @@ export const SCRUB_WITHHELD = "«message withheld: scrubber error»";
 
 /** Rule name used for known-secret findings. */
 export const KNOWN_SECRET_RULE = "known-secret";
+/** `mask: "partial"` shows the first and last 4 characters only of values at least this long. */
+export const PARTIAL_MASK_MIN_CHARS = 32;
 
 export function redactionMarker(rule: string): string {
   return `«redacted:${rule}»`;
@@ -486,7 +488,9 @@ export class SecretScrubber {
   }
 
   private markerFor(rule: string, value: string): string {
-    if (this.mask === "partial" && value.length >= 18 && !/[\s«»]/.test(value)) {
+    // SCRUB-N9: 8 revealed characters are only acceptable on long, random pattern matches;
+    // a known value (a password from the credential store) is never partly shown.
+    if (this.mask === "partial" && rule !== KNOWN_SECRET_RULE && value.length >= PARTIAL_MASK_MIN_CHARS && !/[\s«»]/.test(value)) {
       return `«redacted:${rule}:${value.slice(0, 4)}…${value.slice(-4)}»`;
     }
     return redactionMarker(rule);

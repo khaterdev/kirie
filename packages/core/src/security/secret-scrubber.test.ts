@@ -155,6 +155,18 @@ describe("SecretScrubber pattern rules (one positive per rule)", () => {
       make: () => ({ input: `sid ${["AC", synth(32, HEX)].join("")}`, expected: `sid ${marker("twilio-account-sid")}` }),
     },
     {
+      rule: "voice-provider-credential",
+      make: () => {
+        const id = ["MA", synth(17, UPPER + DIGITS), "7"].join("");
+        const token = ["Zx9", synth(36), "q7"].join("").slice(0, 40);
+        const tw = ["4f", synth(29, HEX), "a"].join("");
+        return {
+          input: `Plivo auth id ${id}, token ${token}\ntwilio auth token: ${tw}`,
+          expected: `Plivo auth id ${marker("voice-provider-credential")}, token ${marker("voice-provider-credential")}\ntwilio auth token: ${marker("voice-provider-credential")}`,
+        };
+      },
+    },
+    {
       rule: "jwt",
       make: () => {
         const t = ["ey", "J", synth(20, TOKEN), ".", "eyJ", synth(30, TOKEN), ".", synth(43, TOKEN)].join("");
@@ -507,6 +519,50 @@ describe("idempotency and markers", () => {
     expect(out).toBe(`«redacted:github-token:${t.slice(0, 4)}…${t.slice(-4)}»`);
     expect(p.scrub(out)).toBe(out);
   });
+
+  it("the partial mask needs 32+ characters and never applies to known values (SCRUB-N9)", () => {
+    const p = fresh({ mask: "partial" });
+    const short = mixed(24);
+    expect(p.scrub(`DB_PASSWORD=${short}`)).toBe(`DB_PASSWORD=${marker("secret-assignment")}`);
+    const known = mixed(40);
+    p.addKnownSecret(known, "db");
+    expect(p.scrub(`x ${known} y`)).toBe(`x ${marker("known-secret")} y`);
+  });
+
+  describe("voice provider credentials without a prefix (SCRUB-N2)", () => {
+    it("only near the provider name", () => {
+      const tw = ["4f", synth(29, HEX), "a"].join("");
+      expect(s.scrub(`TWILIO auth token is ${tw}`)).toBe(`TWILIO auth token is ${marker("voice-provider-credential")}`);
+      expect(s.scrub(`${tw} is the twilio token`)).toBe(`${marker("voice-provider-credential")} is the twilio token`);
+      // Far from the name, or with no name at all: an MD5 or a hash is left alone.
+      expect(s.scrub(`md5 ${tw}`)).toBe(`md5 ${tw}`);
+      expect(s.scrub(`twilio${" filler".repeat(30)} ${tw}`)).toContain(tw);
+      // A lower-case git SHA next to "plivo" is not a Plivo token.
+      const sha = synth(40, HEX);
+      expect(s.scrub(`plivo fix in ${sha}`)).toBe(`plivo fix in ${sha}`);
+    });
+
+    it("is linear on many keywords", () => {
+      const text = `twilio ${synth(31, HEX)}g `.repeat(40_000);
+      const t0 = performance.now();
+      s.scrub(text);
+      expect(performance.now() - t0).toBeLessThan(1500);
+    });
+  });
+
+  it("a versioned model id next to token is not a secret; a password still is (SCRUB-N7)", () => {
+    expect(s.scrub("token: claude-opus-5-5")).toBe("token: claude-opus-5-5");
+    expect(s.scrub("model_key: llama-3.1-70")).toBe("model_key: llama-3.1-70");
+    expect(s.scrub("password: correct-horse-battery-9")).toBe(`password: ${marker("secret-assignment")}`);
+    const uuidish = "123e4567-e89b-12d3-a456-426614174000";
+    expect(s.scrub(`token: ${uuidish}`)).toBe(`token: ${marker("secret-assignment")}`);
+  });
+
+  it("a Telegram bot token with an 11 or 12 digit bot id (SCRUB-N10)", () => {
+    const secret = ["AA", synth(33, TOKEN)].join("");
+    expect(s.scrub(`12345678901:${secret}`)).toBe(`12345678901:${marker("telegram-bot-token")}`);
+    expect(s.scrub(`123456789012:${secret}`)).toBe(`123456789012:${marker("telegram-bot-token")}`);
+  });
 });
 
 describe("allow lists and rule configuration", () => {
@@ -723,6 +779,8 @@ describe("timing on 1 MB adversarial input", () => {
     "BEGIN + escaped tabs": fill(`-----BEGIN PRIVATE KEY-----\\n${"\\t".repeat(40)}`),
     "body of alternating blanks": `-----BEGIN PRIVATE KEY-----\n${fill(" \t\n")}`,
     "body of blank lines": `-----BEGIN PRIVATE KEY-----\n${fill(`${" ".repeat(15)}\n`)}`,
+    "provider names": fill("plivo twilio "),
+    "provider names and near-tokens": fill(`twilio ${"a1".repeat(15)}b plivo ${"Ab1".repeat(13)} `),
   };
 
   const known = fresh();

@@ -298,6 +298,9 @@ const UNQUOTED_VALUE_RE = /[^\s"'\\`,;&|<>(){}[\]=]+={0,3}/y;
 const QUOTED_VALUE_RE = /[^"'`\\\r\n]+/y;
 const MAX_NAME = 64;
 const MAX_VALUE = 512;
+/** Lower-case words then numeric version parts: claude-opus-5-5, llama-3.1-70, gpt-oss-120. */
+const VERSIONED_NAME_RE = /^[a-z]+(?:-[a-z]+)*(?:-\d+(?:\.\d+)*)+$/;
+const PASSWORD_KEYWORD_RE = /passw|pwd|passphrase/i;
 const MAX_GAP = 8;
 
 function splitNameSegments(rest: string): string[] {
@@ -432,8 +435,68 @@ const secretAssignmentRule: SecretPatternRule = {
       }
       const value = text.slice(p, Math.min(valueEnd, p + MAX_VALUE));
       if (!isPlausibleSecretValue(value, { strictWords: !quoted })) continue;
+      // SCRUB-N7: a lower-case name with a version ("claude-opus-5-5", "gpt-oss-120") next to
+      // "token" or "key" is a model or package id. Never applied to passwords (diceware).
+      if (!PASSWORD_KEYWORD_RE.test(m[0]) && VERSIONED_NAME_RE.test(value)) continue;
       // Over-long values are redacted in full: the cap only bounds validation work.
       emit(p, valueEnd);
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Voice provider credentials without a prefix (SCRUB-N2)
+// ---------------------------------------------------------------------------
+
+/** Characters before and after "plivo" / "twilio" in which a bare credential is looked for. */
+const PROVIDER_WINDOW_BEFORE = 40;
+const PROVIDER_WINDOW_AFTER = 120;
+/** Longest credential the rule matches (a Plivo auth token). */
+const PROVIDER_TOKEN_MAX = 40;
+const PROVIDER_KEYWORD_RE = /plivo|twilio/g;
+/** Plivo Auth ID (MA/SA + 18), Plivo auth token (40 alphanumerics), Twilio auth token (32 hex). */
+const PLIVO_CREDENTIAL_RE = /(?<![A-Za-z0-9])(?:(?:MA|SA)[A-Z0-9]{18}|[A-Za-z0-9]{40})(?![A-Za-z0-9])/g;
+const TWILIO_CREDENTIAL_RE = /(?<![A-Za-z0-9])[0-9a-f]{32}(?![A-Za-z0-9])/g;
+
+/**
+ * A Plivo Auth ID or auth token, or a Twilio auth token, has no prefix of its own. Near the
+ * word "plivo" or "twilio" (40 characters before, 120 after) such a value is redacted. Each
+ * character is scanned once per provider: windows are merged as the keywords advance.
+ */
+const voiceProviderCredentialRule: SecretPatternRule = {
+  name: "voice-provider-credential",
+  gate: ["plivo", "twilio"],
+  gateLower: true,
+  scan(input, emit) {
+    const text = input.text;
+    const lower = input.lower();
+    const scannedTo: Record<string, number> = { plivo: 0, twilio: 0 };
+    PROVIDER_KEYWORD_RE.lastIndex = 0;
+    let k: RegExpExecArray | null;
+    while ((k = PROVIDER_KEYWORD_RE.exec(lower)) !== null) {
+      const provider = k[0];
+      const re = provider === "plivo" ? PLIVO_CREDENTIAL_RE : TWILIO_CREDENTIAL_RE;
+      const from = Math.max(k.index - PROVIDER_WINDOW_BEFORE, scannedTo[provider] ?? 0);
+      const to = Math.min(text.length, k.index + provider.length + PROVIDER_WINDOW_AFTER);
+      if (from >= to) continue;
+      // Search only this window (plus room for a token that starts inside it and one
+      // character either side for the boundaries), so the work per keyword is bounded.
+      const sliceStart = Math.max(0, from - 1);
+      const window = text.slice(sliceStart, Math.min(text.length, to + PROVIDER_TOKEN_MAX + 1));
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(window)) !== null) {
+        const at = sliceStart + m.index;
+        if (at >= to) break;
+        if (at < from) continue;
+        const v = m[0];
+        // A Plivo token or a Twilio token is random: it has a digit, and a Plivo token mixes case.
+        const plausible = provider === "twilio"
+          ? /\d/.test(v) && /[a-f]/.test(v)
+          : /^(?:MA|SA)/.test(v) && v.length === 20 ? /\d/.test(v) : /\d/.test(v) && /[a-z]/.test(v) && /[A-Z]/.test(v);
+        if (plausible) emit(at, at + v.length);
+      }
+      scannedTo[provider] = to;
     }
   },
 };
@@ -458,7 +521,8 @@ export const DEFAULT_SECRET_RULES: readonly SecretPatternRule[] = [
   regexRule("aws-access-key-id", `${LB_ALNUM}(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])`, "", { gate: ["AKIA", "ASIA"] }),
   prefixRule("slack-token", ["xox[abeprs]-[A-Za-z0-9-]{10,}", "xapp-\\d{1,3}-[A-Za-z0-9-]{10,}"], ["xox", "xapp-"]),
   regexRule("slack-token", "hooks\\.slack\\.com/services/([A-Za-z0-9/_-]{20,})", "", { group: 1, gate: ["hooks.slack.com"] }),
-  regexRule("telegram-bot-token", "(?<!\\d)\\d{8,10}:([A-Za-z0-9_-]{30,})", "", { group: 1, gate: [":"] }),
+  // Bot ids are 10 digits today; {8,12} leaves headroom (SCRUB-N10).
+  regexRule("telegram-bot-token", "(?<!\\d)\\d{8,12}:([A-Za-z0-9_-]{30,})", "", { group: 1, gate: [":"] }),
   regexRule(
     "discord-token",
     `(?:(?<![${TOKEN_CHARS}.])|${AFTER_ESCAPE})[MNO][${TOKEN_CHARS}]{23,27}\\.[${TOKEN_CHARS}]{6,7}\\.[${TOKEN_CHARS}]{27,40}(?![${TOKEN_CHARS}])`,
@@ -497,6 +561,7 @@ export const DEFAULT_SECRET_RULES: readonly SecretPatternRule[] = [
     ["npm_", "pypi-", "hf_", "SG.", "xai-", "gsk_", "pplx-", "r8_", "ntn_", "_v1_", "SK"],
   ),
   regexRule("twilio-account-sid", `${LB_ALNUM}AC[0-9a-f]{32}(?![A-Za-z0-9])`, "", { gate: ["AC"] }),
+  voiceProviderCredentialRule,
   prefixRule("jwt", [`eyJ[${TOKEN_CHARS}]{8,}\\.eyJ[${TOKEN_CHARS}]{8,}\\.[${TOKEN_CHARS}]{10,}`], ["eyJ"]),
 
   regexRule(
