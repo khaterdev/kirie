@@ -21,29 +21,48 @@ Two passes run on every scrubbed text:
    variables with secret-shaped names, and the `KEY=VALUE` lines of
    `~/.kirie/secrets/*.env`. Values shorter than 12 characters are skipped
    unless they are at least 8 and mix letters and digits.
-2. **Patterns.** Provider formats (`private-key`, `anthropic-key`,
-   `openai-key`, `github-token`, `gitlab-token`, `aws-access-key-id`,
-   `slack-token`, `telegram-bot-token`, `discord-token`, `google-api-key`,
-   `stripe-key`, `linear-key`, `sentry-token`, `vendor-prefixed`,
-   `twilio-account-sid`, `jwt`) and context rules that keep the name and
-   redact only the value (`auth-header`, `url-password`,
-   `secret-query-param`, `secret-assignment`). There is no generic
-   "high-entropy string" rule, so git SHAs, UUIDs, message ids and base64
-   images pass untouched.
+2. **Patterns.** Provider formats (`private-key`, also when indented in YAML
+   or a Markdown list, `anthropic-key`, `openai-key`, `github-token`,
+   `gitlab-token`, `aws-access-key-id`, `slack-token`, `telegram-bot-token`,
+   `discord-token`, `google-api-key`, `stripe-key`, `linear-key`,
+   `sentry-token`, `vendor-prefixed`, `twilio-account-sid`, `jwt`) and
+   context rules that keep the name and redact only the value
+   (`auth-header`, `url-password`, `secret-query-param`,
+   `secret-assignment`, and `voice-provider-credential`: a Plivo Auth ID or
+   auth token, or a Twilio auth token, within 40 characters before or 120
+   after the word "plivo" or "twilio"). There is no generic "high-entropy
+   string" rule, so git SHAs, UUIDs, message ids and base64 images pass
+   untouched.
+
+Both passes also run on a shadow copy of the text without zero-width
+characters, soft hyphens and Markdown marks (`*`, `~`, backtick, `__`), so a
+token split by them is still found.
+
+**Where the known values are.** Only the daemon holds them. The `kirie-tools`
+subprocess that runs the agent's tools sends text it is about to store
+(`memory_store` content, tags and key, `memory_store_document`,
+`daily_note_append`, `learning_propose`) and `tts` text to the daemon's
+loopback route `POST /api/scrub/text` first. The route needs a per-boot token
+from the subprocess env, accepts only store sinks and `channel`, answers at
+most 600 requests a minute and returns only scrubbed text and a count. If the
+daemon cannot be asked, the write is refused. The route can tell a caller
+holding the token whether a guess would be redacted, so a weak value (a short
+password) is better rotated than relied on.
 
 Sinks:
 
 | Sink | Where it is applied |
 |---|---|
-| Channel sends and edits | Every adapter is wrapped at registration: `sendText`, `editMessage`, media captions, button labels, `sendInteractive`, `updateInteractive`. This covers agent replies, command output, errors, task results, proactive notifications, schedule announcements and `/api/channel-action` |
-| Logs | Every module logger scrubs the serialized log line |
-| Memory and daily notes | `MemoryStore.store()`, in the daemon and in the tools subprocess. The tool result tells the agent that something was redacted and to use `kirie credentials set` |
+| Channel sends and edits | Every adapter is wrapped at registration: `sendText`, `editMessage`, media captions and filenames, remote media URLs (`MEDIA: https://...?token=...`, never a local path), button labels, `sendInteractive`, `updateInteractive`. This covers agent replies, command output, errors, task results, proactive notifications, schedule announcements and `/api/channel-action` |
+| Voice notes | `tts` text, before it goes to Edge, OpenAI or ElevenLabs; a marker is read out as "redacted" |
+| Logs | Every module logger scrubs the serialized log line. The startup failure line in `daemon.err.log` holds only the error's name and message, scrubbed. At every start the daemon makes `~/.kirie/logs/*.log`, `*.jsonl` and launchd's `daemon.out.log` / `daemon.err.log` owner-only (0600) |
+| Memory and daily notes | `MemoryStore.store()` in the daemon (known values and patterns). In the tools subprocess, the agent's writes get the daemon's known values through `/api/scrub/text` first, then patterns, before anything is stored or embedded. The tool result tells the agent that something was redacted and to use `kirie credentials set` |
 | Chat history | `ChatHistoryStore.append()`. The live turn still sees what you typed; only the stored copy is scrubbed |
 | Heartbeat logs | `HeartbeatLogStore.log()` |
 | Background tasks | `result` and `error` (not `prompt`: a task may need the value to do its job) |
 | Gateway JSON | `lastError` in `/status`, the `/api/channel-action` error |
 | Audit trail, owner prompt cards, command replies | through the shared scrubber |
-| Webhook payloads, approval prompts, plugin events, proposals | in the features that produce them |
+| Webhook payloads, approval prompts, plugin events, proposals | in the features that produce them. On an approval card, a value shaped like shell code (whitespace, `;`, `|`, `&`, `$(`, a URL) is never hidden, and when the scrubber did hide something in the command the card says how many values were hidden and that they are part of what will run |
 
 `security.scrubbing.enabled` is read **once at start**. A config reload or a
 runtime setting cannot turn it off, and there is deliberately no
@@ -54,9 +73,11 @@ runtime setting cannot turn it off, and there is deliberately no
 - **Pixels.** Screenshots and images are never inspected. A key visible in a
   screenshot stays in that screenshot.
 - **Values the scrubber cannot recognise**: a secret with no known prefix and
-  no secret-looking name next to it (for example a bare random password), and
-  transformed values (split across messages, reversed, spelled out, hex).
-  Only values Kirie itself holds are caught in base64 or URL-encoded form.
+  no secret-looking name next to it that Kirie does not hold (for example a
+  bare random password typed in chat), and transformed values (split across
+  messages, reversed, spelled out, hex). Only values Kirie itself holds are
+  caught in base64 or URL-encoded form. A token glued to another word
+  (`x` + token) is not caught: the left boundary keeps every rule linear.
 - **Files the agent writes** with `Write`, `Edit` or `Bash`, including
   `MEMORY.md`, `SOUL.md`, `TOOLS.md` and anything in the workspace.
 - **SDK transcripts** under `~/.claude*/projects/`, which hold full turns.
@@ -84,7 +105,7 @@ security:
         pattern: "acme_[a-z0-9]{32}"
         flags: ""              # any of i, m, s, u
     allowPatterns: []          # a match that fully matches one of these is kept
-    mask: "label"              # "partial" keeps the first and last 4 chars of long values
+    mask: "label"              # "partial" keeps the first and last 4 chars of pattern matches of 32+ chars (never of known values)
 ```
 
 Custom and allow patterns must stay linear-time, because there is no regex
