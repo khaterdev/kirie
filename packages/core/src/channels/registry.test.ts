@@ -366,6 +366,18 @@ describe("ChannelRegistry", () => {
       expect(batch[1]).toEqual({ type: "photo", url: "file:///b.png" });
     });
 
+    it("scrubs remote media URLs and filenames, never a local path (SCRUB-N4)", async () => {
+      const { adapter, calls } = capturingAdapter();
+      registry.register(adapter);
+      const proxy = registry.getById("telegram")!;
+      await proxy.sendMedia!({ ctx, media: { type: "document", url: `https://files.example/r.pdf?token=${token()}`, filename: `report ${token()}.pdf` } });
+      const first = (calls.sendMedia![0] as { media: { url: string; filename: string } }).media;
+      expect(first.url).toBe(`https://files.example/r.pdf?token=${MARK}`);
+      expect(first.filename).toBe(`report ${MARK}.pdf`);
+      await proxy.sendMedia!({ ctx, media: { type: "photo", url: "/Users/tester/.kirie/media/x.png" } });
+      expect((calls.sendMedia![0] as { media: { url: string } }).media.url).toBe("/Users/tester/.kirie/media/x.png");
+    });
+
     it("scrubs interactive text and button labels, not callback data", async () => {
       const { adapter, calls } = capturingAdapter();
       registry.register(adapter);

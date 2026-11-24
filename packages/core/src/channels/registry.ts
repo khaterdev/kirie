@@ -47,10 +47,23 @@ function filterText(value: unknown, filter: ChannelOutboundFilter): unknown {
   }
 }
 
+/**
+ * Media: the caption, the filename and a remote URL are filtered (SCRUB-N4: a
+ * `MEDIA: https://host/f?token=...` line must not hand the token to the platform).
+ * A local path is left alone, so the file can still be read.
+ */
 function rewriteCaption(media: unknown, filter: ChannelOutboundFilter): unknown {
-  if (!media || typeof media !== "object" || !("caption" in media)) return media;
-  return { ...(media as Record<string, unknown>), caption: filterText((media as { caption?: unknown }).caption, filter) };
+  if (!media || typeof media !== "object") return media;
+  const m = media as { caption?: unknown; url?: unknown; filename?: unknown };
+  const out: Record<string, unknown> = { ...(media as Record<string, unknown>) };
+  if ("caption" in m) out.caption = filterText(m.caption, filter);
+  if (typeof m.filename === "string") out.filename = filterText(m.filename, filter);
+  if (typeof m.url === "string" && REMOTE_URL_RE.test(m.url)) out.url = filterText(m.url, filter);
+  return out;
 }
+
+/** A URL the platform fetches (not file:, which names a local file to upload). */
+const REMOTE_URL_RE = /^(?!file:)[a-z][a-z0-9+.-]{1,20}:\/\//i;
 
 /** Button rows: filter the visible label fields and link urls, never the callback data. */
 function rewriteButtons(rows: unknown, filter: ChannelOutboundFilter): unknown {

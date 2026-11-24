@@ -31,8 +31,8 @@ export const SCRUB_TOKEN_HEADER = "x-kirie-scrub-token";
 export const SCRUB_API_MAX_CHARS = 1_000_000;
 /** Requests per minute the route answers. */
 export const SCRUB_API_MAX_PER_MINUTE = 600;
-/** Sinks a subprocess may ask for (the stores it writes). */
-const REMOTE_SINKS: ReadonlySet<ScrubSink> = new Set<ScrubSink>(["memory", "proposal", "chat-history", "task-result", "heartbeat-log"]);
+/** Sinks a subprocess may ask for: the stores it writes, and "channel" for text it sends out (TTS). */
+const REMOTE_SINKS: ReadonlySet<ScrubSink> = new Set<ScrubSink>(["memory", "proposal", "chat-history", "task-result", "heartbeat-log", "channel"]);
 
 let remote: RemoteScrubber | null = null;
 
